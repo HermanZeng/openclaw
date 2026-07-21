@@ -236,17 +236,17 @@ export function applySqliteSessionEntryMaintenance(
   };
 }
 
-export function finalizeSqliteSessionEntryMaintenancePlansBestEffort(
+export async function finalizeSqliteSessionEntryMaintenancePlansBestEffort(
   scope: Pick<ResolvedSqliteReadScope, "agentId" | "env" | "path">,
   plans: readonly SqliteSessionEntryMaintenancePlan[],
-): SessionLifecycleArchivedTranscript[] {
+): Promise<SessionLifecycleArchivedTranscript[]> {
   const entryRemovals = plans.flatMap((plan) => plan.entryRemovals);
   const stateDeletePlans = plans.flatMap((plan) => plan.stateDeletePlans);
   if (entryRemovals.length === 0 && stateDeletePlans.length === 0) {
     return [];
   }
   try {
-    const materializedPlans = materializeSqliteSessionStateDeletePlans(stateDeletePlans);
+    const materializedPlans = await materializeSqliteSessionStateDeletePlans(stateDeletePlans);
     let archivedTranscripts: SessionLifecycleArchivedTranscript[] = [];
     runOpenClawAgentWriteTransaction((database) => {
       assertPlannedSqliteLifecycleArtifactEntriesUnchanged(database, entryRemovals);
@@ -273,6 +273,3 @@ export function finalizeSqliteSessionEntryMaintenancePlansBestEffort(
     return [];
   }
 }
-
-// Revalidates transcript bytes before row deletion so a concurrent append is
-// not dropped by an archive prepared from older content.

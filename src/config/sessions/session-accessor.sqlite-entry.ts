@@ -601,7 +601,7 @@ async function patchSqliteSessionEntrySnapshot<TSnapshot>(
       result = cloneSessionEntry(next);
     }, toDatabaseOptions(resolved));
     emitCommittedSessionIdentityDiff(previousIdentity, currentIdentity);
-    finalizeSqliteSessionEntryMaintenancePlansBestEffort(resolved, maintenancePlans);
+    await finalizeSqliteSessionEntryMaintenancePlansBestEffort(resolved, maintenancePlans);
     kickSessionHistoryDiskBudgetMaintenance({
       ...(resolved.agentId ? { agentId: resolved.agentId } : {}),
       storePath: params.storePath,
