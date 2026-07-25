@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
@@ -19,6 +18,26 @@ import { replaceSqliteTranscriptEvents } from "./session-accessor.sqlite.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 import type { SessionEntry } from "./types.js";
 
+const archiveMaterializationHook = vi.hoisted(() => ({
+  afterMaterialize: undefined as (() => void) | undefined,
+}));
+
+// Place test mutations after the real Worker finishes but before cleanup opens
+// its final transaction, without relying on cross-isolate filesystem timing.
+vi.mock("./session-accessor.sqlite-archive.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-accessor.sqlite-archive.js")>();
+  return {
+    ...actual,
+    materializeSqliteSessionStateDeletePlans: async (
+      ...args: Parameters<typeof actual.materializeSqliteSessionStateDeletePlans>
+    ) => {
+      const result = await actual.materializeSqliteSessionStateDeletePlans(...args);
+      archiveMaterializationHook.afterMaterialize?.();
+      return result;
+    },
+  };
+});
+
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("SQLite lifecycle cleanup races", () => {
@@ -31,6 +50,7 @@ describe("SQLite lifecycle cleanup races", () => {
   });
 
   afterEach(() => {
+    archiveMaterializationHook.afterMaterialize = undefined;
     closeOpenClawAgentDatabasesForTest();
   });
 
@@ -357,18 +377,13 @@ describe("SQLite lifecycle cleanup races", () => {
     expect(planned.deletePlans).toHaveLength(1);
 
     const refreshedEntry = { label: "refreshed", sessionId, updatedAt: now + 1 };
-    const originalRenameSync = fs.renameSync;
     let refreshed = false;
-    const renameSpy = vi.spyOn(fs, "renameSync").mockImplementation((...args) => {
-      const result = originalRenameSync(...args);
-      if (!refreshed && String(args[1]).includes(`${sessionId}.jsonl.deleted.`)) {
-        refreshed = true;
-        database.db
-          .prepare("UPDATE session_nodes SET entry_json = ?, updated_at = ? WHERE session_key = ?")
-          .run(JSON.stringify(refreshedEntry), refreshedEntry.updatedAt, sessionKey);
-      }
-      return result;
-    });
+    archiveMaterializationHook.afterMaterialize = () => {
+      refreshed = true;
+      database.db
+        .prepare("UPDATE session_nodes SET entry_json = ?, updated_at = ? WHERE session_key = ?")
+        .run(JSON.stringify(refreshedEntry), refreshedEntry.updatedAt, sessionKey);
+    };
 
     try {
       await expect(
@@ -381,7 +396,7 @@ describe("SQLite lifecycle cleanup races", () => {
         }),
       ).rejects.toThrow("SQLite lifecycle cleanup entry changed");
     } finally {
-      renameSpy.mockRestore();
+      archiveMaterializationHook.afterMaterialize = undefined;
     }
 
     expect(refreshed).toBe(true);
