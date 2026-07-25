@@ -176,6 +176,64 @@ describe("SQLite transcript archive worker", () => {
     ]);
   });
 
+  it("archives a logical agent transcript through the exact database's physical owner", async () => {
+    const sharedDatabasePath = path.join(tempDir, "shared.sqlite");
+    const mainSessionId = "shared-physical-owner-main-session";
+    const mainSessionKey = "agent:main:shared-physical-owner-main";
+    const opsSessionId = "shared-physical-owner-ops-session";
+    const opsSessionKey = "agent:ops:shared-physical-owner-ops";
+    const mainScope = {
+      agentId: "main",
+      defaultAgentId: "main",
+      sessionId: mainSessionId,
+      sessionKey: mainSessionKey,
+      storePath: sharedDatabasePath,
+    };
+    const opsScope = {
+      agentId: "ops",
+      defaultAgentId: "main",
+      sessionId: opsSessionId,
+      sessionKey: opsSessionKey,
+      storePath: sharedDatabasePath,
+    };
+    const mainEvent = createTranscriptEvent(mainSessionId, "keep physical-owner transcript");
+    const opsEvent = createTranscriptEvent(opsSessionId, "archive logical-owner transcript");
+
+    await replaceSessionEntry(mainScope, { sessionId: mainSessionId, updatedAt: Date.now() });
+    await replaceSqliteTranscriptEvents(mainScope, [mainEvent]);
+    await replaceSessionEntry(opsScope, { sessionId: opsSessionId, updatedAt: Date.now() });
+    await replaceSqliteTranscriptEvents(opsScope, [opsEvent]);
+
+    const opsTarget = resolveSqliteTargetFromSessionStorePath(sharedDatabasePath, {
+      agentId: opsScope.agentId,
+      defaultAgentId: opsScope.defaultAgentId,
+    });
+    const database = openLifecycleTestDatabase(sharedDatabasePath);
+    expect(opsTarget).toMatchObject({
+      agentId: "main",
+      path: sharedDatabasePath,
+      shared: true,
+    });
+    expect(database.agentId).toBe("main");
+    expect(database.agentId).not.toBe(opsScope.agentId);
+
+    const plan = planArchiveWorker(database, tempDir, opsSessionId);
+    expect(plan).toMatchObject({
+      agentId: database.agentId,
+      databasePath: database.path,
+      sessionId: opsSessionId,
+    });
+    const materialized = await materializeSqliteSessionStateDeletePlans([plan]);
+    const archivedPath = materialized[0]?.archivedTranscript?.archivedPath;
+    expect(readArchiveLines(archivedPath ?? undefined)).toEqual([JSON.stringify(opsEvent)]);
+
+    deleteMaterializedPlans(database, materialized, opsSessionKey);
+
+    await expect(loadTranscriptEvents(opsScope)).resolves.toEqual([]);
+    await expect(loadTranscriptEvents(mainScope)).resolves.toEqual([mainEvent]);
+    expect(loadSessionEntry(mainScope)).toMatchObject({ sessionId: mainSessionId });
+  });
+
   it("rejects transcript changes between deletion planning and the worker snapshot", async () => {
     const sessionId = "changed-before-worker-snapshot";
     const scope = {
@@ -315,13 +373,19 @@ describe("SQLite transcript archive worker", () => {
           .select("session_id")
           .where("session_id", "=", sessionId),
       ).rows.length,
-      routes: executeSqliteQuerySync(
+      nodes: executeSqliteQuerySync(
         database.db,
-        db.selectFrom("session_routes").select("session_id").where("session_id", "=", sessionId),
+        db
+          .selectFrom("session_nodes")
+          .select("current_session_id")
+          .where("current_session_id", "=", sessionId),
       ).rows.length,
-      sessions: executeSqliteQuerySync(
+      rewriteWatermarks: executeSqliteQuerySync(
         database.db,
-        db.selectFrom("sessions").select("session_id").where("session_id", "=", sessionId),
+        db
+          .selectFrom("transcript_rewrite_watermarks")
+          .select("session_id")
+          .where("session_id", "=", sessionId),
       ).rows.length,
       trajectory: executeSqliteQuerySync(
         database.db,
@@ -333,6 +397,10 @@ describe("SQLite transcript archive worker", () => {
       transcript: executeSqliteQuerySync(
         database.db,
         db.selectFrom("transcript_events").select("seq").where("session_id", "=", sessionId),
+      ).rows.length,
+      windows: executeSqliteQuerySync(
+        database.db,
+        db.selectFrom("session_windows").select("session_id").where("session_id", "=", sessionId),
       ).rows.length,
     });
     const before = readLifecycleCounts();
@@ -352,25 +420,22 @@ describe("SQLite transcript archive worker", () => {
       acp: 1,
       fts: 1,
       indexState: 1,
-      routes: 1,
-      sessions: 1,
+      nodes: 1,
+      rewriteWatermarks: 1,
       trajectory: 1,
       transcript: 1,
+      windows: 1,
     });
   });
 
   it("keeps rows when a transcript changes after its archive snapshot", async () => {
     const sessionId = "stale-archive-snapshot-session";
-    await replaceSqliteTranscriptEvents(
-      { sessionKey: "agent:main:stale-archive-snapshot", sessionId, storePath },
-      [createTranscriptEvent(sessionId, "archived snapshot")],
-    );
+    const sessionKey = "agent:main:stale-archive-snapshot";
+    await replaceSqliteTranscriptEvents({ sessionKey, sessionId, storePath }, [
+      createTranscriptEvent(sessionId, "archived snapshot"),
+    ]);
     const database = openLifecycleTestDatabase(storePath);
     const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
-    executeSqliteQuerySync(
-      database.db,
-      db.deleteFrom("session_routes").where("session_id", "=", sessionId),
-    );
     const plan = planSqliteSessionStateDeleteIfUnreferenced({
       archiveDirectory: path.dirname(storePath),
       database,
@@ -384,7 +449,7 @@ describe("SQLite transcript archive worker", () => {
 
     appendTranscriptEvent(database, sessionId);
 
-    expect(() => deleteMaterializedPlans(database, materialized)).toThrow(
+    expect(() => deleteMaterializedPlans(database, materialized, sessionKey)).toThrow(
       `SQLite session state changed before deletion for ${sessionId}`,
     );
     expect(
@@ -395,18 +460,81 @@ describe("SQLite transcript archive worker", () => {
     ).toHaveLength(2);
   });
 
+  it.each(["rewrite generation", "transcript mutation watermark", "window metadata"] as const)(
+    "keeps rows when the %s changes after archive materialization",
+    async (kind) => {
+      const sessionId = `stale-${
+        kind === "rewrite generation"
+          ? "generation"
+          : kind === "transcript mutation watermark"
+            ? "watermark"
+            : "window"
+      }-snapshot`;
+      const sessionKey = `agent:main:${sessionId}`;
+      await replaceSqliteTranscriptEvents({ sessionKey, sessionId, storePath }, [
+        createTranscriptEvent(sessionId, "archived transcript"),
+      ]);
+      const database = openLifecycleTestDatabase(storePath);
+      const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
+      const plan = planArchiveWorker(database, path.dirname(storePath), sessionId);
+      expect(plan.snapshot.generation).not.toBeNull();
+      expect(plan.snapshot.sessionUpdatedAt).not.toBeNull();
+      expect(plan.snapshot.transcriptUpdatedAt).not.toBeNull();
+      const materialized = await materializeSqliteSessionStateDeletePlans([plan]);
+
+      if (kind === "rewrite generation") {
+        executeSqliteQuerySync(
+          database.db,
+          db
+            .updateTable("transcript_rewrite_watermarks")
+            .set({
+              generation: `${plan.snapshot.generation ?? "missing"}-changed`,
+              updated_at: Date.now(),
+            })
+            .where("session_id", "=", sessionId),
+        );
+      } else if (kind === "transcript mutation watermark") {
+        executeSqliteQuerySync(
+          database.db,
+          db
+            .updateTable("session_windows")
+            .set({
+              transcript_updated_at: (plan.snapshot.transcriptUpdatedAt ?? 0) + 1,
+            })
+            .where("session_id", "=", sessionId),
+        );
+      } else {
+        executeSqliteQuerySync(
+          database.db,
+          db
+            .updateTable("session_windows")
+            .set({
+              updated_at: (plan.snapshot.sessionUpdatedAt ?? 0) + 1,
+            })
+            .where("session_id", "=", sessionId),
+        );
+      }
+
+      expect(() => deleteMaterializedPlans(database, materialized, sessionKey)).toThrow(
+        `SQLite session state changed before deletion for ${sessionId}`,
+      );
+      expect(
+        executeSqliteQuerySync(
+          database.db,
+          db.selectFrom("transcript_events").select("seq").where("session_id", "=", sessionId),
+        ).rows,
+      ).toHaveLength(1);
+    },
+  );
+
   it("keeps rows when a non-archive delete plan becomes stale", async () => {
     const sessionId = "stale-non-archive-snapshot-session";
-    await replaceSqliteTranscriptEvents(
-      { sessionKey: "agent:main:stale-non-archive-snapshot", sessionId, storePath },
-      [createTranscriptEvent(sessionId, "planned transcript")],
-    );
+    const sessionKey = "agent:main:stale-non-archive-snapshot";
+    await replaceSqliteTranscriptEvents({ sessionKey, sessionId, storePath }, [
+      createTranscriptEvent(sessionId, "planned transcript"),
+    ]);
     const database = openLifecycleTestDatabase(storePath);
     const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
-    executeSqliteQuerySync(
-      database.db,
-      db.deleteFrom("session_routes").where("session_id", "=", sessionId),
-    );
     const plan = planSqliteSessionStateDeleteIfUnreferenced({
       archiveDirectory: path.dirname(storePath),
       archiveTranscript: false,
@@ -421,7 +549,7 @@ describe("SQLite transcript archive worker", () => {
 
     appendTranscriptEvent(database, sessionId);
 
-    expect(() => deleteMaterializedPlans(database, materialized)).toThrow(
+    expect(() => deleteMaterializedPlans(database, materialized, sessionKey)).toThrow(
       `SQLite session state changed before deletion for ${sessionId}`,
     );
     expect(
@@ -436,16 +564,12 @@ describe("SQLite transcript archive worker", () => {
     "keeps rows when %s state changes after archive materialization",
     async (kind) => {
       const sessionId = `stale-${kind === "trajectory" ? "trajectory" : "acp"}-snapshot-session`;
-      await replaceSqliteTranscriptEvents(
-        { sessionKey: `agent:main:${sessionId}`, sessionId, storePath },
-        [createTranscriptEvent(sessionId, "archived transcript")],
-      );
+      const sessionKey = `agent:main:${sessionId}`;
+      await replaceSqliteTranscriptEvents({ sessionKey, sessionId, storePath }, [
+        createTranscriptEvent(sessionId, "archived transcript"),
+      ]);
       const database = openLifecycleTestDatabase(storePath);
       const db = getNodeSqliteKysely<OpenClawAgentKyselyDatabase>(database.db);
-      executeSqliteQuerySync(
-        database.db,
-        db.deleteFrom("session_routes").where("session_id", "=", sessionId),
-      );
       const plan = planArchiveWorker(database, path.dirname(storePath), sessionId);
       const materialized = await materializeSqliteSessionStateDeletePlans([plan]);
 
@@ -463,7 +587,7 @@ describe("SQLite transcript archive worker", () => {
         });
       }
 
-      expect(() => deleteMaterializedPlans(database, materialized)).toThrow(
+      expect(() => deleteMaterializedPlans(database, materialized, sessionKey)).toThrow(
         `SQLite session state changed before deletion for ${sessionId}`,
       );
       const rows =
@@ -651,9 +775,16 @@ function appendTranscriptEvent(
 function deleteMaterializedPlans(
   database: ReturnType<typeof openLifecycleTestDatabase>,
   plans: Parameters<typeof deleteMaterializedSqliteSessionStatePlans>[1],
+  excludedSessionKey: string,
 ): void {
   runOpenClawAgentWriteTransaction(
-    (transactionDb) => deleteMaterializedSqliteSessionStatePlans(transactionDb, plans),
+    (transactionDb) =>
+      deleteMaterializedSqliteSessionStatePlans(
+        transactionDb,
+        plans,
+        undefined,
+        new Set([excludedSessionKey]),
+      ),
     { agentId: database.agentId, path: database.path },
   );
 }

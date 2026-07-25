@@ -148,8 +148,8 @@ export function writeSqliteTranscriptArchive(params: {
       writeDurableFileExclusive(tempPath, encoded.bytes);
       fs.renameSync(tempPath, archivePath);
       syncDirectoryBestEffortSync(params.archiveDirectory);
-      // Full readback is bounded by the same single-generation content the
-      // delete plan already buffers (Node string limits cap both); a partial
+      // Full readback is bounded by the same single-generation content held by
+      // this Worker (Node string limits cap both); a partial
       // or corrupt archive must fail here, before any rows are reclaimed.
       if (readSessionArchiveContentSync(archivePath) !== params.content) {
         fs.rmSync(archivePath, { force: true });

@@ -5,33 +5,33 @@ import type { SqliteSessionStateDeleteSnapshot } from "./session-accessor.sqlite
 type SessionStateDeleteSnapshotDatabase = Pick<
   OpenClawAgentKyselyDatabase,
   | "acp_parent_stream_events"
-  | "sessions"
-  | "session_transcript_generations"
+  | "session_windows"
   | "trajectory_runtime_events"
   | "transcript_events"
+  | "transcript_rewrite_watermarks"
 >;
 
 function normalizeOptionalSqliteNumber(value: number | bigint | null | undefined): number | null {
   return value === null || value === undefined ? null : Number(value);
 }
 
-/** Captures canonical state that supported writers can mutate outside the session writer queue. */
+/** Captures the owner window and canonical child state writable outside the lifecycle queue. */
 export function readSqliteSessionStateDeleteSnapshot(
   database: import("node:sqlite").DatabaseSync,
   sessionId: string,
 ): SqliteSessionStateDeleteSnapshot {
   const db = getNodeSqliteKysely<SessionStateDeleteSnapshotDatabase>(database);
-  const session = executeSqliteQueryTakeFirstSync(
+  const window = executeSqliteQueryTakeFirstSync(
     database,
     db
-      .selectFrom("sessions")
+      .selectFrom("session_windows")
       .select(["transcript_updated_at", "updated_at"])
       .where("session_id", "=", sessionId),
   );
-  const generation = executeSqliteQueryTakeFirstSync(
+  const rewriteWatermark = executeSqliteQueryTakeFirstSync(
     database,
     db
-      .selectFrom("session_transcript_generations")
+      .selectFrom("transcript_rewrite_watermarks")
       .select("generation")
       .where("session_id", "=", sessionId),
   );
@@ -62,10 +62,10 @@ export function readSqliteSessionStateDeleteSnapshot(
   );
   return {
     acpParentStreamEventCount: normalizeOptionalSqliteNumber(acpParentStream?.event_count) ?? 0,
-    generation: generation?.generation ?? null,
+    generation: rewriteWatermark?.generation ?? null,
     lastSeq: lastEvent?.seq ?? null,
-    sessionUpdatedAt: session?.updated_at ?? null,
+    sessionUpdatedAt: window?.updated_at ?? null,
     trajectoryLastSeq: lastTrajectory?.seq ?? null,
-    transcriptUpdatedAt: session?.transcript_updated_at ?? null,
+    transcriptUpdatedAt: window?.transcript_updated_at ?? null,
   };
 }

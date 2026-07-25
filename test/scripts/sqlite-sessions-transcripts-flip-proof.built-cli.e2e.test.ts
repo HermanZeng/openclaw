@@ -71,7 +71,7 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
       const databasePath = requireSqliteDatabasePath(storePath);
       expect(readSessionRowCounts(databasePath, sessionId)).toEqual({
         fts: 1,
-        sessions: 1,
+        sessionWindows: 1,
         transcriptEvents: events.length,
       });
       closeOpenClawAgentDatabasesForTest();
@@ -96,7 +96,10 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
           timeoutMs: 20_000,
         }),
       ]);
-      await deleteClient.request("sessions.list", {}, { timeoutMs: 20_000 });
+      // Cold-opening and indexing the pre-seeded 64 MiB database is outside
+      // the deletion latency measurement below and can exceed the normal RPC
+      // timeout on Windows CI hosts. Finish that one-time initialization first.
+      await deleteClient.request("sessions.list", {}, { timeoutMs: 120_000 });
       for (let attempt = 0; attempt < 3; attempt += 1) {
         await probeClient.request("system-presence", {}, { timeoutMs: 2_000 });
       }
@@ -147,7 +150,10 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
       const deleteResult = await deletion;
       expect(deleteResult).toMatchObject({ ok: true, deleted: true });
       expect(prePublicationProbeLatencies.length).toBeGreaterThan(5);
-      expect(Math.max(...prePublicationProbeLatencies)).toBeLessThan(250);
+      // Keep enough headroom for Windows scheduling and a probe that crosses
+      // into the existing synchronous SQLite/FTS deletion tail. The former
+      // synchronous archive path instead exceeds the probe's 2s RPC timeout.
+      expect(Math.max(...prePublicationProbeLatencies)).toBeLessThan(500);
       const archivedPath = deleteResult.archived?.[0];
       expect(archivedPath).toBeTruthy();
 
@@ -166,7 +172,7 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
       await expect(loadTranscriptEvents({ sessionKey, sessionId, storePath })).resolves.toEqual([]);
       expect(readSessionRowCounts(databasePath, sessionId)).toEqual({
         fts: 0,
-        sessions: 0,
+        sessionWindows: 0,
         transcriptEvents: 0,
       });
     } finally {
@@ -234,12 +240,12 @@ function readSessionRowCounts(
   sessionId: string,
 ): {
   fts: number;
-  sessions: number;
+  sessionWindows: number;
   transcriptEvents: number;
 } {
   const database = new DatabaseSync(databasePath, { readOnly: true });
   try {
-    const count = (table: "session_transcript_fts" | "sessions" | "transcript_events") => {
+    const count = (table: "session_transcript_fts" | "session_windows" | "transcript_events") => {
       const row = database
         .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE session_id = ?`)
         .get(sessionId) as { count: number };
@@ -247,7 +253,7 @@ function readSessionRowCounts(
     };
     return {
       fts: count("session_transcript_fts"),
-      sessions: count("sessions"),
+      sessionWindows: count("session_windows"),
       transcriptEvents: count("transcript_events"),
     };
   } finally {
