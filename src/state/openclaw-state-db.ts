@@ -578,6 +578,13 @@ export function closeOpenClawStateDatabase(): void {
   cachedDatabases.clear();
 }
 
+/** List process-held shared state databases without opening fixture state. */
+export function listOpenClawStateDatabasesForTest(): Array<{ path: string }> {
+  return [...cachedDatabases.values()]
+    .map((database) => ({ path: database.path }))
+    .toSorted((left, right) => left.path.localeCompare(right.path));
+}
+
 /** Test whether any cached shared state database handle is still open. */
 export function isOpenClawStateDatabaseOpen(): boolean {
   return Array.from(cachedDatabases.values()).some((database) => database.db.isOpen);

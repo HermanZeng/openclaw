@@ -295,9 +295,11 @@ export async function runSqliteSessionsTranscriptsFlipProof(
     name: `sqlite-sessions-transcripts-flip-${randomUUID()}`,
     config: buildMockOpenAiConfig(mockOpenAiPort),
     env: {
+      NO_PROXY: "127.0.0.1,localhost",
       OPENAI_API_KEY: "sk-openclaw-e2e-mock",
       OPENCLAW_TEST_MINIMAL_GATEWAY: undefined,
       OPENCLAW_SKIP_PROVIDERS: undefined,
+      no_proxy: "127.0.0.1,localhost",
     },
     startTimeoutMs: 90_000,
     stopTimeoutMs: 3_000,

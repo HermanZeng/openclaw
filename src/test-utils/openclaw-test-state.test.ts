@@ -168,6 +168,15 @@ describe("openclaw test state", () => {
       label: "database-cleanup",
     });
     const fixtureShared = openOpenClawStateDatabase({ env: state.env });
+    const fixtureCustomShared = openOpenClawStateDatabase({
+      env: state.env,
+      path: path.join(state.stateDir, "test-device-identities", "client.sqlite"),
+    });
+    const fixtureClosedCustomShared = openOpenClawStateDatabase({
+      env: state.env,
+      path: path.join(state.stateDir, "test-device-identities", "closed-client.sqlite"),
+    });
+    fixtureClosedCustomShared.db.close();
     const fixtureAgent = openOpenClawAgentDatabase({
       agentId: "worker",
       env: state.env,
@@ -182,6 +191,8 @@ describe("openclaw test state", () => {
     state.restoreEnv = () => {
       expect(process.env.OPENCLAW_STATE_DIR).toBe(state.stateDir);
       expect(fixtureShared.db.isOpen).toBe(false);
+      expect(fixtureCustomShared.db.isOpen).toBe(false);
+      expect(fixtureClosedCustomShared.db.isOpen).toBe(false);
       expect(fixtureAgent.db.isOpen).toBe(false);
       expect(unrelatedShared.db.isOpen).toBe(true);
       expect(unrelatedAgent.db.isOpen).toBe(true);
@@ -199,6 +210,7 @@ describe("openclaw test state", () => {
         retryDelay: 25,
       });
       await expectPathMissing(state.root);
+      expect(closeOpenClawStateDatabaseByPath(fixtureClosedCustomShared.path)).toBe(false);
       expect(unrelatedShared.db.isOpen).toBe(true);
       expect(unrelatedAgent.db.isOpen).toBe(true);
     } finally {
@@ -207,6 +219,8 @@ describe("openclaw test state", () => {
       closeOpenClawAgentDatabaseByPath(fixtureAgent.path);
       closeOpenClawAgentDatabaseByPath(unrelatedAgent.path);
       closeOpenClawStateDatabaseByPath(fixtureShared.path);
+      closeOpenClawStateDatabaseByPath(fixtureCustomShared.path);
+      closeOpenClawStateDatabaseByPath(fixtureClosedCustomShared.path);
       closeOpenClawStateDatabaseByPath(unrelatedShared.path);
       rmSpy.mockRestore();
       await fs.rm(state.root, {
