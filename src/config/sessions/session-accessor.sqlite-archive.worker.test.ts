@@ -328,11 +328,7 @@ describe("SQLite transcript archive worker", () => {
     await replaceSqliteTranscriptEvents(recoveryScope, [
       createTranscriptEvent(recoverySessionId, "archive after queued failure"),
     ]);
-    const recoveryPlan = planArchiveWorker(
-      database,
-      path.dirname(storePath),
-      recoverySessionId,
-    );
+    const recoveryPlan = planArchiveWorker(database, path.dirname(storePath), recoverySessionId);
 
     const failedArchive = materializeSqliteSessionStateDeletePlans([plan]);
     const recoveredArchive = materializeSqliteSessionStateDeletePlans([recoveryPlan]);

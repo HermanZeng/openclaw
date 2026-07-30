@@ -123,16 +123,13 @@ describe("incognito transcript access", () => {
           skipMaintenance: true,
         },
       );
-      await replaceSqliteTranscriptEvents(
-        { ...staleScope, sessionId: "incognito-stale-session" },
-        [
-          {
-            id: "incognito-stale-event",
-            timestamp: new Date(now).toISOString(),
-            type: "metadata",
-          },
-        ],
-      );
+      await replaceSqliteTranscriptEvents({ ...staleScope, sessionId: "incognito-stale-session" }, [
+        {
+          id: "incognito-stale-event",
+          timestamp: new Date(now).toISOString(),
+          type: "metadata",
+        },
+      ]);
       await patchSessionEntry(
         activeScope,
         () => ({ sessionId: "incognito-active-session", updatedAt: now + 1 }),
