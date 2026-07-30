@@ -305,7 +305,7 @@ describe("SQLite transcript archive worker", () => {
     await expect(loadTranscriptEvents(scope)).resolves.toHaveLength(1);
   });
 
-  it("propagates worker file failures without deleting transcript rows", async () => {
+  it("recovers the lifecycle archive queue after a worker file failure", async () => {
     const sessionId = "archive-file-failure-session";
     const scope = {
       sessionKey: "agent:main:archive-file-failure",
@@ -319,8 +319,33 @@ describe("SQLite transcript archive worker", () => {
     fs.writeFileSync(blockedArchiveDirectory, "not a directory", "utf8");
     const database = openLifecycleTestDatabase(storePath);
     const plan = planArchiveWorker(database, blockedArchiveDirectory, sessionId);
+    const recoverySessionId = "archive-after-file-failure-session";
+    const recoveryScope = {
+      sessionKey: "agent:main:archive-after-file-failure",
+      sessionId: recoverySessionId,
+      storePath,
+    };
+    await replaceSqliteTranscriptEvents(recoveryScope, [
+      createTranscriptEvent(recoverySessionId, "archive after queued failure"),
+    ]);
+    const recoveryPlan = planArchiveWorker(
+      database,
+      path.dirname(storePath),
+      recoverySessionId,
+    );
 
-    await expect(materializeSqliteSessionStateDeletePlans([plan])).rejects.toThrow();
+    const failedArchive = materializeSqliteSessionStateDeletePlans([plan]);
+    const recoveredArchive = materializeSqliteSessionStateDeletePlans([recoveryPlan]);
+
+    await expect(failedArchive).rejects.toThrow();
+    await expect(recoveredArchive).resolves.toMatchObject([
+      {
+        archivedTranscript: {
+          archivedPath: expect.stringContaining(`${recoverySessionId}.jsonl.deleted.`),
+        },
+        sessionId: recoverySessionId,
+      },
+    ]);
     await expect(loadTranscriptEvents(scope)).resolves.toHaveLength(1);
     expect(fs.readFileSync(blockedArchiveDirectory, "utf8")).toBe("not a directory");
   });

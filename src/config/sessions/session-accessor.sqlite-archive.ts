@@ -4,6 +4,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { syncDirectoryBestEffortSync } from "../../infra/directory-durability.js";
+import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
 import {
   encodeSessionArchiveContent,
   readSessionArchiveContentSync,
@@ -255,28 +256,24 @@ function spawnSqliteTranscriptArchiveWorker(
   });
 }
 
-// The old synchronous implementation naturally serialized whole-buffer
-// archives across the process. Preserve that peak-memory bound while moving
-// the work off-thread: independent stores may queue, but only one archive
-// Worker holds a transcript generation in memory at a time.
-let sqliteTranscriptArchiveWorkerTail: Promise<void> = Promise.resolve();
+// Serialize lifecycle archive Workers so this path cannot multiply
+// whole-buffer usage across several Worker heaps at once.
+const sqliteTranscriptArchiveWorkerQueue = new KeyedAsyncQueue();
+const SQLITE_TRANSCRIPT_ARCHIVE_WORKER_QUEUE_KEY = "lifecycle-archive";
 
 function runSqliteTranscriptArchiveWorker(
   plans: readonly SqliteTranscriptArchiveWorkerPlan[],
 ): Promise<SqliteTranscriptArchiveWorkerResult[]> {
-  const execution = sqliteTranscriptArchiveWorkerTail.then(() =>
-    spawnSqliteTranscriptArchiveWorker(plans),
+  return sqliteTranscriptArchiveWorkerQueue.enqueue(
+    SQLITE_TRANSCRIPT_ARCHIVE_WORKER_QUEUE_KEY,
+    () => spawnSqliteTranscriptArchiveWorker(plans),
   );
-  sqliteTranscriptArchiveWorkerTail = execution.then(
-    () => undefined,
-    () => undefined,
-  );
-  return execution;
 }
 
 // Runs duplicate probing, archive write, rename, fsync, and readback outside
-// SQLite write transactions and off the gateway event loop. The global worker
-// queue and per-call dedupe prevent concurrent whole-buffer memory spikes.
+// SQLite write transactions and off the gateway event loop. The lifecycle
+// Worker queue and per-call dedupe prevent concurrent whole-buffer spikes
+// within this path.
 export async function materializeSqliteSessionStateDeletePlans(
   plans: readonly SqliteSessionStateDeletePlan[],
 ): Promise<MaterializedSqliteSessionStateDeletePlan[]> {

@@ -4,7 +4,10 @@ import {
   executeSqliteQueryTakeFirstSync,
 } from "../../infra/kysely-sync.js";
 import { normalizeAgentId, parseAgentSessionKey } from "../../routing/session-key.js";
-import type { OpenClawAgentDatabase } from "../../state/openclaw-agent-db.js";
+import {
+  isIncognitoOpenClawAgentDatabase,
+  type OpenClawAgentDatabase,
+} from "../../state/openclaw-agent-db.js";
 import {
   sqliteSessionStateDeleteSnapshotsEqual,
   type MaterializedSqliteSessionStateDeletePlan,
@@ -213,7 +216,8 @@ export function planSqliteSessionStateDeleteIfUnreferenced(params: {
   return {
     agentId: params.database.agentId,
     archiveDirectory: params.archiveDirectory,
-    archiveTranscript: params.archiveTranscript !== false,
+    archiveTranscript:
+      params.archiveTranscript !== false && !isIncognitoOpenClawAgentDatabase(params.database),
     databasePath: params.database.path,
     reason: params.reason ?? "deleted",
     sessionId: params.sessionId,
