@@ -42,6 +42,7 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
     inst.state.applyEnv();
     const sessionId = "sqlite-large-archive-responsive";
     const sessionKey = "agent:main:dashboard:sqlite-large-archive-responsive";
+    const writerSessionKey = "agent:main:dashboard:sqlite-large-archive-writer";
     const warmupSessionId = "sqlite-archive-worker-warmup";
     const warmupSessionKey = "agent:main:dashboard:sqlite-archive-worker-warmup";
     const storePath = path.join(inst.stateDir, "agents", "main", "sessions", "sessions.json");
@@ -53,6 +54,10 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
 
     try {
       await replaceSessionEntry({ sessionKey, storePath }, { sessionId, updatedAt: Date.now() });
+      await replaceSessionEntry(
+        { sessionKey: writerSessionKey, storePath },
+        { sessionId: "sqlite-large-archive-writer", updatedAt: Date.now() },
+      );
       await replaceSqliteTranscriptEvents({ sessionKey, sessionId, storePath }, events);
       await replaceSessionEntry(
         { sessionKey: warmupSessionKey, storePath },
@@ -128,6 +133,17 @@ describe("SQLite sessions/transcripts flip built CLI proof", () => {
           deleteSettled = true;
         });
       void deletion.catch(() => undefined);
+      const writerStartedAt = performance.now();
+      const writerResult = await probeClient.request<{ key?: string; ok?: boolean }>(
+        "sessions.patch",
+        { key: writerSessionKey, label: "writer-progressed-during-archive" },
+        { timeoutMs: 2_000 },
+      );
+      const writerLatencyMs = performance.now() - writerStartedAt;
+      expect(writerResult).toMatchObject({ ok: true, key: writerSessionKey });
+      expect(writerLatencyMs).toBeLessThan(500);
+      expect(deleteSettled).toBe(false);
+      expect(archivePublishedAt).toBeUndefined();
       const prePublicationProbeLatencies: number[] = [];
       const shouldProbeBeforePublication = () => !deleteSettled && archivePublishedAt === undefined;
       try {
