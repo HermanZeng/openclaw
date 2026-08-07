@@ -6,7 +6,12 @@ import { pipeline } from "node:stream/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
-import { publishFileNoClobber } from "../../infra/directory-durability.js";
+import {
+  getPublishFileExclusiveFailureDetails,
+  publishFileNoClobber,
+  syncDirectory,
+} from "../../infra/directory-durability.js";
+import { sameFileIdentity, type FileIdentityStat } from "../../infra/fs-safe-advanced.js";
 import { FsSafeError } from "../../infra/fs-safe.js";
 import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
 import {
@@ -247,6 +252,34 @@ function removeArchiveTempBestEffort(tempPath: string): void {
   }
 }
 
+function removePublishedArchiveIfOwnedBestEffort(
+  archivePath: string,
+  expectedIdentity: FileIdentityStat,
+): boolean {
+  let currentIdentity: fs.Stats;
+  try {
+    currentIdentity = fs.lstatSync(archivePath);
+  } catch {
+    return false;
+  }
+  if (
+    currentIdentity.isSymbolicLink() ||
+    !currentIdentity.isFile() ||
+    !sameFileIdentity(currentIdentity, expectedIdentity)
+  ) {
+    return false;
+  }
+  // Node has no cross-platform unlink-by-identity primitive. Keep the owner
+  // check and unlink synchronous so no in-process task can replace the path.
+  try {
+    fs.unlinkSync(archivePath);
+    return true;
+  } catch {
+    // Preserve the verification failure; a later retention sweep can retry cleanup.
+    return false;
+  }
+}
+
 function isArchivePublicationCollision(error: unknown): boolean {
   return (
     (error instanceof FsSafeError && error.code === "already-exists") ||
@@ -310,12 +343,14 @@ export async function writeTranscriptArchive(
         sessionId: params.sessionId,
         nowMs: nowMs + attempt,
       })}${encoding.suffix}`;
+      let publishedIdentity: FileIdentityStat | undefined;
       try {
-        await publishFileNoClobber(tempPath, archivePath, {
+        const publication = await publishFileNoClobber(tempPath, archivePath, {
           durability: "degrade",
           moveSource: true,
           strategy: "link-or-copy",
         });
+        publishedIdentity = publication.identity;
         // Publication fences the bytes, but archive pruning can still unlink the
         // pathname after the helper's identity check. Preserve the lifecycle's
         // post-publication existence and content fence before rows may be deleted.
@@ -329,6 +364,18 @@ export async function writeTranscriptArchive(
         }
         return archivePath;
       } catch (error) {
+        const publicationFailure = getPublishFileExclusiveFailureDetails(error);
+        const cleanupIdentity =
+          publishedIdentity ??
+          (publicationFailure?.targetCreated && publicationFailure.cleanup !== "removed"
+            ? publicationFailure.targetIdentity
+            : undefined);
+        if (cleanupIdentity) {
+          const removed = removePublishedArchiveIfOwnedBestEffort(archivePath, cleanupIdentity);
+          if (removed) {
+            await syncDirectory(path.dirname(archivePath)).catch(() => undefined);
+          }
+        }
         if (isArchivePublicationCollision(error)) {
           if (
             transcriptArchiveDigestsEqual(
