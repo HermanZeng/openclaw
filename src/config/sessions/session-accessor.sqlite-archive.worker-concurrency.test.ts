@@ -11,10 +11,10 @@ import {
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
 import { replaceSessionEntry } from "./session-accessor.js";
-import { materializeSqliteTranscriptArchiveInWorker } from "./session-accessor.sqlite-archive.worker.js";
-import { planSqliteSessionStateDeleteIfUnreferenced } from "./session-accessor.sqlite-lifecycle-state.js";
+import { materializeTranscriptArchiveInWorker } from "./session-accessor.sqlite-archive.worker.js";
+import { planSessionStateDeleteIfUnreferenced } from "./session-accessor.sqlite-lifecycle-state.js";
 import { touchTranscriptMutationInTransaction } from "./session-accessor.sqlite-transcript-state.js";
-import { replaceSqliteTranscriptEvents } from "./session-accessor.sqlite.js";
+import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
 const BATCHED_TRANSCRIPT_EVENT_COUNT = 33;
@@ -51,7 +51,7 @@ describe("SQLite transcript archive worker concurrency", () => {
     let batchesRead = 0;
     let concurrentWriteCompleted = false;
 
-    const result = await materializeSqliteTranscriptArchiveInWorker(
+    const result = await materializeTranscriptArchiveInWorker(
       planArchiveWorker(database, path.dirname(storePath), sessionId),
       {
         afterBatchRead: (batchIndex) => {
@@ -96,7 +96,7 @@ describe("SQLite transcript archive worker concurrency", () => {
     database.db.exec("PRAGMA wal_checkpoint(TRUNCATE);");
     let checkpoint: Record<string, unknown> | undefined;
 
-    const result = await materializeSqliteTranscriptArchiveInWorker(
+    const result = await materializeTranscriptArchiveInWorker(
       planArchiveWorker(database, path.dirname(storePath), sessionId),
       {
         afterBatchRead: (batchIndex) => {
@@ -131,7 +131,7 @@ describe("SQLite transcript archive worker concurrency", () => {
     let mutationCount = 0;
 
     await expect(
-      materializeSqliteTranscriptArchiveInWorker(
+      materializeTranscriptArchiveInWorker(
         planArchiveWorker(database, archiveDirectory, sessionId),
         {
           afterBatchRead: (batchIndex) => {
@@ -185,7 +185,7 @@ async function createBatchedTranscript(params: {
     { sessionKey: params.sessionKey, storePath: params.storePath },
     { sessionId: params.sessionId, updatedAt: Date.now() },
   );
-  await replaceSqliteTranscriptEvents(
+  await replaceTranscriptEvents(
     { sessionId: params.sessionId, sessionKey: params.sessionKey, storePath: params.storePath },
     Array.from({ length: BATCHED_TRANSCRIPT_EVENT_COUNT }, (_, index) => ({
       content: `event-${index}`,
@@ -221,7 +221,7 @@ function planArchiveWorker(
   archiveDirectory: string,
   sessionId: string,
 ) {
-  const plan = planSqliteSessionStateDeleteIfUnreferenced({
+  const plan = planSessionStateDeleteIfUnreferenced({
     archiveDirectory,
     database,
     referencedSessionIds: new Set(),

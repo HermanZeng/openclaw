@@ -5,7 +5,7 @@ import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
 import { readSessionArchiveContentSync } from "./archive-compression.js";
-import { writeSqliteTranscriptArchive } from "./session-accessor.sqlite-archive.js";
+import { writeTranscriptArchive } from "./session-accessor.sqlite-archive.js";
 
 describe("SQLite transcript archive stream writer", () => {
   const tempDirs = useAutoCleanupTempDirTracker(afterEach);
@@ -24,7 +24,7 @@ describe("SQLite transcript archive stream writer", () => {
     const sessionId = "whole-content-archive-session";
     const content = `${createTranscriptEventLine(sessionId, "existing caller")}\n`;
 
-    const archivedPath = await writeSqliteTranscriptArchive({
+    const archivedPath = await writeTranscriptArchive({
       archiveDirectory,
       content,
       reason: "bak",
@@ -41,13 +41,13 @@ describe("SQLite transcript archive stream writer", () => {
       text: "\u4f60\u597d\ud83e\udd9e".repeat(32_768),
     })}\n`;
     const contentBytes = Buffer.from(content, "utf8");
-    const first = await writeSqliteTranscriptArchive({
+    const first = await writeTranscriptArchive({
       archiveDirectory,
       contentChunks: splitBuffer(contentBytes, 7),
       reason: "deleted",
       sessionId,
     });
-    const second = await writeSqliteTranscriptArchive({
+    const second = await writeTranscriptArchive({
       archiveDirectory,
       contentChunks: splitBuffer(contentBytes, 4093),
       reason: "deleted",
@@ -67,7 +67,7 @@ describe("SQLite transcript archive stream writer", () => {
     );
     fs.writeFileSync(corruptPath, randomBytes(128));
 
-    const archivedPath = await writeSqliteTranscriptArchive({
+    const archivedPath = await writeTranscriptArchive({
       archiveDirectory,
       contentChunks: [Buffer.from(content, "utf8")],
       reason: "deleted",
@@ -83,7 +83,7 @@ describe("SQLite transcript archive stream writer", () => {
     const sessionId = "failed-stream-verification-session";
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("original\n", "utf8")],
         reason: "deleted",
@@ -110,7 +110,7 @@ describe("SQLite transcript archive stream writer", () => {
     });
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("durability required\n", "utf8")],
         reason: "deleted",
@@ -130,7 +130,7 @@ describe("SQLite transcript archive stream writer", () => {
     });
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("preserve the primary failure\n", "utf8")],
         reason: "deleted",
@@ -144,7 +144,7 @@ describe("SQLite transcript archive stream writer", () => {
     const content = `${createTranscriptEventLine(sessionId, "concurrent publication")}\n`;
     vi.spyOn(Date, "now").mockReturnValue(1_788_000_000_000);
     const writeArchive = () =>
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from(content, "utf8")],
         reason: "deleted",
@@ -169,7 +169,7 @@ describe("SQLite transcript archive stream writer", () => {
     });
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("must remain durable\n", "utf8")],
         reason: "deleted",
@@ -189,7 +189,7 @@ describe("SQLite transcript archive stream writer", () => {
     });
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("verified before publication\n", "utf8")],
         reason: "deleted",
@@ -213,7 +213,7 @@ describe("SQLite transcript archive stream writer", () => {
     });
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("original publication\n", "utf8")],
         reason: "deleted",
@@ -237,7 +237,7 @@ describe("SQLite transcript archive stream writer", () => {
     });
 
     await expect(
-      writeSqliteTranscriptArchive({
+      writeTranscriptArchive({
         archiveDirectory,
         contentChunks: [Buffer.from("verified before publication\n", "utf8")],
         reason: "deleted",

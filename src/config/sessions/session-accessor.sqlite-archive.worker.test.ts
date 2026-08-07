@@ -445,7 +445,7 @@ describe("SQLite transcript archive worker", () => {
     const sessionKey = "agent:main:missing-archive-result";
     const scope = { sessionKey, sessionId, storePath };
     const event = createTranscriptEvent(sessionId, "must survive a missing archive result");
-    await replaceSqliteTranscriptEvents(scope, [event]);
+    await replaceTranscriptEvents(scope, [event]);
     const database = openLifecycleTestDatabase(storePath);
     const plan = planArchiveWorker(database, path.dirname(storePath), sessionId);
 
@@ -669,7 +669,7 @@ describe("SQLite transcript archive worker", () => {
     const archiveDirectory = path.dirname(storePath);
     const database = openLifecycleTestDatabase(storePath);
 
-    const result = await materializeSqliteTranscriptArchiveInWorker(
+    const result = await materializeTranscriptArchiveInWorker(
       planArchiveWorker(database, archiveDirectory, sessionId),
     );
 
@@ -742,7 +742,7 @@ describe("SQLite transcript archive worker", () => {
     const sessionKey = "agent:main:changed-during-archive-verification";
     const scope = { sessionKey, sessionId, storePath };
     const original = createTranscriptEvent(sessionId, "stable read snapshot");
-    await replaceSqliteTranscriptEvents(scope, [original]);
+    await replaceTranscriptEvents(scope, [original]);
     const database = openLifecycleTestDatabase(storePath);
     const plan = planArchiveWorker(database, path.dirname(storePath), sessionId);
     let mutationCount = 0;
@@ -753,9 +753,9 @@ describe("SQLite transcript archive worker", () => {
       },
     });
 
-    let workerResult: Awaited<ReturnType<typeof materializeSqliteTranscriptArchiveInWorker>>;
+    let workerResult: Awaited<ReturnType<typeof materializeTranscriptArchiveInWorker>>;
     try {
-      workerResult = await materializeSqliteTranscriptArchiveInWorker(plan);
+      workerResult = await materializeTranscriptArchiveInWorker(plan);
     } finally {
       __setFsSafeTestHooksForTest();
     }
