@@ -11,7 +11,7 @@ import {
   canAdmitInGroup,
   type CommandLaneBlockReason,
   type CommandLaneGroupSpec,
-  drainCommandLaneGroup,
+  drainGroupSiblings,
   getGroupRegistry,
   getLaneGroup,
   getMemberActiveCount,
@@ -497,7 +497,7 @@ function drainLane(
 
 function drainReadyCommandLane(lane: string, completedState?: LaneState): void {
   if (getLaneGroup(lane)) {
-    drainCommandLaneGroup(lane, drainLane);
+    drainGroupSiblings(lane, drainLane);
     return;
   }
   // An idle scoped lane may have been retired and recreated while an older
