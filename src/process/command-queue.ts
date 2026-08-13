@@ -406,8 +406,11 @@ async function runQueueEntryTask(
   }
 }
 
-function drainLane(lane: string, maxStarts = Number.POSITIVE_INFINITY): number {
-  const state = getLaneState(lane);
+function drainLane(
+  lane: string,
+  maxStarts = Number.POSITIVE_INFINITY,
+  state = getLaneState(lane),
+): number {
   if (state.draining) {
     if (state.activeTaskIds.size === 0 && state.queue.length > 0) {
       diag.warn(
@@ -461,7 +464,7 @@ function drainLane(lane: string, maxStarts = Number.POSITIVE_INFINITY): number {
             diag.debug(
               `lane task done: lane=${lane} durationMs=${Date.now() - startTime} active=${state.activeTaskIds.size} queued=${state.queue.length}`,
             );
-            drainReadyCommandLane(lane);
+            drainReadyCommandLane(lane, state);
           }
           entry.resolve(result);
         } catch (err) {
@@ -479,7 +482,7 @@ function drainLane(lane: string, maxStarts = Number.POSITIVE_INFINITY): number {
           }
           if (completedCurrentGeneration) {
             notifyActiveTaskWaiters();
-            drainReadyCommandLane(lane);
+            drainReadyCommandLane(lane, state);
           }
           entry.reject(err);
         }
@@ -492,12 +495,15 @@ function drainLane(lane: string, maxStarts = Number.POSITIVE_INFINITY): number {
   return started;
 }
 
-function drainReadyCommandLane(lane: string): void {
+function drainReadyCommandLane(lane: string, completedState?: LaneState): void {
   if (getLaneGroup(lane)) {
     drainCommandLaneGroup(lane, drainLane);
     return;
   }
-  drainLane(lane);
+  // An idle scoped lane may have been retired and recreated while an older
+  // task was finishing. Preserve the completion's captured state so its drain
+  // cannot retire a newer registry entry that it never owned.
+  drainLane(lane, Number.POSITIVE_INFINITY, completedState);
 }
 
 /**
