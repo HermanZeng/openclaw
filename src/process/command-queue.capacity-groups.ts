@@ -10,7 +10,7 @@ import { CommandLane } from "./lanes.js";
 type DrainLaneFn = (lane: string) => void;
 
 /** Internal bounded drain contract used by the group arbiter. */
-type BoundedDrainLaneFn = (lane: string, maxStarts?: number) => number;
+type BoundedDrainLaneFn = (lane: string, maxStarts?: number) => number | void;
 
 /** Why a lane cannot admit, from the narrowest cause outward. */
 export type CommandLaneBlockReason = "lane" | "group-budget" | "sibling-reservation" | null;
@@ -284,5 +284,5 @@ function drainCommandLaneGroup(lane: string, drainLane: BoundedDrainLaneFn): voi
  * consumers; the supplied queue drain also supports the private bounded call.
  */
 export function drainGroupSiblings(lane: string, drainLane: DrainLaneFn): void {
-  drainCommandLaneGroup(lane, drainLane as BoundedDrainLaneFn);
+  drainCommandLaneGroup(lane, drainLane);
 }
