@@ -76,7 +76,7 @@ type SqliteSessionEntrySelectionSnapshot = {
   selected: ResolvedSessionEntryRow | undefined;
   selectedRows: Array<{ entry: SessionEntry; sessionKey: string }>;
 };
-type SqliteLifecycleTargetSnapshot = {
+export type SqliteLifecycleTargetSnapshot = {
   primary: { entry: SessionEntry; key: string } | undefined;
   rows: Array<{ entry: SessionEntry; sessionKey: string }>;
 };

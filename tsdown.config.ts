@@ -360,6 +360,8 @@ function buildCoreDistEntries(): Record<string, string> {
     "agents/prepared-model-catalog.worker": "src/agents/prepared-model-catalog.worker.ts",
     "config/sessions/session-accessor.sqlite-archive.worker":
       "src/config/sessions/session-accessor.sqlite-archive.worker.ts",
+    "config/sessions/session-accessor.sqlite-reclamation.worker":
+      "src/config/sessions/session-accessor.sqlite-reclamation.worker.ts",
     "config/sessions/session-transcript-reconcile.worker":
       "src/config/sessions/session-transcript-reconcile.worker.ts",
     "infra/sqlite-readonly-location.worker": "src/infra/sqlite-readonly-location.worker.ts",

@@ -156,6 +156,7 @@ const rootEntries = [
   "scripts/e2e/lib/**/{assertions,probe,mock-server}.{js,mjs,ts}!",
   // Loaded by URL from the SQLite lifecycle archive owner.
   "src/config/sessions/session-accessor.sqlite-archive.worker.ts!",
+  "src/config/sessions/session-accessor.sqlite-reclamation.worker.ts!",
   "src/state/openclaw-database-verify.worker.ts!",
   // Spawned by path from sqlite-readonly-location.ts to isolate raw-fd snapshot preparation.
   "src/infra/sqlite-readonly-location.worker.ts!",

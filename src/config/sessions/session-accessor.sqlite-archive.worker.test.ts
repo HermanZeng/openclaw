@@ -12,10 +12,12 @@ import {
   openOpenClawAgentDatabase,
   runOpenClawAgentWriteTransaction,
 } from "../../state/openclaw-agent-db.js";
+import { ensureSessionTranscriptArchiveSchema } from "../../state/openclaw-agent-session-transcript-archive-schema.js";
 import { appendSqliteTrajectoryRuntimeEvents } from "../../trajectory/runtime-store.sqlite.js";
 import type { TrajectoryEvent } from "../../trajectory/types.js";
 import { decodeSessionArchiveBytes, readSessionArchiveContentSync } from "./archive-compression.js";
 import {
+  assignSessionOwner,
   applySessionEntryLifecycleMutation,
   deleteSessionEntryLifecycle,
   loadSessionEntry,
@@ -23,10 +25,12 @@ import {
   replaceSessionEntry,
 } from "./session-accessor.js";
 import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-archive.js";
+import { readLifecycleTargetSnapshot } from "./session-accessor.sqlite-entry-store.js";
 import {
   deleteMaterializedSessionStatePlans,
   planSessionStateDeleteIfUnreferenced,
 } from "./session-accessor.sqlite-lifecycle-state.js";
+import { reclaimSqliteSessionEntryInTransaction } from "./session-accessor.sqlite-reclamation.js";
 import { touchTranscriptMutationInTransaction } from "./session-accessor.sqlite-transcript-state.js";
 import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
@@ -134,6 +138,84 @@ describe("SQLite transcript archive worker", () => {
         )
         .get(sessionId),
     ).toMatchObject({ published_at: expect.any(Number), session_key: sessionKey });
+  });
+
+  it("preserves projected owner fields across worker reclamation", async () => {
+    const sessionId = "owner-projected-reclamation-session";
+    const sessionKey = "agent:main:owner-projected-reclamation";
+    const scope = { agentId: "main", sessionId, sessionKey, storePath };
+    await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
+    expect(
+      assignSessionOwner(scope, {
+        assignedAt: 1234,
+        assignedBy: { id: "operator", type: "human" },
+        owner: { id: "research", type: "agent" },
+      }),
+    ).toMatchObject({ actor: { id: "research", type: "agent" } });
+
+    const result = await deleteSessionEntryLifecycle({
+      agentId: "main",
+      archiveTranscript: false,
+      expectedEntry: loadSessionEntry(scope),
+      storePath,
+      target: { canonicalKey: sessionKey, storeKeys: [sessionKey] },
+    });
+
+    expect(result).toMatchObject({
+      deleted: true,
+      deletedEntry: {
+        owner: {
+          actor: { id: "research", type: "agent" },
+          assignedAt: 1234,
+          assignedBy: { id: "operator", type: "human" },
+        },
+      },
+    });
+    expect(loadSessionEntry(scope)).toBeUndefined();
+  });
+
+  it("rolls back reclamation when entry deletion fails after archive persistence", async () => {
+    const sessionId = "atomic-reclamation-rollback-session";
+    const sessionKey = "agent:main:atomic-reclamation-rollback";
+    const scope = { sessionKey, sessionId, storePath };
+    const event = createTranscriptEvent(sessionId, "preserve the complete transaction");
+    await replaceSessionEntry(scope, { sessionId, updatedAt: Date.now() });
+    await replaceTranscriptEvents(scope, [event]);
+    const database = openLifecycleTestDatabase(storePath);
+    ensureSessionTranscriptArchiveSchema(database.db);
+    const target = { canonicalKey: sessionKey, storeKeys: [sessionKey] };
+    const preparedTargetSnapshot = readLifecycleTargetSnapshot(database, target);
+    const materializedPlans = await materializeSessionStateDeletePlans([
+      planArchiveWorker(database, path.dirname(storePath), sessionId),
+    ]);
+    // sqlite-allow-raw -- fixture trigger forces failure after transcript/archive mutations.
+    database.db.exec(`
+      CREATE TEMP TRIGGER fail_atomic_session_node_delete
+      BEFORE DELETE ON main.session_nodes
+      WHEN OLD.session_key = '${sessionKey}'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced atomic reclamation rollback');
+      END;
+    `);
+    expect(() =>
+      reclaimSqliteSessionEntryInTransaction({
+        databaseOptions: { agentId: database.agentId, path: database.path },
+        materializedPlans,
+        params: { archiveTranscript: true, storePath, target },
+        preparedTargetSnapshot,
+      }),
+    ).toThrow("forced atomic reclamation rollback");
+
+    expect(loadSessionEntry(scope)).toMatchObject({ sessionId });
+    await expect(loadTranscriptEvents(scope)).resolves.toEqual([event]);
+    expect(
+      database.db.prepare("SELECT 1 FROM session_windows WHERE session_id = ?").get(sessionId),
+    ).toEqual({ 1: 1 });
+    expect(
+      database.db
+        .prepare("SELECT 1 FROM session_transcript_archives WHERE session_id = ?")
+        .get(sessionId),
+    ).toBeUndefined();
   });
 
   it("retains distinct transcript generations after a physical session id is restored", async () => {
