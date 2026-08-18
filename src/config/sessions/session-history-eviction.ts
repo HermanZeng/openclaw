@@ -25,10 +25,13 @@ import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-ar
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import {
   collectSessionStateIdsForEntry,
-  deleteMaterializedSessionStatePlans,
   planSessionStateDeleteIfUnreferenced,
   readReferencedSessionIds,
 } from "./session-accessor.sqlite-lifecycle-state.js";
+import {
+  runExclusiveSqliteSessionReclamation,
+  runSqliteHistoryEvictionReclamation,
+} from "./session-accessor.sqlite-reclamation.js";
 import {
   getSessionKysely,
   resolveSqliteScope,
@@ -630,50 +633,30 @@ async function enforceSessionHistoryMaintenanceSerialized(
         }
         // Extract-before-delete is the retention invariant. The lifecycle hold
         // fences admission while the store writer is released for archive I/O.
-        const materialized = await materializeSessionStateDeletePlans([plan]);
-        const committedArchives = await runExclusiveSqliteSessionWrite(resolved, async () => {
-          let deleted = false;
-          let archivedTranscripts: ReturnType<typeof deleteMaterializedSessionStatePlans> = [];
-          runOpenClawAgentWriteTransaction((transactionDb) => {
+        const committed = await runExclusiveSqliteSessionReclamation(async () => {
+          const materialized = await materializeSessionStateDeletePlans([plan]);
+          return await runExclusiveSqliteSessionWrite(resolved, async () => {
+            // The lifecycle mutation fences new work for this candidate while the
+            // writer lane keeps database references stable through Worker commit.
             const protectedAtDelete = collectCandidateProtectedHistoricalSessionIds({
-              database: transactionDb,
+              database,
               preserveRecentMs: params.maintenance.preserveRecentMs,
               sessionId,
               storePath: params.storePath,
             });
-            archivedTranscripts = deleteMaterializedSessionStatePlans(
-              transactionDb,
-              materialized,
-              protectedAtDelete,
-            );
-            const db = getSessionKysely(transactionDb.db);
-            deleted =
-              executeSqliteQuerySync(
-                transactionDb.db,
-                db
-                  .selectFrom("session_windows")
-                  .select("session_id")
-                  .where("session_id", "=", sessionId),
-              ).rows.length === 0;
-          }, toDatabaseOptions(resolved));
-          if (!deleted) {
-            return null;
-          }
-          try {
-            // The deletion is committed; checkpoint/incremental-vacuum failure
-            // must not hide it from accounting or observers. Pages reclaim on
-            // a later pass instead.
-            reclaimSqliteFreePages(database);
-          } catch {
-            // Best-effort reclamation only.
-          }
-          return archivedTranscripts;
+            return await runSqliteHistoryEvictionReclamation({
+              databaseOptions: toDatabaseOptions(resolved),
+              materializedPlans: materialized,
+              protectedSessionIds: protectedAtDelete,
+              sessionId,
+            });
+          });
         });
-        if (!committedArchives) {
+        if (!committed.deleted) {
           return null;
         }
         return {
-          archivedTranscripts: committedArchives,
+          archivedTranscripts: committed.archivedTranscripts,
         };
       },
     });

@@ -9,10 +9,11 @@ import type {
 } from "./session-accessor.sqlite-contract.js";
 import type { SessionStateDeleteSnapshot } from "./session-accessor.sqlite-delete-snapshot.types.js";
 import type { SqliteLifecycleTargetSnapshot } from "./session-accessor.sqlite-entry-store.js";
+import type { SessionEntryRemovalPlan } from "./session-accessor.sqlite-lifecycle-types.js";
 import {
-  reclaimSqliteSessionEntryInTransaction,
-  type SqliteSessionEntryReclamationPlan,
+  reclaimSqliteSessionInTransaction,
   type SqliteSessionEntryReclamationWorkerMessage,
+  type SqliteSessionReclamationPlan,
 } from "./session-accessor.sqlite-reclamation.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
@@ -281,7 +282,28 @@ function parseMaterializedPlans(value: unknown): MaterializedSessionStateDeleteP
   return plans;
 }
 
-function parseWorkerPlan(value: unknown): SqliteSessionEntryReclamationPlan | undefined {
+function parseEntryRemovalPlans(value: unknown): SessionEntryRemovalPlan[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const entries: SessionEntryRemovalPlan[] = [];
+  for (const entryValue of value) {
+    if (!isRecord(entryValue) || typeof entryValue.sessionKey !== "string") {
+      return undefined;
+    }
+    const expectedEntry =
+      entryValue.expectedEntry === undefined
+        ? undefined
+        : parseSessionEntry(entryValue.expectedEntry);
+    if (entryValue.expectedEntry !== undefined && !expectedEntry) {
+      return undefined;
+    }
+    entries.push({ expectedEntry, sessionKey: entryValue.sessionKey });
+  }
+  return entries;
+}
+
+function parseWorkerPlan(value: unknown): SqliteSessionReclamationPlan | undefined {
   if (!isRecord(value) || !isRecord(value.databaseOptions)) {
     return undefined;
   }
@@ -290,31 +312,62 @@ function parseWorkerPlan(value: unknown): SqliteSessionEntryReclamationPlan | un
   const databasePath = databaseOptions.path;
   const env = parseEnvironment(databaseOptions.env);
   const materializedPlans = parseMaterializedPlans(value.materializedPlans);
-  const params = parseDeleteParams(value.params);
-  const preparedTargetSnapshot = parseLifecycleTargetSnapshot(value.preparedTargetSnapshot);
   if (
     typeof agentId !== "string" ||
     typeof databasePath !== "string" ||
     env === null ||
-    !materializedPlans ||
-    !params ||
-    !preparedTargetSnapshot?.primary
+    !materializedPlans
   ) {
     return undefined;
   }
-  return {
-    databaseOptions: {
-      agentId,
-      ...(env !== undefined ? { env } : {}),
-      path: databasePath,
-    } satisfies OpenClawAgentDatabaseOptions & { path: string },
-    materializedPlans,
-    params,
-    preparedTargetSnapshot,
-  };
+  const parsedDatabaseOptions = {
+    agentId,
+    ...(env !== undefined ? { env } : {}),
+    path: databasePath,
+  } satisfies OpenClawAgentDatabaseOptions & { path: string };
+  if (value.kind === "entry") {
+    const params = parseDeleteParams(value.params);
+    const preparedTargetSnapshot = parseLifecycleTargetSnapshot(value.preparedTargetSnapshot);
+    if (!params || !preparedTargetSnapshot?.primary) {
+      return undefined;
+    }
+    return {
+      databaseOptions: parsedDatabaseOptions,
+      kind: value.kind,
+      materializedPlans,
+      params,
+      preparedTargetSnapshot,
+    };
+  }
+  if (value.kind === "lifecycle-artifacts") {
+    const entries = parseEntryRemovalPlans(value.entries);
+    if (!entries) {
+      return undefined;
+    }
+    return {
+      databaseOptions: parsedDatabaseOptions,
+      entries,
+      kind: value.kind,
+      materializedPlans,
+    };
+  }
+  if (value.kind === "history-eviction") {
+    const protectedSessionIds = parseStringArray(value.protectedSessionIds);
+    if (!protectedSessionIds || typeof value.sessionId !== "string") {
+      return undefined;
+    }
+    return {
+      databaseOptions: parsedDatabaseOptions,
+      kind: value.kind,
+      materializedPlans,
+      protectedSessionIds,
+      sessionId: value.sessionId,
+    };
+  }
+  return undefined;
 }
 
-if (isRecord(workerData) && workerData.type === "sqlite-session-entry-reclamation-v1") {
+if (isRecord(workerData) && workerData.type === "sqlite-session-reclamation-v2") {
   if (!parentPort) {
     throw new Error("SQLite session reclamation worker requires a parent port");
   }
@@ -322,7 +375,7 @@ if (isRecord(workerData) && workerData.type === "sqlite-session-entry-reclamatio
   if (!plan) {
     throw new Error("SQLite session reclamation worker requires valid plan data");
   }
-  const result = reclaimSqliteSessionEntryInTransaction(plan);
+  const result = reclaimSqliteSessionInTransaction(plan);
   const postMessage = parentPort.postMessage.bind(parentPort);
   postMessage({
     result,

@@ -38,9 +38,7 @@ import {
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
 import { emitCommittedSessionEntryRemovals } from "./session-accessor.sqlite-identity.js";
 import {
-  assertPlannedLifecycleArtifactEntriesUnchanged,
   deleteMaterializedSessionStatePlans,
-  deletePlannedLifecycleArtifactEntries,
   planSessionLifecycleArtifactCleanup,
   planSessionStateDeleteIfUnreferenced,
   readSessionGenerationIdsForKeys,
@@ -49,7 +47,8 @@ import {
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import { loadTranscriptEventsFromDatabase } from "./session-accessor.sqlite-read.js";
 import {
-  runExclusiveSqliteSessionEntryReclamation,
+  runExclusiveSqliteSessionReclamation,
+  runSqliteLifecycleArtifactReclamation,
   runSqliteSessionEntryReclamation,
   shouldDeleteSqliteSessionEntryLifecycle,
 } from "./session-accessor.sqlite-reclamation.js";
@@ -103,26 +102,17 @@ export async function cleanupSessionLifecycleArtifactsCore(
       nowMs: params.nowMs ?? Date.now(),
     });
   });
-  const materializedPlans = await materializeSessionStateDeletePlans(cleanupPlan.deletePlans);
-  const committed = await runExclusiveSqliteSessionWrite(resolved, async () => {
-    let removedEntries = 0;
-    let archivedTranscripts: SessionLifecycleArchivedTranscript[] = [];
-    runOpenClawAgentWriteTransaction((transactionDb) => {
-      assertPlannedLifecycleArtifactEntriesUnchanged(transactionDb, cleanupPlan.entries);
-      archivedTranscripts = deleteMaterializedSessionStatePlans(
-        transactionDb,
+  const committed = await runExclusiveSqliteSessionReclamation(async () => {
+    const materializedPlans = await materializeSessionStateDeletePlans(cleanupPlan.deletePlans);
+    return await runExclusiveSqliteSessionWrite(resolved, async () =>
+      runSqliteLifecycleArtifactReclamation({
+        databaseOptions,
+        entries: cleanupPlan.entries,
         materializedPlans,
-        undefined,
-        new Set(cleanupPlan.entries.map((entry) => entry.sessionKey)),
-      );
-      removedEntries = deletePlannedLifecycleArtifactEntries(transactionDb, cleanupPlan.entries);
-    }, databaseOptions);
-    emitCommittedSessionEntryRemovals(cleanupPlan.entries);
-    return {
-      removedEntries,
-      archivedTranscripts,
-    };
+      }),
+    );
   });
+  emitCommittedSessionEntryRemovals(cleanupPlan.entries);
   const archivedTranscripts = await publishSessionStateArchives(
     resolved,
     committed.archivedTranscripts,
@@ -435,7 +425,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
 
   // Archive materialization remains outside the store writer lane. The global
   // reclamation lane bounds whole-buffer residency until the Worker exits.
-  const result = await runExclusiveSqliteSessionEntryReclamation(async () => {
+  const result = await runExclusiveSqliteSessionReclamation(async () => {
     const materializedPlans = await materializeSessionStateDeletePlans(prepared.entryPlans);
     return await runExclusiveSqliteSessionWrite(resolved, async () =>
       runSqliteSessionEntryReclamation({

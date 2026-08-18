@@ -1,9 +1,13 @@
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const evictionWarnSpy = vi.hoisted(() => vi.fn());
+const archiveMaterializationHook = vi.hoisted(() => ({
+  afterMaterialize: undefined as (() => void) | undefined,
+}));
 vi.mock("../../logging/subsystem.js", async () => {
   const actual = await vi.importActual<typeof import("../../logging/subsystem.js")>(
     "../../logging/subsystem.js",
@@ -15,6 +19,19 @@ vi.mock("../../logging/subsystem.js", async () => {
       return subsystem === "sessions/history-eviction"
         ? { ...logger, warn: evictionWarnSpy }
         : logger;
+    },
+  };
+});
+vi.mock("./session-accessor.sqlite-archive.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-accessor.sqlite-archive.js")>();
+  return {
+    ...actual,
+    materializeSessionStateDeletePlans: async (
+      ...args: Parameters<typeof actual.materializeSessionStateDeletePlans>
+    ) => {
+      const result = await actual.materializeSessionStateDeletePlans(...args);
+      archiveMaterializationHook.afterMaterialize?.();
+      return result;
     },
   };
 });
@@ -37,6 +54,9 @@ import {
   replaceSessionEntry,
   resetSessionEntryLifecycle,
 } from "./session-accessor.js";
+import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-archive.js";
+import { planSessionStateDeleteIfUnreferenced } from "./session-accessor.sqlite-lifecycle-state.js";
+import { reclaimSqliteSessionInTransaction } from "./session-accessor.sqlite-reclamation.js";
 import { getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import {
   enforceSqliteSessionHistoryDiskBudget,
@@ -61,6 +81,7 @@ describe("SQLite historical session disk budget", () => {
   });
 
   afterEach(async () => {
+    archiveMaterializationHook.afterMaterialize = undefined;
     await enforceSqliteSessionHistoryDiskBudget({
       storePath,
       mode: "warn",
@@ -112,6 +133,89 @@ describe("SQLite historical session disk budget", () => {
     expect(readArchiveNames("oldest-history")).toHaveLength(1);
     expect(readArchiveNames("newer-history")).toHaveLength(0);
   });
+
+  it("keeps the event loop responsive while disk-budget eviction commits large history", async () => {
+    const rows = 100_000;
+    const sessionId = "large-budget-history";
+    await createHistoricalTranscript({
+      content: "large budget history",
+      nextSessionId: "large-budget-live",
+      sessionId,
+      sessionKey: "agent:main:large-budget-history",
+      updatedAt: 1,
+    });
+    const owner = database();
+    const insert = owner.db.prepare(
+      "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?, ?, ?, ?)",
+    );
+    const eventJson = JSON.stringify({
+      type: "message",
+      message: { content: "large budget history", role: "user" },
+    });
+    const initialSeq = Number(
+      (
+        owner.db
+          .prepare("SELECT max(seq) AS seq FROM transcript_events WHERE session_id = ?")
+          .get(sessionId) as { seq: number | bigint }
+      ).seq,
+    );
+    // sqlite-allow-raw -- bulk fixture setup stays outside the measured eviction commit.
+    owner.db.exec("BEGIN IMMEDIATE");
+    try {
+      for (let index = 1; index < rows; index += 1) {
+        insert.run(sessionId, initialSeq + index, eventJson, index);
+      }
+      // sqlite-allow-raw -- commits the deterministic fixture before measurement.
+      owner.db.exec("COMMIT");
+    } catch (error) {
+      // sqlite-allow-raw -- releases the failed fixture transaction.
+      owner.db.exec("ROLLBACK");
+      throw error;
+    }
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+
+    const samples: number[] = [];
+    let previous = 0;
+    let heartbeat: ReturnType<typeof setInterval> | undefined;
+    archiveMaterializationHook.afterMaterialize = () => {
+      previous = performance.now();
+      heartbeat = setInterval(() => {
+        const current = performance.now();
+        samples.push(current - previous);
+        previous = current;
+      }, 10);
+    };
+
+    let result: Awaited<ReturnType<typeof enforceSqliteSessionHistoryDiskBudget>>;
+    try {
+      result = await enforceSqliteSessionHistoryDiskBudget({
+        storePath,
+        mode: "enforce",
+        maintenance: {
+          maxDiskBytes: before.totalBytes - 1,
+          highWaterBytes: before.totalBytes - 1,
+        },
+      });
+    } finally {
+      if (heartbeat) {
+        clearInterval(heartbeat);
+      }
+    }
+
+    const maxGapMs = Math.max(...samples);
+    if (process.env.OPENCLAW_TEST_RECLAMATION_LOG === "1") {
+      process.stdout.write(
+        `${JSON.stringify({ owner: "history-eviction", rows, maxGapMs, result })}\n`,
+      );
+    }
+    expect(result?.removedEntries).toBe(1);
+    expect(samples.length).toBeGreaterThan(0);
+    expect(maxGapMs).toBeLessThan(500);
+    expect(sessionExists(sessionId)).toBe(false);
+    expect(sessionExists("large-budget-live")).toBe(true);
+    expect(readArchiveNames(sessionId)).toHaveLength(1);
+  }, 120_000);
 
   it("remeasures incompressible archive publication before declaring high water", async () => {
     const sessionId = "incompressible-history";
@@ -322,6 +426,91 @@ describe("SQLite historical session disk budget", () => {
     } finally {
       admission.release();
     }
+  });
+
+  it("preserves a candidate referenced after archive materialization", async () => {
+    const sessionId = "late-protected-history";
+    await createHistoricalTranscript({
+      content: "late protected history",
+      nextSessionId: "late-protected-live",
+      sessionId,
+      sessionKey: "agent:main:late-protected-history",
+      updatedAt: 1,
+    });
+    settlePhysicalUsage();
+    const before = await measureSessionPhysicalDiskUsage(storePath);
+    archiveMaterializationHook.afterMaterialize = () => {
+      addRouteReference("late-protected-route", sessionId);
+    };
+
+    const result = await enforceSqliteSessionHistoryDiskBudget({
+      storePath,
+      mode: "enforce",
+      maintenance: {
+        maxDiskBytes: before.totalBytes - 1,
+        highWaterBytes: 0,
+      },
+    });
+
+    expect(result?.removedEntries).toBe(0);
+    expect(sessionExists(sessionId)).toBe(true);
+    expect(sessionExists("late-protected-live")).toBe(true);
+    expect(readArchiveNames(sessionId)).toHaveLength(0);
+  });
+
+  it("rolls back disk-budget eviction when transcript deletion fails after archive persistence", async () => {
+    const sessionId = "budget-reclamation-rollback";
+    await createHistoricalTranscript({
+      content: "budget rollback history",
+      nextSessionId: "budget-rollback-live",
+      sessionId,
+      sessionKey: "agent:main:budget-reclamation-rollback",
+      updatedAt: 1,
+    });
+    const owner = database();
+    const plan = planSessionStateDeleteIfUnreferenced({
+      archiveDirectory: tempDir,
+      archiveTranscript: true,
+      database: owner,
+      referencedSessionIds: new Set(),
+      sessionId,
+    });
+    if (!plan) {
+      throw new Error("expected disk-budget rollback plan");
+    }
+    const materializedPlans = await materializeSessionStateDeletePlans([plan]);
+    // sqlite-allow-raw -- connection-local trigger injects a deterministic mid-transaction failure.
+    owner.db.exec(`
+      CREATE TEMP TRIGGER fail_budget_transcript_delete
+      BEFORE DELETE ON main.transcript_events
+      WHEN OLD.session_id = '${sessionId}'
+      BEGIN
+        SELECT RAISE(ABORT, 'forced budget reclamation rollback');
+      END;
+    `);
+    try {
+      expect(() =>
+        reclaimSqliteSessionInTransaction({
+          databaseOptions: { agentId: owner.agentId, path: owner.path },
+          kind: "history-eviction",
+          materializedPlans,
+          protectedSessionIds: [],
+          sessionId,
+        }),
+      ).toThrow("forced budget reclamation rollback");
+    } finally {
+      // sqlite-allow-raw -- remove the connection-local deterministic failure fixture.
+      owner.db.exec("DROP TRIGGER IF EXISTS temp.fail_budget_transcript_delete");
+    }
+
+    expect(sessionExists(sessionId)).toBe(true);
+    expect(sessionExists("budget-rollback-live")).toBe(true);
+    expect(readArchiveNames(sessionId)).toHaveLength(0);
+    expect(
+      owner.db
+        .prepare("SELECT 1 FROM session_transcript_archives WHERE session_id = ?")
+        .get(sessionId),
+    ).toBeUndefined();
   });
 
   it("preserves every generation of a recently active session under physical pressure", async () => {

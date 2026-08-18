@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
-import { runExclusiveSqliteSessionEntryReclamation } from "./session-accessor.sqlite-reclamation.js";
+import { runExclusiveSqliteSessionReclamation } from "./session-accessor.sqlite-reclamation.js";
 
 describe("SQLite session entry reclamation queue", () => {
   it("holds later materialization work until the active reclamation phase settles", async () => {
@@ -8,14 +8,14 @@ describe("SQLite session entry reclamation queue", () => {
     const firstGate = createDeferred();
     const firstStarted = createDeferred();
 
-    const first = runExclusiveSqliteSessionEntryReclamation(async () => {
+    const first = runExclusiveSqliteSessionReclamation(async () => {
       events.push("first:materialize");
       firstStarted.resolve();
       await firstGate.promise;
       events.push("first:reclaimed");
     });
     await firstStarted.promise;
-    const second = runExclusiveSqliteSessionEntryReclamation(async () => {
+    const second = runExclusiveSqliteSessionReclamation(async () => {
       events.push("second:materialize");
       events.push("second:reclaimed");
     });

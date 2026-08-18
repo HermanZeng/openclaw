@@ -30,7 +30,7 @@ import {
   deleteMaterializedSessionStatePlans,
   planSessionStateDeleteIfUnreferenced,
 } from "./session-accessor.sqlite-lifecycle-state.js";
-import { reclaimSqliteSessionEntryInTransaction } from "./session-accessor.sqlite-reclamation.js";
+import { reclaimSqliteSessionInTransaction } from "./session-accessor.sqlite-reclamation.js";
 import { touchTranscriptMutationInTransaction } from "./session-accessor.sqlite-transcript-state.js";
 import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
@@ -198,8 +198,9 @@ describe("SQLite transcript archive worker", () => {
       END;
     `);
     expect(() =>
-      reclaimSqliteSessionEntryInTransaction({
+      reclaimSqliteSessionInTransaction({
         databaseOptions: { agentId: database.agentId, path: database.path },
+        kind: "entry",
         materializedPlans,
         params: { archiveTranscript: true, storePath, target },
         preparedTargetSnapshot,
