@@ -16,6 +16,7 @@ import {
 const SESSION_ID = "phase3-reclamation-e2e";
 const SESSION_KEY = "discord:group:phase3-reclamation-e2e";
 const CANONICAL_SESSION_KEY = `agent:main:${SESSION_KEY}`;
+const HISTORICAL_SESSION_ID = "phase3-reclamation-e2e-history";
 const UNRELATED_SESSION_ID = "phase3-reclamation-unrelated";
 const UNRELATED_SESSION_KEY = "discord:group:phase3-reclamation-unrelated";
 const ROWS = 200_000;
@@ -64,10 +65,27 @@ function seedTranscriptState(storePath: string): void {
   // sqlite-allow-raw -- bulk fixture setup stays outside the measured delete path.
   database.db.exec("BEGIN IMMEDIATE");
   try {
+    database.db
+      .prepare(
+        `INSERT INTO session_windows (
+           session_id, session_key, reason, session_scope, created_at, updated_at
+         )
+         SELECT ?, session_key, 'initial', session_scope, ?, ?
+         FROM session_windows
+         WHERE session_id = ?`,
+      )
+      .run(HISTORICAL_SESSION_ID, now - 1, now - 1, SESSION_ID);
+    database.db
+      .prepare(
+        `UPDATE session_windows
+         SET previous_session_id = ?, reason = 'reset'
+         WHERE session_id = ?`,
+      )
+      .run(HISTORICAL_SESSION_ID, SESSION_ID);
     for (let index = 0; index < ROWS; index += 1) {
-      insertEvent.run(SESSION_ID, index, eventJson, now + index);
-      insertActive.run(SESSION_ID, index, index, index);
-      insertFts.run(SESSION_ID, `${SESSION_ID}-message-${index}`, now);
+      insertEvent.run(HISTORICAL_SESSION_ID, index, eventJson, now + index);
+      insertActive.run(HISTORICAL_SESSION_ID, index, index, index);
+      insertFts.run(HISTORICAL_SESSION_ID, `${HISTORICAL_SESSION_ID}-message-${index}`, now);
     }
     database.db
       .prepare(
@@ -76,11 +94,28 @@ function seedTranscriptState(storePath: string): void {
            active_message_count, updated_at
          ) VALUES (?, ?, 0, ?, ?, ?)`,
       )
-      .run(SESSION_ID, ROWS - 1, ROWS, ROWS, now);
+      .run(HISTORICAL_SESSION_ID, ROWS - 1, ROWS, ROWS, now);
     database.db
       .prepare(
         `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at)
          VALUES (?, 'phase3-e2e-generation', ?)`,
+      )
+      .run(HISTORICAL_SESSION_ID, now);
+    insertEvent.run(SESSION_ID, 0, eventJson, now);
+    insertActive.run(SESSION_ID, 0, 0, 0);
+    insertFts.run(SESSION_ID, `${SESSION_ID}-message-0`, now);
+    database.db
+      .prepare(
+        `INSERT INTO session_transcript_index_state (
+           session_id, indexed_seq, needs_rebuild, active_event_count,
+           active_message_count, updated_at
+         ) VALUES (?, 0, 0, 1, 1, ?)`,
+      )
+      .run(SESSION_ID, now);
+    database.db
+      .prepare(
+        `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at)
+         VALUES (?, 'phase3-e2e-current-generation', ?)`,
       )
       .run(SESSION_ID, now);
     insertEvent.run(
@@ -117,7 +152,7 @@ function seedTranscriptState(storePath: string): void {
   }
 }
 
-test("sessions.delete keeps the Gateway responsive during final transcript reclamation", async () => {
+test("sessions.delete keeps the Gateway responsive while reclaiming historical generations", async () => {
   const { storePath } = await createSessionStoreDir();
   await writeSessionStore({
     entries: {
@@ -173,6 +208,14 @@ test("sessions.delete keeps the Gateway responsive during final transcript recla
     rewriteWatermarks: countRows(database, "transcript_rewrite_watermarks", SESSION_ID),
     windows: countRows(database, "session_windows", SESSION_ID),
   };
+  const historicalCounts = {
+    active: countRows(database, "session_transcript_active_events", HISTORICAL_SESSION_ID),
+    fts: countRows(database, "session_transcript_fts", HISTORICAL_SESSION_ID),
+    indexState: countRows(database, "session_transcript_index_state", HISTORICAL_SESSION_ID),
+    transcriptEvents: countRows(database, "transcript_events", HISTORICAL_SESSION_ID),
+    rewriteWatermarks: countRows(database, "transcript_rewrite_watermarks", HISTORICAL_SESSION_ID),
+    windows: countRows(database, "session_windows", HISTORICAL_SESSION_ID),
+  };
   const unrelatedCounts = {
     active: countRows(database, "session_transcript_active_events", UNRELATED_SESSION_ID),
     fts: countRows(database, "session_transcript_fts", UNRELATED_SESSION_ID),
@@ -195,14 +238,19 @@ test("sessions.delete keeps the Gateway responsive during final transcript recla
         .get(UNRELATED_SESSION_ID) as { count: number | bigint }
     ).count,
   );
-  const archive = database.db
+  const archives = database.db
     .prepare(
-      `SELECT archive_sha256, length(archive_blob) AS archive_bytes, published_at
-       FROM session_transcript_archives WHERE session_id = ?`,
+      `SELECT session_id, archive_sha256, length(archive_blob) AS archive_bytes, published_at
+       FROM session_transcript_archives
+       WHERE session_id IN (?, ?)
+       ORDER BY session_id`,
     )
-    .get(SESSION_ID) as
-    | { archive_bytes: number | bigint; archive_sha256: string; published_at: number | null }
-    | undefined;
+    .all(SESSION_ID, HISTORICAL_SESSION_ID) as Array<{
+    archive_bytes: number | bigint;
+    archive_sha256: string;
+    published_at: number | null;
+    session_id: string;
+  }>;
 
   if (process.env.OPENCLAW_TEST_RECLAMATION_LOG === "1") {
     process.stdout.write(
@@ -210,6 +258,7 @@ test("sessions.delete keeps the Gateway responsive during final transcript recla
         deleteMs,
         maxGatewayGapMs,
         rows: ROWS,
+        historicalCounts,
         targetCounts,
         unrelatedCounts,
       })}\n`,
@@ -218,12 +267,12 @@ test("sessions.delete keeps the Gateway responsive during final transcript recla
 
   expect(deleted.ok).toBe(true);
   expect(deleted.payload).toMatchObject({
-    archived: [expect.any(String)],
+    archived: [expect.any(String), expect.any(String)],
     deleted: true,
     key: CANONICAL_SESSION_KEY,
     ok: true,
   });
-  expect(fs.existsSync(deleted.payload?.archived[0] ?? "")).toBe(true);
+  expect(deleted.payload?.archived.every((archivePath) => fs.existsSync(archivePath))).toBe(true);
   expect(targetCounts).toEqual({
     active: 0,
     fts: 0,
@@ -233,6 +282,14 @@ test("sessions.delete keeps the Gateway responsive during final transcript recla
     windows: 0,
   });
   expect(targetNodeCount).toBe(0);
+  expect(historicalCounts).toEqual({
+    active: 0,
+    fts: 0,
+    indexState: 0,
+    transcriptEvents: 0,
+    rewriteWatermarks: 0,
+    windows: 0,
+  });
   expect(unrelatedCounts).toEqual({
     active: 1,
     fts: 1,
@@ -242,10 +299,20 @@ test("sessions.delete keeps the Gateway responsive during final transcript recla
     windows: 1,
   });
   expect(unrelatedNodeCount).toBe(1);
-  expect(archive).toMatchObject({
-    archive_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
-    published_at: expect.any(Number),
-  });
-  expect(Number(archive?.archive_bytes ?? 0)).toBeGreaterThan(0);
+  expect(archives).toEqual([
+    {
+      archive_bytes: expect.any(Number),
+      archive_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      published_at: expect.any(Number),
+      session_id: SESSION_ID,
+    },
+    {
+      archive_bytes: expect.any(Number),
+      archive_sha256: expect.stringMatching(/^[a-f0-9]{64}$/u),
+      published_at: expect.any(Number),
+      session_id: HISTORICAL_SESSION_ID,
+    },
+  ]);
+  expect(archives.every((archive) => Number(archive.archive_bytes) > 0)).toBe(true);
   expect(maxGatewayGapMs).toBeLessThan(500);
 }, 120_000);
