@@ -4,6 +4,7 @@ import { Worker } from "node:worker_threads";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
+import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
@@ -109,15 +110,23 @@ type SqliteSessionReclamationResult =
   | { kind: "history-eviction"; value: SqliteHistoryEvictionReclamationResult }
   | { kind: "historical-generation"; value: SqliteHistoricalGenerationReclamationResult };
 
-export type SqliteSessionEntryReclamationWorkerMessage = {
-  result: SqliteSessionReclamationResult;
-  type: "done";
-};
+export type SqliteSessionEntryReclamationWorkerMessage =
+  | {
+      cleanupWarnings?: string[];
+      result: SqliteSessionReclamationResult;
+      type: "done";
+    }
+  | {
+      cleanupWarnings?: string[];
+      error: string;
+      type: "failed";
+    };
 
 // Bound the whole materialize-and-reclaim phase, not only Worker execution. This
 // prevents separate stores from retaining several maximum-size archive payloads.
 const sqliteSessionReclamationQueue = new KeyedAsyncQueue();
 const SQLITE_SESSION_RECLAMATION_QUEUE_KEY = "session-reclamation";
+const reclamationLog = createSubsystemLogger("sessions/reclamation");
 
 export function runExclusiveSqliteSessionReclamation<T>(task: () => Promise<T>): Promise<T> {
   return sqliteSessionReclamationQueue.enqueue(SQLITE_SESSION_RECLAMATION_QUEUE_KEY, task);
@@ -446,12 +455,10 @@ function spawnSqliteSessionReclamationWorker(
   }
 
   return new Promise((resolve, reject) => {
-    let result: SqliteSessionReclamationResult | undefined;
+    let message: SqliteSessionEntryReclamationWorkerMessage | undefined;
     let workerError: Error | undefined;
-    worker.on("message", (message: SqliteSessionEntryReclamationWorkerMessage) => {
-      if (message.type === "done") {
-        result = message.result;
-      }
+    worker.on("message", (nextMessage: SqliteSessionEntryReclamationWorkerMessage) => {
+      message = nextMessage;
     });
     worker.once("error", (error) => {
       // Wait for exit so the caller never races the Worker's SQLite handles on Windows.
@@ -459,21 +466,41 @@ function spawnSqliteSessionReclamationWorker(
     });
     worker.once("exit", (code) => {
       worker.removeAllListeners();
-      if (workerError) {
-        reject(workerError);
-        return;
+      if (message?.cleanupWarnings?.length) {
+        reclamationLog.warn("SQLite session reclamation worker recovered cleanup failures", {
+          errors: message.cleanupWarnings,
+          path: plan.databaseOptions.path,
+        });
       }
-      if (code !== 0) {
-        reject(new Error(`SQLite session reclamation worker exited with code ${code}`));
-        return;
+      try {
+        resolve(resolveSqliteSessionReclamationWorkerExit({ code, message, workerError }));
+      } catch (error) {
+        reject(error);
       }
-      if (!result) {
-        reject(new Error("SQLite session reclamation worker exited without a result"));
-        return;
-      }
-      resolve(result);
     });
   });
+}
+
+export function resolveSqliteSessionReclamationWorkerExit(params: {
+  code: number;
+  message?: SqliteSessionEntryReclamationWorkerMessage;
+  workerError?: Error;
+}): SqliteSessionReclamationResult {
+  // A structured message is emitted only after database-handle and lease cleanup
+  // settles. Once present, it is authoritative over a later Worker exit error.
+  if (params.message?.type === "done") {
+    return params.message.result;
+  }
+  if (params.message?.type === "failed") {
+    throw new Error(params.message.error);
+  }
+  if (params.workerError) {
+    throw params.workerError;
+  }
+  if (params.code !== 0) {
+    throw new Error(`SQLite session reclamation worker exited with code ${params.code}`);
+  }
+  throw new Error("SQLite session reclamation worker exited without a result");
 }
 
 function resolveSqliteSessionReclamationPlan(

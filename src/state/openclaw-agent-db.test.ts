@@ -50,6 +50,7 @@ import {
   readOpenClawAgentDatabaseRegistryToken,
   resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
+  settleOpenClawAgentDatabaseWorkerClose,
 } from "./openclaw-agent-db.js";
 import {
   closeOpenClawStateDatabaseForTest,
@@ -2888,6 +2889,24 @@ describe("openclaw agent database", () => {
 
     close.mockRestore();
     expect(closeOpenClawAgentDatabaseByPath(database.path)).toBe(true);
+    expect(() => assertNoOpenClawAgentDatabaseLeases("worker-1", { env })).not.toThrow();
+  });
+
+  it("settles a terminating Worker's handle and lease after checkpoint cleanup fails", () => {
+    const stateDir = createTempStateDir();
+    const env = { OPENCLAW_STATE_DIR: stateDir };
+    const database = openOpenClawAgentDatabase({ agentId: "worker-1", env });
+    vi.spyOn(database.walMaintenance, "close").mockImplementationOnce(() => {
+      throw new Error("worker checkpoint cleanup failed");
+    });
+
+    const result = settleOpenClawAgentDatabaseWorkerClose(database.path);
+
+    expect(result).toMatchObject({ settled: true });
+    expect(result.errors.map((error) => error.message)).toEqual([
+      "worker checkpoint cleanup failed",
+    ]);
+    expect(database.db.isOpen).toBe(false);
     expect(() => assertNoOpenClawAgentDatabaseLeases("worker-1", { env })).not.toThrow();
   });
 

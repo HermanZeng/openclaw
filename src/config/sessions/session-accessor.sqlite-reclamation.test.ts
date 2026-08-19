@@ -1,11 +1,14 @@
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import {
   resolveSqliteSessionReclamationWorkerDatabaseOptions,
+  resolveSqliteSessionReclamationWorkerExit,
   runExclusiveSqliteSessionReclamation,
+  type SqliteSessionEntryReclamationWorkerMessage,
 } from "./session-accessor.sqlite-reclamation.js";
+import { settleSqliteSessionReclamationWorkerDatabase } from "./session-accessor.sqlite-reclamation.worker.js";
 
 describe("SQLite session entry reclamation queue", () => {
   it("holds later materialization work until the active reclamation phase settles", async () => {
@@ -65,5 +68,46 @@ describe("SQLite session entry reclamation queue", () => {
 
     expect(workerOptions.env?.OPENCLAW_STATE_DIR).toBe(stateDir);
     expect(resolveOpenClawStateSqlitePath(workerOptions.env)).toBe(expectedStatePath);
+  });
+
+  it("retries Worker handle and lease cleanup without losing the committed result", async () => {
+    const close = vi
+      .fn()
+      .mockReturnValueOnce({ errors: [new Error("state lease remained busy")], settled: false })
+      .mockReturnValueOnce({ errors: [], settled: true });
+    const delay = vi.fn(async () => undefined);
+
+    await expect(
+      settleSqliteSessionReclamationWorkerDatabase("worker.sqlite", { close, delay }),
+    ).resolves.toEqual(["state lease remained busy"]);
+    expect(close).toHaveBeenCalledTimes(2);
+    expect(delay).toHaveBeenCalledOnce();
+  });
+
+  it("treats a committed Worker message as authoritative over a later exit error", () => {
+    const message = {
+      result: {
+        kind: "history-eviction",
+        value: { archivedTranscripts: [], deleted: true },
+      },
+      type: "done",
+    } satisfies SqliteSessionEntryReclamationWorkerMessage;
+
+    expect(
+      resolveSqliteSessionReclamationWorkerExit({
+        code: 1,
+        message,
+        workerError: new Error("post-commit cleanup error"),
+      }),
+    ).toEqual(message.result);
+  });
+
+  it("preserves an explicit pre-commit Worker failure", () => {
+    expect(() =>
+      resolveSqliteSessionReclamationWorkerExit({
+        code: 0,
+        message: { error: "reclamation rolled back", type: "failed" },
+      }),
+    ).toThrow("reclamation rolled back");
   });
 });

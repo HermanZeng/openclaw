@@ -1,8 +1,10 @@
 /** Worker entrypoint for the final SQLite session reclamation transaction. */
 import { parentPort, workerData } from "node:worker_threads";
+import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import {
-  closeOpenClawAgentDatabaseByPath,
+  settleOpenClawAgentDatabaseWorkerClose,
+  type OpenClawAgentDatabaseWorkerCloseResult,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
 import type { MaterializedSessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
@@ -35,6 +37,38 @@ function parseEnvironment(value: unknown): NodeJS.ProcessEnv | undefined | null 
     env[key] = entry;
   }
   return env;
+}
+
+const WORKER_CLOSE_RETRY_INITIAL_MS = 25;
+const WORKER_CLOSE_RETRY_MAX_MS = 500;
+
+export async function settleSqliteSessionReclamationWorkerDatabase(
+  pathname: string,
+  dependencies: {
+    close?: (targetPath: string) => OpenClawAgentDatabaseWorkerCloseResult;
+    delay?: (delayMs: number) => Promise<void>;
+  } = {},
+): Promise<string[]> {
+  const close = dependencies.close ?? settleOpenClawAgentDatabaseWorkerClose;
+  const delay =
+    dependencies.delay ??
+    ((delayMs: number) =>
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, delayMs);
+      }));
+  const warnings = new Set<string>();
+  let retryDelayMs = WORKER_CLOSE_RETRY_INITIAL_MS;
+  while (true) {
+    const outcome = close(pathname);
+    for (const error of outcome.errors) {
+      warnings.add(error.message);
+    }
+    if (outcome.settled) {
+      return [...warnings];
+    }
+    await delay(retryDelayMs);
+    retryDelayMs = Math.min(retryDelayMs * 2, WORKER_CLOSE_RETRY_MAX_MS);
+  }
 }
 
 function parseStringArray(value: unknown): string[] | undefined {
@@ -392,7 +426,10 @@ function parseWorkerPlan(value: unknown): SqliteSessionReclamationPlan | undefin
   return undefined;
 }
 
-if (isRecord(workerData) && workerData.type === "sqlite-session-reclamation-v2") {
+async function runWorker(): Promise<void> {
+  if (!isRecord(workerData) || workerData.type !== "sqlite-session-reclamation-v2") {
+    return;
+  }
   if (!parentPort) {
     throw new Error("SQLite session reclamation worker requires a parent port");
   }
@@ -400,15 +437,30 @@ if (isRecord(workerData) && workerData.type === "sqlite-session-reclamation-v2")
   if (!plan) {
     throw new Error("SQLite session reclamation worker requires valid plan data");
   }
+  let message:
+    | Omit<Extract<SqliteSessionEntryReclamationWorkerMessage, { type: "done" }>, "cleanupWarnings">
+    | Omit<
+        Extract<SqliteSessionEntryReclamationWorkerMessage, { type: "failed" }>,
+        "cleanupWarnings"
+      >;
   try {
     const result = reclaimSqliteSessionInTransaction(plan);
+    message = { result, type: "done" };
+  } catch (error) {
+    message = { error: toStringifiedError(error).message, type: "failed" };
+  }
+  const cleanupWarnings = await settleSqliteSessionReclamationWorkerDatabase(
+    plan.databaseOptions.path,
+  );
+  try {
     const postMessage = parentPort.postMessage.bind(parentPort);
     postMessage({
-      result,
-      type: "done",
+      ...message,
+      ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
     } satisfies SqliteSessionEntryReclamationWorkerMessage);
   } finally {
-    closeOpenClawAgentDatabaseByPath(plan.databaseOptions.path);
     parentPort.close();
   }
 }
+
+void runWorker();
