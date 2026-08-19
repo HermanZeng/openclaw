@@ -1,7 +1,10 @@
 /** Worker entrypoint for the final SQLite session reclamation transaction. */
 import { parentPort, workerData } from "node:worker_threads";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
-import type { OpenClawAgentDatabaseOptions } from "../../state/openclaw-agent-db.js";
+import {
+  closeOpenClawAgentDatabaseByPath,
+  type OpenClawAgentDatabaseOptions,
+} from "../../state/openclaw-agent-db.js";
 import type { MaterializedSessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
 import type {
   DeleteSessionEntryLifecycleParams,
@@ -375,11 +378,15 @@ if (isRecord(workerData) && workerData.type === "sqlite-session-reclamation-v2")
   if (!plan) {
     throw new Error("SQLite session reclamation worker requires valid plan data");
   }
-  const result = reclaimSqliteSessionInTransaction(plan);
-  const postMessage = parentPort.postMessage.bind(parentPort);
-  postMessage({
-    result,
-    type: "done",
-  } satisfies SqliteSessionEntryReclamationWorkerMessage);
-  parentPort.close();
+  try {
+    const result = reclaimSqliteSessionInTransaction(plan);
+    const postMessage = parentPort.postMessage.bind(parentPort);
+    postMessage({
+      result,
+      type: "done",
+    } satisfies SqliteSessionEntryReclamationWorkerMessage);
+  } finally {
+    closeOpenClawAgentDatabaseByPath(plan.databaseOptions.path);
+    parentPort.close();
+  }
 }
