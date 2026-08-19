@@ -71,10 +71,19 @@ type SqliteHistoryEvictionReclamationPlan = SqliteSessionReclamationPlanBase & {
   sessionId: string;
 };
 
+type SqliteHistoricalGenerationReclamationPlan = SqliteSessionReclamationPlanBase & {
+  kind: "historical-generation";
+  params: DeleteSessionEntryLifecycleParams;
+  preparedTargetSnapshot: SqliteLifecycleTargetSnapshot;
+  protectedSessionIds: string[];
+  sessionId: string;
+};
+
 export type SqliteSessionReclamationPlan =
   | SqliteSessionEntryReclamationPlan
   | SqliteLifecycleArtifactReclamationPlan
-  | SqliteHistoryEvictionReclamationPlan;
+  | SqliteHistoryEvictionReclamationPlan
+  | SqliteHistoricalGenerationReclamationPlan;
 
 type SqliteLifecycleArtifactReclamationResult = {
   archivedTranscripts: SessionLifecycleArchivedTranscript[];
@@ -86,10 +95,15 @@ type SqliteHistoryEvictionReclamationResult = {
   deleted: boolean;
 };
 
+type SqliteHistoricalGenerationReclamationResult = SqliteHistoryEvictionReclamationResult & {
+  expectedEntryMismatch?: true;
+};
+
 type SqliteSessionReclamationResult =
   | { kind: "entry"; value: DeleteSessionEntryLifecycleResult }
   | { kind: "lifecycle-artifacts"; value: SqliteLifecycleArtifactReclamationResult }
-  | { kind: "history-eviction"; value: SqliteHistoryEvictionReclamationResult };
+  | { kind: "history-eviction"; value: SqliteHistoryEvictionReclamationResult }
+  | { kind: "historical-generation"; value: SqliteHistoricalGenerationReclamationResult };
 
 export type SqliteSessionEntryReclamationWorkerMessage = {
   result: SqliteSessionReclamationResult;
@@ -309,6 +323,46 @@ function reclaimSqliteHistoryEvictionInTransaction(
   return result;
 }
 
+/** Revalidates and reclaims one direct-delete historical generation atomically. */
+function reclaimSqliteHistoricalGenerationInTransaction(
+  plan: SqliteHistoricalGenerationReclamationPlan,
+): SqliteHistoricalGenerationReclamationResult {
+  return runOpenClawAgentWriteTransaction<SqliteHistoricalGenerationReclamationResult>(
+    (transactionDb) => {
+      const transactionSnapshot = readLifecycleTargetSnapshot(transactionDb, plan.params.target);
+      if (
+        !sqliteLifecycleTargetSnapshotsEqual(plan.preparedTargetSnapshot, transactionSnapshot) ||
+        !shouldDeleteSqliteSessionEntryLifecycle(
+          transactionDb,
+          transactionSnapshot.primary?.entry,
+          plan.params,
+        )
+      ) {
+        return { archivedTranscripts: [], deleted: false, expectedEntryMismatch: true };
+      }
+      const archivedTranscripts = deleteMaterializedSessionStatePlans(
+        transactionDb,
+        plan.materializedPlans,
+        new Set(plan.protectedSessionIds),
+      );
+      const db = getSessionKysely(transactionDb.db);
+      const deleted =
+        executeSqliteQuerySync(
+          transactionDb.db,
+          db
+            .selectFrom("session_windows")
+            .select("session_id")
+            .where("session_id", "=", plan.sessionId),
+        ).rows.length === 0;
+      return {
+        archivedTranscripts: deleted ? archivedTranscripts : [],
+        deleted,
+      };
+    },
+    plan.databaseOptions,
+  );
+}
+
 export function reclaimSqliteSessionInTransaction(
   plan: SqliteSessionReclamationPlan,
 ): SqliteSessionReclamationResult {
@@ -319,6 +373,8 @@ export function reclaimSqliteSessionInTransaction(
       return { kind: plan.kind, value: reclaimSqliteLifecycleArtifactsInTransaction(plan) };
     case "history-eviction":
       return { kind: plan.kind, value: reclaimSqliteHistoryEvictionInTransaction(plan) };
+    case "historical-generation":
+      return { kind: plan.kind, value: reclaimSqliteHistoricalGenerationInTransaction(plan) };
   }
   throw new Error("Unsupported SQLite session reclamation plan");
 }
@@ -485,6 +541,32 @@ export async function runSqliteHistoryEvictionReclamation(params: {
     databaseOptions: { ...params.databaseOptions, path: databasePath },
     kind: "history-eviction",
     materializedPlans: params.materializedPlans,
+    protectedSessionIds: [...params.protectedSessionIds],
+    sessionId: params.sessionId,
+  };
+  const result = await resolveSqliteSessionReclamationPlan(plan);
+  if (result.kind !== plan.kind) {
+    throw new Error(`SQLite session reclamation worker returned ${result.kind} for ${plan.kind}`);
+  }
+  return result.value;
+}
+
+/** Keeps one direct-delete historical-generation transaction off the Gateway event loop. */
+export async function runSqliteHistoricalGenerationReclamation(params: {
+  databaseOptions: OpenClawAgentDatabaseOptions;
+  deleteParams: DeleteSessionEntryLifecycleParams;
+  materializedPlans: MaterializedSessionStateDeletePlan[];
+  preparedTargetSnapshot: SqliteLifecycleTargetSnapshot;
+  protectedSessionIds: ReadonlySet<string>;
+  sessionId: string;
+}): Promise<SqliteHistoricalGenerationReclamationResult> {
+  const databasePath = resolveOpenClawAgentSqlitePath(params.databaseOptions);
+  const plan: SqliteHistoricalGenerationReclamationPlan = {
+    databaseOptions: { ...params.databaseOptions, path: databasePath },
+    kind: "historical-generation",
+    materializedPlans: params.materializedPlans,
+    params: params.deleteParams,
+    preparedTargetSnapshot: params.preparedTargetSnapshot,
     protectedSessionIds: [...params.protectedSessionIds],
     sessionId: params.sessionId,
   };

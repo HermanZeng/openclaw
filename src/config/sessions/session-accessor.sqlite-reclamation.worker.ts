@@ -367,6 +367,28 @@ function parseWorkerPlan(value: unknown): SqliteSessionReclamationPlan | undefin
       sessionId: value.sessionId,
     };
   }
+  if (value.kind === "historical-generation") {
+    const params = parseDeleteParams(value.params);
+    const preparedTargetSnapshot = parseLifecycleTargetSnapshot(value.preparedTargetSnapshot);
+    const protectedSessionIds = parseStringArray(value.protectedSessionIds);
+    if (
+      !params ||
+      !preparedTargetSnapshot?.primary ||
+      !protectedSessionIds ||
+      typeof value.sessionId !== "string"
+    ) {
+      return undefined;
+    }
+    return {
+      databaseOptions: parsedDatabaseOptions,
+      kind: value.kind,
+      materializedPlans,
+      params,
+      preparedTargetSnapshot,
+      protectedSessionIds,
+      sessionId: value.sessionId,
+    };
+  }
   return undefined;
 }
 
