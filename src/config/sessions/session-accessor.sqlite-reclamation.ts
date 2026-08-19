@@ -14,6 +14,10 @@ import {
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
+import {
+  resolveOpenClawStateDirForDatabasePath,
+  resolveOpenClawStateSqlitePath,
+} from "../../state/openclaw-state-db.paths.js";
 import type { MaterializedSessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
 import type {
   DeleteSessionEntryLifecycleParams,
@@ -487,6 +491,25 @@ function resolveSqliteSessionReclamationPlan(
   return spawnSqliteSessionReclamationWorker(plan);
 }
 
+/** Pins Worker lease and registry writes to the shared-state root resolved by the parent. */
+export function resolveSqliteSessionReclamationWorkerDatabaseOptions(
+  options: OpenClawAgentDatabaseOptions,
+): OpenClawAgentDatabaseOptions & { path: string } {
+  const sourceEnv = options.env ?? process.env;
+  const sharedStatePath = options.database?.path ?? resolveOpenClawStateSqlitePath(sourceEnv);
+  const authoritativeStateDir = resolveOpenClawStateDirForDatabasePath(sharedStatePath);
+  return {
+    agentId: options.agentId,
+    env: {
+      ...sourceEnv,
+      // Worker process.env and structured-cloned objects are case-sensitive on Windows.
+      // Supplying the canonical key also preserves Vitest's parent-thread state root.
+      OPENCLAW_STATE_DIR: authoritativeStateDir,
+    },
+    path: resolveOpenClawAgentSqlitePath(options),
+  };
+}
+
 /** Keeps one atomic live-entry reclamation transaction off the Gateway event loop. */
 export async function runSqliteSessionEntryReclamation(params: {
   databaseOptions: OpenClawAgentDatabaseOptions;
@@ -494,9 +517,8 @@ export async function runSqliteSessionEntryReclamation(params: {
   deleteParams: DeleteSessionEntryLifecycleParams;
   preparedTargetSnapshot: SqliteLifecycleTargetSnapshot;
 }): Promise<DeleteSessionEntryLifecycleResult> {
-  const databasePath = resolveOpenClawAgentSqlitePath(params.databaseOptions);
   const plan: SqliteSessionEntryReclamationPlan = {
-    databaseOptions: { ...params.databaseOptions, path: databasePath },
+    databaseOptions: resolveSqliteSessionReclamationWorkerDatabaseOptions(params.databaseOptions),
     kind: "entry",
     materializedPlans: params.materializedPlans,
     params: params.deleteParams,
@@ -515,9 +537,8 @@ export async function runSqliteLifecycleArtifactReclamation(params: {
   entries: SessionEntryRemovalPlan[];
   materializedPlans: MaterializedSessionStateDeletePlan[];
 }): Promise<SqliteLifecycleArtifactReclamationResult> {
-  const databasePath = resolveOpenClawAgentSqlitePath(params.databaseOptions);
   const plan: SqliteLifecycleArtifactReclamationPlan = {
-    databaseOptions: { ...params.databaseOptions, path: databasePath },
+    databaseOptions: resolveSqliteSessionReclamationWorkerDatabaseOptions(params.databaseOptions),
     entries: params.entries,
     kind: "lifecycle-artifacts",
     materializedPlans: params.materializedPlans,
@@ -536,9 +557,8 @@ export async function runSqliteHistoryEvictionReclamation(params: {
   protectedSessionIds: ReadonlySet<string>;
   sessionId: string;
 }): Promise<SqliteHistoryEvictionReclamationResult> {
-  const databasePath = resolveOpenClawAgentSqlitePath(params.databaseOptions);
   const plan: SqliteHistoryEvictionReclamationPlan = {
-    databaseOptions: { ...params.databaseOptions, path: databasePath },
+    databaseOptions: resolveSqliteSessionReclamationWorkerDatabaseOptions(params.databaseOptions),
     kind: "history-eviction",
     materializedPlans: params.materializedPlans,
     protectedSessionIds: [...params.protectedSessionIds],
@@ -560,9 +580,8 @@ export async function runSqliteHistoricalGenerationReclamation(params: {
   protectedSessionIds: ReadonlySet<string>;
   sessionId: string;
 }): Promise<SqliteHistoricalGenerationReclamationResult> {
-  const databasePath = resolveOpenClawAgentSqlitePath(params.databaseOptions);
   const plan: SqliteHistoricalGenerationReclamationPlan = {
-    databaseOptions: { ...params.databaseOptions, path: databasePath },
+    databaseOptions: resolveSqliteSessionReclamationWorkerDatabaseOptions(params.databaseOptions),
     kind: "historical-generation",
     materializedPlans: params.materializedPlans,
     params: params.deleteParams,

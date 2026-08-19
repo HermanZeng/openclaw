@@ -105,15 +105,17 @@ export async function cleanupSessionLifecycleArtifactsCore(
   });
   const committed = await runExclusiveSqliteSessionReclamation(async () => {
     const materializedPlans = await materializeSessionStateDeletePlans(cleanupPlan.deletePlans);
-    return await runExclusiveSqliteSessionWrite(resolved, async () =>
-      runSqliteLifecycleArtifactReclamation({
+    return await runExclusiveSqliteSessionWrite(resolved, async () => {
+      const result = await runSqliteLifecycleArtifactReclamation({
         databaseOptions,
         entries: cleanupPlan.entries,
         materializedPlans,
-      }),
-    );
+      });
+      // Keep identity observers in the same order as commits queued on this writer lane.
+      emitCommittedSessionEntryRemovals(cleanupPlan.entries);
+      return result;
+    });
   });
-  emitCommittedSessionEntryRemovals(cleanupPlan.entries);
   const archivedTranscripts = await publishSessionStateArchives(
     resolved,
     committed.archivedTranscripts,
@@ -454,28 +456,40 @@ async function deleteSqliteSessionEntryLifecycleLocked(
 
   // Archive materialization remains outside the store writer lane. The global
   // reclamation lane bounds whole-buffer residency until the Worker exits.
-  const result = await runExclusiveSqliteSessionReclamation(async () => {
-    const materializedPlans = await materializeSessionStateDeletePlans(prepared.entryPlans);
-    return await runExclusiveSqliteSessionWrite(resolved, async () =>
-      runSqliteSessionEntryReclamation({
-        databaseOptions: toDatabaseOptions(resolved),
-        deleteParams: params,
-        materializedPlans,
-        preparedTargetSnapshot: prepared.targetSnapshot,
+  const result = await runExclusiveSessionLifecycleMutation({
+    scope: params.storePath,
+    identities: [
+      params.target.canonicalKey,
+      ...params.target.storeKeys,
+      ...prepared.targetSnapshot.rows.flatMap((row) => [row.sessionKey, row.entry.sessionId]),
+      ...prepared.entryPlans.map((plan) => plan.sessionId),
+    ],
+    run: async () =>
+      await runExclusiveSqliteSessionReclamation(async () => {
+        const materializedPlans = await materializeSessionStateDeletePlans(prepared.entryPlans);
+        return await runExclusiveSqliteSessionWrite(resolved, async () => {
+          const reclaimed = await runSqliteSessionEntryReclamation({
+            databaseOptions: toDatabaseOptions(resolved),
+            deleteParams: params,
+            materializedPlans,
+            preparedTargetSnapshot: prepared.targetSnapshot,
+          });
+          if (reclaimed.deleted) {
+            // Emit before this writer lane admits a replacement for the same identity.
+            emitSessionIdentityMutation({
+              kind: "delete",
+              previous: {
+                ...(prepared.current.entry.sessionId
+                  ? { sessionId: prepared.current.entry.sessionId }
+                  : {}),
+                sessionKeys: prepared.targetSnapshot.rows.map((row) => row.sessionKey),
+              },
+            });
+          }
+          return reclaimed;
+        });
       }),
-    );
   });
-  if (result.deleted) {
-    emitSessionIdentityMutation({
-      kind: "delete",
-      previous: {
-        ...(prepared.current.entry.sessionId
-          ? { sessionId: prepared.current.entry.sessionId }
-          : {}),
-        sessionKeys: prepared.targetSnapshot.rows.map((row) => row.sessionKey),
-      },
-    });
-  }
   result.archivedTranscripts = await publishSessionStateArchives(
     resolved,
     result.archivedTranscripts,
