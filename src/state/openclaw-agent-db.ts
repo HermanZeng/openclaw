@@ -639,7 +639,7 @@ export type OpenClawAgentDatabaseWorkerCloseResult = {
 /**
  * Converge a terminating worker's cached handle and durable lease without
  * turning an already committed worker result into an operation failure.
- * Callers must retry until `settled` is true.
+ * Callers own a bounded retry policy and must surface an unsettled result.
  */
 export function settleOpenClawAgentDatabaseWorkerClose(
   pathname: string,

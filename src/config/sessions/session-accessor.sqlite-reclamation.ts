@@ -112,11 +112,13 @@ type SqliteSessionReclamationResult =
 
 export type SqliteSessionEntryReclamationWorkerMessage =
   | {
+      cleanupIncomplete?: true;
       cleanupWarnings?: string[];
       result: SqliteSessionReclamationResult;
       type: "done";
     }
   | {
+      cleanupIncomplete?: true;
       cleanupWarnings?: string[];
       error: string;
       type: "failed";
@@ -407,7 +409,7 @@ function resolveSqliteSessionEntryReclamationWorkerUrl(currentModuleUrl = import
   return new URL(`./session-accessor.sqlite-reclamation.worker${extension}`, currentModuleUrl);
 }
 
-function resolveSourceWorkerExecArgv(): string[] {
+export function resolveSqliteSessionReclamationSourceWorkerExecArgv(): string[] {
   const tsxApiUrl = import.meta.resolve("tsx/esm/api");
   const registerTsx = `import { register } from ${JSON.stringify(tsxApiUrl)}; register();`;
   return ["--import", `data:text/javascript,${encodeURIComponent(registerTsx)}`];
@@ -446,7 +448,9 @@ function spawnSqliteSessionReclamationWorker(
   let worker: Worker;
   try {
     worker = new Worker(workerUrl, {
-      execArgv: workerUrl.pathname.endsWith(".ts") ? resolveSourceWorkerExecArgv() : undefined,
+      execArgv: workerUrl.pathname.endsWith(".ts")
+        ? resolveSqliteSessionReclamationSourceWorkerExecArgv()
+        : undefined,
       transferList,
       workerData: { plan, type: "sqlite-session-reclamation-v2" },
     });
@@ -454,28 +458,49 @@ function spawnSqliteSessionReclamationWorker(
     return Promise.reject(toStringifiedError(error));
   }
 
+  return observeSqliteSessionReclamationWorker({
+    databasePath: plan.databaseOptions.path,
+    worker,
+  });
+}
+
+export function observeSqliteSessionReclamationWorker(params: {
+  databasePath: string;
+  worker: Worker;
+}): Promise<SqliteSessionReclamationResult> {
   return new Promise((resolve, reject) => {
     let message: SqliteSessionEntryReclamationWorkerMessage | undefined;
     let workerError: Error | undefined;
-    worker.on("message", (nextMessage: SqliteSessionEntryReclamationWorkerMessage) => {
+    params.worker.on("message", (nextMessage: SqliteSessionEntryReclamationWorkerMessage) => {
       message = nextMessage;
     });
-    worker.once("error", (error) => {
+    params.worker.once("error", (error) => {
       // Wait for exit so the caller never races the Worker's SQLite handles on Windows.
       workerError = toStringifiedError(error);
     });
-    worker.once("exit", (code) => {
-      worker.removeAllListeners();
-      if (message?.cleanupWarnings?.length) {
+    params.worker.once("exit", (code) => {
+      params.worker.removeAllListeners();
+      if (message?.cleanupIncomplete) {
+        reclamationLog.error(
+          message.type === "done"
+            ? "SQLite session reclamation committed but Worker database cleanup remains incomplete"
+            : "SQLite session reclamation failed and Worker database cleanup remains incomplete",
+          {
+            errors: message.cleanupWarnings ?? [],
+            path: params.databasePath,
+            recovery: "restart OpenClaw before deleting the owning agent",
+          },
+        );
+      } else if (message?.cleanupWarnings?.length) {
         reclamationLog.warn("SQLite session reclamation worker recovered cleanup failures", {
           errors: message.cleanupWarnings,
-          path: plan.databaseOptions.path,
+          path: params.databasePath,
         });
       }
       try {
         resolve(resolveSqliteSessionReclamationWorkerExit({ code, message, workerError }));
       } catch (error) {
-        reject(error);
+        reject(toStringifiedError(error));
       }
     });
   });
@@ -486,8 +511,9 @@ export function resolveSqliteSessionReclamationWorkerExit(params: {
   message?: SqliteSessionEntryReclamationWorkerMessage;
   workerError?: Error;
 }): SqliteSessionReclamationResult {
-  // A structured message is emitted only after database-handle and lease cleanup
-  // settles. Once present, it is authoritative over a later Worker exit error.
+  // A structured message is emitted after bounded database-handle and lease cleanup.
+  // Once present, it is authoritative over a later Worker exit error; unresolved
+  // cleanup is reported separately without misreporting a committed transaction.
   if (params.message?.type === "done") {
     return params.message.result;
   }

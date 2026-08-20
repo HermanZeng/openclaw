@@ -41,6 +41,13 @@ function parseEnvironment(value: unknown): NodeJS.ProcessEnv | undefined | null 
 
 const WORKER_CLOSE_RETRY_INITIAL_MS = 25;
 const WORKER_CLOSE_RETRY_MAX_MS = 500;
+const WORKER_CLOSE_MAX_ATTEMPTS = 3;
+
+export type SqliteSessionReclamationWorkerDatabaseSettlement = {
+  attempts: number;
+  cleanupWarnings: string[];
+  settled: boolean;
+};
 
 export async function settleSqliteSessionReclamationWorkerDatabase(
   pathname: string,
@@ -48,7 +55,7 @@ export async function settleSqliteSessionReclamationWorkerDatabase(
     close?: (targetPath: string) => OpenClawAgentDatabaseWorkerCloseResult;
     delay?: (delayMs: number) => Promise<void>;
   } = {},
-): Promise<string[]> {
+): Promise<SqliteSessionReclamationWorkerDatabaseSettlement> {
   const close = dependencies.close ?? settleOpenClawAgentDatabaseWorkerClose;
   const delay =
     dependencies.delay ??
@@ -58,17 +65,27 @@ export async function settleSqliteSessionReclamationWorkerDatabase(
       }));
   const warnings = new Set<string>();
   let retryDelayMs = WORKER_CLOSE_RETRY_INITIAL_MS;
-  while (true) {
+  for (let attempt = 1; attempt <= WORKER_CLOSE_MAX_ATTEMPTS; attempt += 1) {
     const outcome = close(pathname);
     for (const error of outcome.errors) {
       warnings.add(error.message);
     }
     if (outcome.settled) {
-      return [...warnings];
+      return { attempts: attempt, cleanupWarnings: [...warnings], settled: true };
     }
-    await delay(retryDelayMs);
-    retryDelayMs = Math.min(retryDelayMs * 2, WORKER_CLOSE_RETRY_MAX_MS);
+    if (attempt < WORKER_CLOSE_MAX_ATTEMPTS) {
+      await delay(retryDelayMs);
+      retryDelayMs = Math.min(retryDelayMs * 2, WORKER_CLOSE_RETRY_MAX_MS);
+    }
   }
+  warnings.add(
+    `SQLite session reclamation worker database cleanup remained incomplete after ${WORKER_CLOSE_MAX_ATTEMPTS} attempts`,
+  );
+  return {
+    attempts: WORKER_CLOSE_MAX_ATTEMPTS,
+    cleanupWarnings: [...warnings],
+    settled: false,
+  };
 }
 
 function parseStringArray(value: unknown): string[] | undefined {
@@ -426,14 +443,26 @@ function parseWorkerPlan(value: unknown): SqliteSessionReclamationPlan | undefin
   return undefined;
 }
 
-async function runWorker(): Promise<void> {
-  if (!isRecord(workerData) || workerData.type !== "sqlite-session-reclamation-v2") {
+type SqliteSessionReclamationWorkerPort = Pick<
+  NonNullable<typeof parentPort>,
+  "close" | "postMessage"
+>;
+
+export async function runSqliteSessionReclamationWorker(
+  data: unknown,
+  port: SqliteSessionReclamationWorkerPort | null,
+  dependencies: {
+    reclaim?: typeof reclaimSqliteSessionInTransaction;
+    settle?: typeof settleSqliteSessionReclamationWorkerDatabase;
+  } = {},
+): Promise<void> {
+  if (!isRecord(data) || data.type !== "sqlite-session-reclamation-v2") {
     return;
   }
-  if (!parentPort) {
+  if (!port) {
     throw new Error("SQLite session reclamation worker requires a parent port");
   }
-  const plan = parseWorkerPlan(workerData.plan);
+  const plan = parseWorkerPlan(data.plan);
   if (!plan) {
     throw new Error("SQLite session reclamation worker requires valid plan data");
   }
@@ -444,23 +473,24 @@ async function runWorker(): Promise<void> {
         "cleanupWarnings"
       >;
   try {
-    const result = reclaimSqliteSessionInTransaction(plan);
+    const result = (dependencies.reclaim ?? reclaimSqliteSessionInTransaction)(plan);
     message = { result, type: "done" };
   } catch (error) {
     message = { error: toStringifiedError(error).message, type: "failed" };
   }
-  const cleanupWarnings = await settleSqliteSessionReclamationWorkerDatabase(
+  const cleanup = await (dependencies.settle ?? settleSqliteSessionReclamationWorkerDatabase)(
     plan.databaseOptions.path,
   );
   try {
-    const postMessage = parentPort.postMessage.bind(parentPort);
+    const postMessage = port.postMessage.bind(port);
     postMessage({
       ...message,
-      ...(cleanupWarnings.length > 0 ? { cleanupWarnings } : {}),
+      ...(cleanup.cleanupWarnings.length > 0 ? { cleanupWarnings: cleanup.cleanupWarnings } : {}),
+      ...(!cleanup.settled ? { cleanupIncomplete: true as const } : {}),
     } satisfies SqliteSessionEntryReclamationWorkerMessage);
   } finally {
-    parentPort.close();
+    port.close();
   }
 }
 
-void runWorker();
+void runSqliteSessionReclamationWorker(workerData, parentPort);

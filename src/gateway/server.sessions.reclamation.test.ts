@@ -187,7 +187,10 @@ test("sessions.delete keeps the Gateway responsive while reclaiming historical g
       setTimeout(resolve, 25);
     });
     const deleteStartedAt = performance.now();
-    deleted = await rpcReq(ws, "sessions.delete", { key: SESSION_KEY });
+    // The 200k-row fixture can take longer than the generic RPC helper's 10s
+    // wall-clock budget on slower CI hosts. Responsiveness is asserted
+    // independently below via the event-loop heartbeat.
+    deleted = await rpcReq(ws, "sessions.delete", { key: SESSION_KEY }, 60_000);
     deleteMs = performance.now() - deleteStartedAt;
   } finally {
     clearInterval(heartbeat);

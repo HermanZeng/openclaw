@@ -1,11 +1,14 @@
 import path from "node:path";
+import { Worker } from "node:worker_threads";
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import {
   resolveSqliteSessionReclamationWorkerDatabaseOptions,
   resolveSqliteSessionReclamationWorkerExit,
+  resolveSqliteSessionReclamationSourceWorkerExecArgv,
   runExclusiveSqliteSessionReclamation,
+  observeSqliteSessionReclamationWorker,
   type SqliteSessionEntryReclamationWorkerMessage,
 } from "./session-accessor.sqlite-reclamation.js";
 import { settleSqliteSessionReclamationWorkerDatabase } from "./session-accessor.sqlite-reclamation.worker.js";
@@ -79,9 +82,79 @@ describe("SQLite session entry reclamation queue", () => {
 
     await expect(
       settleSqliteSessionReclamationWorkerDatabase("worker.sqlite", { close, delay }),
-    ).resolves.toEqual(["state lease remained busy"]);
+    ).resolves.toEqual({
+      attempts: 2,
+      cleanupWarnings: ["state lease remained busy"],
+      settled: true,
+    });
     expect(close).toHaveBeenCalledTimes(2);
     expect(delay).toHaveBeenCalledOnce();
+  });
+
+  it("lets the global queue advance after persistent cleanup failure in a real Worker", async () => {
+    const events: string[] = [];
+    const messages: SqliteSessionEntryReclamationWorkerMessage[] = [];
+    const result = {
+      kind: "history-eviction",
+      value: { archivedTranscripts: [], deleted: true },
+    } as const;
+
+    const first = runExclusiveSqliteSessionReclamation(async () => {
+      events.push("first:start");
+      const worker = new Worker(
+        new URL(
+          "../../../test/fixtures/sqlite-session-reclamation-cleanup-failure.worker.mjs",
+          import.meta.url,
+        ),
+        {
+          execArgv: resolveSqliteSessionReclamationSourceWorkerExecArgv(),
+          workerData: {
+            reclamationData: {
+              plan: {
+                databaseOptions: { agentId: "main", env: {}, path: "worker.sqlite" },
+                kind: "history-eviction",
+                materializedPlans: [],
+                protectedSessionIds: [],
+                sessionId: "session-1",
+              },
+              type: "sqlite-session-reclamation-v2",
+            },
+            result,
+            workerModuleUrl: new URL(
+              "./session-accessor.sqlite-reclamation.worker.ts",
+              import.meta.url,
+            ).href,
+          },
+        },
+      );
+      worker.on("message", (message: SqliteSessionEntryReclamationWorkerMessage) => {
+        messages.push(message);
+      });
+      const workerResult = await observeSqliteSessionReclamationWorker({
+        databasePath: "worker.sqlite",
+        worker,
+      });
+      events.push("first:exited");
+      return workerResult;
+    });
+    const second = runExclusiveSqliteSessionReclamation(async () => {
+      events.push("second:ran");
+    });
+
+    await expect(first).resolves.toEqual(result);
+    await expect(second).resolves.toBeUndefined();
+    expect(events).toEqual(["first:start", "first:exited", "second:ran"]);
+    expect(messages).toEqual([
+      {
+        cleanupIncomplete: true,
+        cleanupWarnings: [
+          "state database unavailable",
+          "SQLite session reclamation worker database cleanup remained incomplete after 3 attempts",
+        ],
+        result,
+        type: "done",
+      },
+    ]);
   });
 
   it("treats a committed Worker message as authoritative over a later exit error", () => {
