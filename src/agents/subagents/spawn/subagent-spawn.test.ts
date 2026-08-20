@@ -656,12 +656,15 @@ describe("spawnSubagentDirect seam flow", () => {
     });
   });
 
-  it("accepts an explicitly allowlisted catalog-missing custom ref", async () => {
+  it.each([
+    { policy: "exact", allow: ["future-provider/new-model"] },
+    { policy: "provider wildcard", allow: ["future-provider/*"] },
+  ])("rejects an unowned catalog-missing ref under a strict $policy policy", async ({ allow }) => {
     hoisted.configOverride = createConfigOverride({
       agents: {
         defaults: {
           workspace: os.tmpdir(),
-          modelPolicy: { allow: ["future-provider/new-model"] },
+          modelPolicy: { allow },
         },
         list: [{ id: "main", workspace: "/tmp/workspace-main" }],
       },
@@ -669,42 +672,18 @@ describe("spawnSubagentDirect seam flow", () => {
     hoisted.resolveProviderRefOwnershipMock.mockReturnValue({ status: "unowned" });
 
     const result = await spawnSubagentDirect(
-      { task: "use the explicit custom ref", model: "future-provider/new-model" },
+      { task: "do not launch an unowned provider", model: "future-provider/new-model" },
       { agentSessionKey: "agent:main:main" },
     );
 
-    expect(result).toMatchObject({
-      status: "accepted",
-      modelApplied: true,
-      resolvedModel: "future-provider/new-model",
-      resolvedProvider: "future-provider",
+    expect(result.status).toBe("error");
+    expect(result.error).toContain('unknown model provider "future-provider"');
+    expect(hoisted.resolveProviderRefOwnershipMock).toHaveBeenCalledWith({
+      provider: "future-provider",
+      config: hoisted.configOverride,
+      workspaceDir: resolveUserPath("/tmp/workspace-main"),
     });
-    expect(hoisted.resolveProviderRefOwnershipMock).not.toHaveBeenCalled();
-  });
-
-  it("accepts a provider-wildcard catalog-missing ref without provider ownership", async () => {
-    hoisted.configOverride = createConfigOverride({
-      agents: {
-        defaults: {
-          workspace: os.tmpdir(),
-          modelPolicy: { allow: ["future-provider/*"] },
-        },
-        list: [{ id: "main", workspace: "/tmp/workspace-main" }],
-      },
-    });
-    hoisted.resolveProviderRefOwnershipMock.mockReturnValue({ status: "unowned" });
-
-    const result = await spawnSubagentDirect(
-      { task: "use a wildcard-authorized ref", model: "future-provider/new-model" },
-      { agentSessionKey: "agent:main:main" },
-    );
-
-    expect(result).toMatchObject({
-      status: "accepted",
-      resolvedModel: "future-provider/new-model",
-      resolvedProvider: "future-provider",
-    });
-    expect(hoisted.resolveProviderRefOwnershipMock).not.toHaveBeenCalled();
+    expectNoChildSpawnSideEffects();
   });
 
   it.each([

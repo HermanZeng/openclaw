@@ -7,7 +7,6 @@ import { findModelCatalogEntry } from "../../model-catalog-lookup.js";
 import type { ModelCatalogEntry } from "../../model-catalog.types.js";
 import {
   findNormalizedProviderValue,
-  getModelRefStatus,
   resolveAllowedModelRef,
   resolveDefaultModelForAgent,
 } from "../../model-selection.js";
@@ -104,15 +103,15 @@ async function resolveSpawnModelError(params: {
     return `sessions_spawn model "${requestedModel}" is not usable: ${resolved.error}`;
   }
 
-  const status = getModelRefStatus({
-    ...selection,
-    ref: resolved.ref,
+  const entry = findModelCatalogEntry(catalog, {
+    provider: resolved.ref.provider,
+    modelId: resolved.ref.model,
   });
-  if (status.allowAny && !status.inCatalog) {
+  if (!entry) {
     const resolvedProvider = resolved.ref.provider;
     const knownProvider =
       findNormalizedProviderValue(cfg.models?.providers, resolvedProvider) ||
-      catalog.some((entry) => entry.provider === resolvedProvider) ||
+      catalog.some((catalogEntry) => catalogEntry.provider === resolvedProvider) ||
       getSubagentSpawnDeps().resolveProviderRefOwnership({
         provider: resolvedProvider,
         config: cfg,
@@ -122,14 +121,8 @@ async function resolveSpawnModelError(params: {
       return `sessions_spawn model "${requestedModel}" is not usable: unknown model provider "${resolvedProvider}"`;
     }
   }
-  if (params.request.outputSchema) {
-    const entry = findModelCatalogEntry(catalog, {
-      provider: resolved.ref.provider,
-      modelId: resolved.ref.model,
-    });
-    if (entry && !supportsModelTools(entry)) {
-      return `sessions_spawn outputSchema requires a tool-capable target model; "${resolved.ref.provider}/${resolved.ref.model}" declares compat.supportsTools=false.`;
-    }
+  if (params.request.outputSchema && entry && !supportsModelTools(entry)) {
+    return `sessions_spawn outputSchema requires a tool-capable target model; "${resolved.ref.provider}/${resolved.ref.model}" declares compat.supportsTools=false.`;
   }
   return undefined;
 }
