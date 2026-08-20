@@ -4,26 +4,19 @@ import { Worker } from "node:worker_threads";
 import { toStringifiedError } from "@openclaw/normalization-core/error-coercion";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { executeSqliteQuerySync, getNodeSqliteKysely } from "../../infra/kysely-sync.js";
-import { createSubsystemLogger } from "../../logging/subsystem.js";
 import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../../state/openclaw-agent-db.generated.js";
 import {
   isIncognitoOpenClawAgentSqlitePath,
   openOpenClawAgentDatabase,
-  resolveOpenClawAgentSqlitePath,
   runOpenClawAgentWriteTransaction,
   type OpenClawAgentDatabase,
   type OpenClawAgentDatabaseOptions,
 } from "../../state/openclaw-agent-db.js";
-import {
-  resolveOpenClawStateDirForDatabasePath,
-  resolveOpenClawStateSqlitePath,
-} from "../../state/openclaw-state-db.paths.js";
 import type { MaterializedSessionStateDeletePlan } from "./session-accessor.sqlite-archive.js";
 import type {
   DeleteSessionEntryLifecycleParams,
   DeleteSessionEntryLifecycleResult,
-  SessionLifecycleArchivedTranscript,
 } from "./session-accessor.sqlite-contract.js";
 import {
   sqliteLifecycleTargetSnapshotsEqual,
@@ -41,6 +34,17 @@ import {
 } from "./session-accessor.sqlite-lifecycle-state.js";
 import type { SessionEntryRemovalPlan } from "./session-accessor.sqlite-lifecycle-types.js";
 import { deleteSessionDeliveryArtifacts } from "./session-accessor.sqlite-node-artifacts.js";
+import type {
+  SqliteHistoricalGenerationReclamationResult,
+  SqliteHistoryEvictionReclamationResult,
+  SqliteLifecycleArtifactReclamationResult,
+  SqliteSessionReclamationResult,
+} from "./session-accessor.sqlite-reclamation-contract.js";
+import { resolveSqliteSessionReclamationWorkerDatabaseOptions } from "./session-accessor.sqlite-reclamation-database-options.js";
+import {
+  observeSqliteSessionReclamationWorker,
+  resolveSqliteSessionReclamationSourceWorkerExecArgv,
+} from "./session-accessor.sqlite-reclamation-worker-parent.js";
 import { cloneSessionEntry, getSessionKysely } from "./session-accessor.sqlite-scope.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
@@ -90,45 +94,10 @@ export type SqliteSessionReclamationPlan =
   | SqliteHistoryEvictionReclamationPlan
   | SqliteHistoricalGenerationReclamationPlan;
 
-type SqliteLifecycleArtifactReclamationResult = {
-  archivedTranscripts: SessionLifecycleArchivedTranscript[];
-  removedEntries: number;
-};
-
-type SqliteHistoryEvictionReclamationResult = {
-  archivedTranscripts: SessionLifecycleArchivedTranscript[];
-  deleted: boolean;
-};
-
-type SqliteHistoricalGenerationReclamationResult = SqliteHistoryEvictionReclamationResult & {
-  expectedEntryMismatch?: true;
-};
-
-type SqliteSessionReclamationResult =
-  | { kind: "entry"; value: DeleteSessionEntryLifecycleResult }
-  | { kind: "lifecycle-artifacts"; value: SqliteLifecycleArtifactReclamationResult }
-  | { kind: "history-eviction"; value: SqliteHistoryEvictionReclamationResult }
-  | { kind: "historical-generation"; value: SqliteHistoricalGenerationReclamationResult };
-
-export type SqliteSessionEntryReclamationWorkerMessage =
-  | {
-      cleanupIncomplete?: true;
-      cleanupWarnings?: string[];
-      result: SqliteSessionReclamationResult;
-      type: "done";
-    }
-  | {
-      cleanupIncomplete?: true;
-      cleanupWarnings?: string[];
-      error: string;
-      type: "failed";
-    };
-
 // Bound the whole materialize-and-reclaim phase, not only Worker execution. This
 // prevents separate stores from retaining several maximum-size archive payloads.
 const sqliteSessionReclamationQueue = new KeyedAsyncQueue();
 const SQLITE_SESSION_RECLAMATION_QUEUE_KEY = "session-reclamation";
-const reclamationLog = createSubsystemLogger("sessions/reclamation");
 
 export function runExclusiveSqliteSessionReclamation<T>(task: () => Promise<T>): Promise<T> {
   return sqliteSessionReclamationQueue.enqueue(SQLITE_SESSION_RECLAMATION_QUEUE_KEY, task);
@@ -409,12 +378,6 @@ function resolveSqliteSessionEntryReclamationWorkerUrl(currentModuleUrl = import
   return new URL(`./session-accessor.sqlite-reclamation.worker${extension}`, currentModuleUrl);
 }
 
-export function resolveSqliteSessionReclamationSourceWorkerExecArgv(): string[] {
-  const tsxApiUrl = import.meta.resolve("tsx/esm/api");
-  const registerTsx = `import { register } from ${JSON.stringify(tsxApiUrl)}; register();`;
-  return ["--import", `data:text/javascript,${encodeURIComponent(registerTsx)}`];
-}
-
 function prepareReclamationWorkerTransferList(plan: SqliteSessionReclamationPlan): ArrayBuffer[] {
   const buffers = new Set<ArrayBuffer>();
   for (const materializedPlan of plan.materializedPlans) {
@@ -464,71 +427,6 @@ function spawnSqliteSessionReclamationWorker(
   });
 }
 
-export function observeSqliteSessionReclamationWorker(params: {
-  databasePath: string;
-  worker: Worker;
-}): Promise<SqliteSessionReclamationResult> {
-  return new Promise((resolve, reject) => {
-    let message: SqliteSessionEntryReclamationWorkerMessage | undefined;
-    let workerError: Error | undefined;
-    params.worker.on("message", (nextMessage: SqliteSessionEntryReclamationWorkerMessage) => {
-      message = nextMessage;
-    });
-    params.worker.once("error", (error) => {
-      // Wait for exit so the caller never races the Worker's SQLite handles on Windows.
-      workerError = toStringifiedError(error);
-    });
-    params.worker.once("exit", (code) => {
-      params.worker.removeAllListeners();
-      if (message?.cleanupIncomplete) {
-        reclamationLog.error(
-          message.type === "done"
-            ? "SQLite session reclamation committed but Worker database cleanup remains incomplete"
-            : "SQLite session reclamation failed and Worker database cleanup remains incomplete",
-          {
-            errors: message.cleanupWarnings ?? [],
-            path: params.databasePath,
-            recovery: "restart OpenClaw before deleting the owning agent",
-          },
-        );
-      } else if (message?.cleanupWarnings?.length) {
-        reclamationLog.warn("SQLite session reclamation worker recovered cleanup failures", {
-          errors: message.cleanupWarnings,
-          path: params.databasePath,
-        });
-      }
-      try {
-        resolve(resolveSqliteSessionReclamationWorkerExit({ code, message, workerError }));
-      } catch (error) {
-        reject(toStringifiedError(error));
-      }
-    });
-  });
-}
-
-export function resolveSqliteSessionReclamationWorkerExit(params: {
-  code: number;
-  message?: SqliteSessionEntryReclamationWorkerMessage;
-  workerError?: Error;
-}): SqliteSessionReclamationResult {
-  // A structured message is emitted after bounded database-handle and lease cleanup.
-  // Once present, it is authoritative over a later Worker exit error; unresolved
-  // cleanup is reported separately without misreporting a committed transaction.
-  if (params.message?.type === "done") {
-    return params.message.result;
-  }
-  if (params.message?.type === "failed") {
-    throw new Error(params.message.error);
-  }
-  if (params.workerError) {
-    throw params.workerError;
-  }
-  if (params.code !== 0) {
-    throw new Error(`SQLite session reclamation worker exited with code ${params.code}`);
-  }
-  throw new Error("SQLite session reclamation worker exited without a result");
-}
-
 function resolveSqliteSessionReclamationPlan(
   plan: SqliteSessionReclamationPlan,
 ): Promise<SqliteSessionReclamationResult> {
@@ -542,25 +440,6 @@ function resolveSqliteSessionReclamationPlan(
     return Promise.resolve(reclaimSqliteSessionInTransaction(plan));
   }
   return spawnSqliteSessionReclamationWorker(plan);
-}
-
-/** Pins Worker lease and registry writes to the shared-state root resolved by the parent. */
-export function resolveSqliteSessionReclamationWorkerDatabaseOptions(
-  options: OpenClawAgentDatabaseOptions,
-): OpenClawAgentDatabaseOptions & { path: string } {
-  const sourceEnv = options.env ?? process.env;
-  const sharedStatePath = options.database?.path ?? resolveOpenClawStateSqlitePath(sourceEnv);
-  const authoritativeStateDir = resolveOpenClawStateDirForDatabasePath(sharedStatePath);
-  return {
-    agentId: options.agentId,
-    env: {
-      ...sourceEnv,
-      // Worker process.env and structured-cloned objects are case-sensitive on Windows.
-      // Supplying the canonical key also preserves Vitest's parent-thread state root.
-      OPENCLAW_STATE_DIR: authoritativeStateDir,
-    },
-    path: resolveOpenClawAgentSqlitePath(options),
-  };
 }
 
 /** Keeps one atomic live-entry reclamation transaction off the Gateway event loop. */

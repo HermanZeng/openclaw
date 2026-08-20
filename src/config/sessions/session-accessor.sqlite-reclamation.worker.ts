@@ -15,9 +15,9 @@ import type {
 import type { SessionStateDeleteSnapshot } from "./session-accessor.sqlite-delete-snapshot.types.js";
 import type { SqliteLifecycleTargetSnapshot } from "./session-accessor.sqlite-entry-store.js";
 import type { SessionEntryRemovalPlan } from "./session-accessor.sqlite-lifecycle-types.js";
+import type { SqliteSessionEntryReclamationWorkerMessage } from "./session-accessor.sqlite-reclamation-contract.js";
 import {
   reclaimSqliteSessionInTransaction,
-  type SqliteSessionEntryReclamationWorkerMessage,
   type SqliteSessionReclamationPlan,
 } from "./session-accessor.sqlite-reclamation.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";

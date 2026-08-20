@@ -1,16 +1,16 @@
+import { EventEmitter } from "node:events";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it, vi } from "vitest";
 import { createDeferred } from "../../../test/helpers/promise.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
+import type { SqliteSessionEntryReclamationWorkerMessage } from "./session-accessor.sqlite-reclamation-contract.js";
+import { resolveSqliteSessionReclamationWorkerDatabaseOptions } from "./session-accessor.sqlite-reclamation-database-options.js";
 import {
-  resolveSqliteSessionReclamationWorkerDatabaseOptions,
-  resolveSqliteSessionReclamationWorkerExit,
-  resolveSqliteSessionReclamationSourceWorkerExecArgv,
-  runExclusiveSqliteSessionReclamation,
   observeSqliteSessionReclamationWorker,
-  type SqliteSessionEntryReclamationWorkerMessage,
-} from "./session-accessor.sqlite-reclamation.js";
+  resolveSqliteSessionReclamationSourceWorkerExecArgv,
+} from "./session-accessor.sqlite-reclamation-worker-parent.js";
+import { runExclusiveSqliteSessionReclamation } from "./session-accessor.sqlite-reclamation.js";
 import { settleSqliteSessionReclamationWorkerDatabase } from "./session-accessor.sqlite-reclamation.worker.js";
 
 describe("SQLite session entry reclamation queue", () => {
@@ -157,7 +157,7 @@ describe("SQLite session entry reclamation queue", () => {
     ]);
   });
 
-  it("treats a committed Worker message as authoritative over a later exit error", () => {
+  it("treats a committed Worker message as authoritative over a later exit error", async () => {
     const message = {
       result: {
         kind: "history-eviction",
@@ -165,22 +165,29 @@ describe("SQLite session entry reclamation queue", () => {
       },
       type: "done",
     } satisfies SqliteSessionEntryReclamationWorkerMessage;
+    const worker = new EventEmitter() as unknown as Worker;
+    const result = observeSqliteSessionReclamationWorker({
+      databasePath: "worker.sqlite",
+      worker,
+    });
 
-    expect(
-      resolveSqliteSessionReclamationWorkerExit({
-        code: 1,
-        message,
-        workerError: new Error("post-commit cleanup error"),
-      }),
-    ).toEqual(message.result);
+    worker.emit("message", message);
+    worker.emit("error", new Error("post-commit cleanup error"));
+    worker.emit("exit", 1);
+
+    await expect(result).resolves.toEqual(message.result);
   });
 
-  it("preserves an explicit pre-commit Worker failure", () => {
-    expect(() =>
-      resolveSqliteSessionReclamationWorkerExit({
-        code: 0,
-        message: { error: "reclamation rolled back", type: "failed" },
-      }),
-    ).toThrow("reclamation rolled back");
+  it("preserves an explicit pre-commit Worker failure", async () => {
+    const worker = new EventEmitter() as unknown as Worker;
+    const result = observeSqliteSessionReclamationWorker({
+      databasePath: "worker.sqlite",
+      worker,
+    });
+
+    worker.emit("message", { error: "reclamation rolled back", type: "failed" });
+    worker.emit("exit", 0);
+
+    await expect(result).rejects.toThrow("reclamation rolled back");
   });
 });
