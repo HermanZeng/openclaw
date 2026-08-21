@@ -55,6 +55,21 @@ describe("Slack native data blocks", () => {
     expect(isSlackInvalidBlocksError(new Error("invalid_blocks"))).toBe(false);
   });
 
+  it("matches one wrapped structural invalid_blocks cause without text false positives", () => {
+    expect(
+      isSlackInvalidBlocksError(
+        new Error("Slack outbound API rejected with a non-Error value", {
+          cause: { data: { error: "invalid_blocks" } },
+        }),
+      ),
+    ).toBe(true);
+    expect(
+      isSlackInvalidBlocksError(
+        new Error("invalid_blocks", { cause: { data: { error: "ratelimited" } } }),
+      ),
+    ).toBe(false);
+  });
+
   it("matches Bolt 5 response_url responses and contextual RespondError failures", async () => {
     const response = new Response(JSON.stringify({ error: "invalid_blocks" }), { status: 200 });
     await expect(isSlackInvalidBlocksResponse(response)).resolves.toBe(true);

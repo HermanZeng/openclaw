@@ -8,9 +8,14 @@ import {
 } from "openclaw/plugin-sdk/error-runtime";
 import { parseStrictNonNegativeInteger } from "openclaw/plugin-sdk/number-runtime";
 import { classifyTransientNetworkErrorCode } from "openclaw/plugin-sdk/retry-runtime";
-import { normalizeLowercaseStringOrEmpty } from "openclaw/plugin-sdk/string-coerce-runtime";
+import {
+  isRecord,
+  normalizeLowercaseStringOrEmpty,
+} from "openclaw/plugin-sdk/string-coerce-runtime";
 
 const TELEGRAM_NETWORK_ORIGIN = Symbol("openclaw.telegram.network-origin");
+const TELEGRAM_SUPERGROUP_MIGRATION_DESCRIPTION =
+  "Bad Request: group chat was upgraded to a supergroup chat";
 
 export class TelegramRequestNotStartedError extends Error {
   constructor(message = "Telegram request did not start") {
@@ -28,9 +33,18 @@ function isTelegramRequestNotStartedError(err: unknown): boolean {
 }
 
 export function rethrowTelegramSendError(err: unknown): never {
-  throw isTelegramRequestNotStartedError(err)
-    ? new PlatformMessageNotDispatchedError("Telegram request not started", { cause: err })
-    : err;
+  if (isTelegramRequestNotStartedError(err)) {
+    throw new PlatformMessageNotDispatchedError("Telegram request not started", { cause: err });
+  }
+  const migration = getTelegramSupergroupMigration(err);
+  throw migration === undefined
+    ? err
+    : new PlatformMessageNotDispatchedError(
+        migration.migratedChatId === undefined
+          ? "Telegram rejected send: group migrated to a supergroup"
+          : `Telegram rejected send: group migrated to supergroup ${migration.migratedChatId}`,
+        { cause: err, retryable: false },
+      );
 }
 
 const TELEGRAM_ADDITIONAL_TRANSIENT_ERROR_CODES = new Set([
@@ -135,6 +149,24 @@ function getNumericHttpStatus(err: unknown): number | undefined {
         return parseStrictNonNegativeInteger(trimmed);
       }
     }
+  }
+  return undefined;
+}
+
+function getTelegramSupergroupMigration(err: unknown): { migratedChatId?: number } | undefined {
+  for (const candidate of collectTelegramErrorCandidates(err)) {
+    if (!isRecord(candidate) || getNumericHttpStatus(candidate) !== 400) {
+      continue;
+    }
+    if (candidate.description !== TELEGRAM_SUPERGROUP_MIGRATION_DESCRIPTION) {
+      continue;
+    }
+    const migratedChatId = isRecord(candidate.parameters)
+      ? candidate.parameters.migrate_to_chat_id
+      : undefined;
+    return typeof migratedChatId === "number" && Number.isSafeInteger(migratedChatId)
+      ? { migratedChatId }
+      : {};
   }
   return undefined;
 }
