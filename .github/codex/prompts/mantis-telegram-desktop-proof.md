@@ -14,8 +14,8 @@ continuous event recording, capture, and cleanup.
 
 ## Design the proof
 
-Each SUT provides a developer shell through `exec` and an in-container gateway
-`restart`. Anything a developer could do locally against a checkout is in scope:
+Each SUT provides a developer shell through `exec` and a root-owned graceful Gateway
+replacement through `restart`. Anything a developer could do locally against a checkout is in scope:
 edit `openclaw.json` and restart, stage plugins/fixtures/scripts under the writable
 runtime directory, run `node` or `tsx` against the read-only repo root, query the
 SQLite state databases, or tail the gateway log. Design the scenario that proves
@@ -84,6 +84,10 @@ Use `$OPENCLAW_TELEGRAM_MANTIS_LANE_CMD` with `--lane baseline|candidate`:
 - `botapi-fail <method> [--times N] [--status CODE | --drop]`; `botapi-clear`
 - `botapi-requests [--method M] [--limit N]` (bounded recorded outbound Bot API
   calls, parsed payloads, statuses, and injected-fault facts)
+- `lifecycle --mode graceful|crash [--timeout-seconds N]` (replace only the
+  Gateway generation while preserving the exact state directory, mock provider,
+  Telegram proxy, and their trusted request journals; returns root-owned lifecycle
+  events and the ready successor generation)
 - `send --text <text>`; also `--text-file`, `--media` (document), `--reply-to`
 - `turn --text <text> --observe-seconds 15` (send + observe convenience)
 - `observe --seconds N [--since cursor] [--until-events N] [--until-text substring]
@@ -102,8 +106,8 @@ Use `$OPENCLAW_TELEGRAM_MANTIS_LANE_CMD` with `--lane baseline|candidate`:
   Returns `{ "exitCode": N, "stdout": "...", "stderr": "...", "truncated": false }`;
   stdout and stderr are each limited to 64 KiB. Write larger output to a runtime
   file and read it in pieces with later `exec` calls.
-- `restart --lane X [--ready-timeout-seconds N]` (restart the gateway in the same SUT and
-  wait for fresh readiness). Example: patch `openclaw.json` with `exec`, then run
+- `restart --lane X [--ready-timeout-seconds N]` (gracefully replace the Gateway in the
+  same SUT and wait 5–120 seconds for fresh readiness). Example: patch `openclaw.json` with `exec`, then run
   `restart`. Returns `{ "status": "ready", "restartedAt": "...", "readyAfterMs": N }`.
 - `view --message-id ID` (scroll Desktop to the exact Telegram server message)
 - `screenshot` (returns a public inspection PNG)
@@ -143,6 +147,13 @@ The observer remains live between commands. This allows sequences such as:
 send → inspect draft edits → wait → send `/stop` → inspect deletion/wipe → focus
 the final relevant message → capture. Prefer explicit `send` + `observe` when
 timing matters; use one `turn` for an ordinary exchange.
+
+For restart/recovery scenarios, perform the accepted action first, invoke
+`lifecycle`, then observe the successor. Assert the returned generation and the
+terminal lane's `lifecycleEvents` alongside provider and Bot API facts. Never
+simulate a restart by ending the lane and starting another one: that changes the
+state root and evidence owners instead of proving recovery. See
+`mantis-recipes/gateway-lifecycle-replacement.md`.
 
 Run comparable baseline and candidate programs. This proof has no skipped lane:
 each side ends as complete, failed, or blocked with its own trusted facts.

@@ -319,7 +319,7 @@ jobs:
           uv_bin="$(command -v uv)"
           recorder_user="$(id -un)"
           toolchain_build="${RUNNER_TEMP}/mantis-toolchain-build"
-          mkdir -p "$toolchain_build/scripts/e2e"
+          mkdir -p "$toolchain_build/scripts/e2e" "$toolchain_build/scripts/mantis"
           node_modules/.bin/esbuild scripts/e2e/telegram-mantis-lane.ts \
             --bundle --platform=node --format=esm --target=node24 \
             --outfile="$toolchain_build/scripts/e2e/telegram-mantis-lane.mjs"
@@ -332,6 +332,9 @@ jobs:
           node_modules/.bin/esbuild scripts/e2e/telegram-desktop-recorder.ts \
             --bundle --platform=node --format=esm --target=node24 \
             --outfile="$toolchain_build/scripts/e2e/telegram-desktop-recorder.mjs"
+          node_modules/.bin/esbuild scripts/mantis/mantis-sut-lifecycle-controller.ts \
+            --bundle --platform=node --format=esm --target=node24 \
+            --outfile="$toolchain_build/scripts/mantis/mantis-sut-lifecycle-controller.mjs"
           cp scripts/windows-cmd-helpers.mjs "$toolchain_build/scripts/windows-cmd-helpers.mjs"
           sudo groupadd --system mantis-proof
           sudo usermod -aG mantis-proof "$recorder_user"
@@ -419,7 +422,8 @@ jobs:
           chmod 0755 "${RUNNER_TEMP}/openclaw-telegram-mantis-lane" "${RUNNER_TEMP}/openclaw-telegram-desktop-recorder" "${RUNNER_TEMP}/openclaw-telegram-user-driver" "${RUNNER_TEMP}/telegram-desktop-recorder-exec" "${RUNNER_TEMP}/telegram-mantis-lane" "${RUNNER_TEMP}/telegram-user-driver"
           sudo apt-get update
           sudo apt-get install -y ffmpeg
-          sudo install -d -m 0755 /usr/local/lib/mantis-toolchain/scripts/e2e
+          sudo install -d -m 0755 /usr/local/lib/mantis-toolchain/scripts/e2e \
+            /usr/local/lib/mantis-toolchain/scripts/mantis
           # The Actions toolcache is runner-private on Blacksmith. Copy the complete
           # executable closures before crossing users; wrappers back into RUNNER_TEMP fail.
           sudo install -m 0755 "$node_bin" /usr/local/lib/mantis-toolchain/node
@@ -439,6 +443,8 @@ jobs:
             /usr/local/lib/mantis-toolchain/scripts/e2e/mock-openai-server.mjs
           sudo install -m 0444 "$toolchain_build/scripts/e2e/telegram-desktop-recorder.mjs" \
             /usr/local/lib/mantis-toolchain/scripts/e2e/telegram-desktop-recorder.mjs
+          sudo install -m 0444 "$toolchain_build/scripts/mantis/mantis-sut-lifecycle-controller.mjs" \
+            /usr/local/lib/mantis-toolchain/scripts/mantis/mantis-sut-lifecycle-controller.mjs
           sudo ln -s /usr/bin/ffmpeg /usr/local/lib/mantis-toolchain/ffmpeg
           sudo ln -s /usr/bin/ffprobe /usr/local/lib/mantis-toolchain/ffprobe
           sudo install -m 0755 "${RUNNER_TEMP}/telegram-mantis-lane" /usr/local/lib/mantis-toolchain/telegram-mantis-lane

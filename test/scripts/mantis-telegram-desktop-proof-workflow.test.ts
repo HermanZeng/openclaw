@@ -9,6 +9,7 @@ const MOCK_OPENAI_SERVER = "scripts/e2e/mock-openai-server.mjs";
 const MANTIS_LANE_SCRIPT = "scripts/e2e/telegram-mantis-lane.ts";
 const DESKTOP_CRABBOX_SCRIPT = "scripts/e2e/telegram-desktop-crabbox.ts";
 const SUT_CONTAINER_WRAPPER = "scripts/mantis/mantis-sut-container.sh";
+const SUT_LIFECYCLE_CONTROLLER = "scripts/mantis/mantis-sut-lifecycle-controller.ts";
 const STOP_LEASE_KEEPALIVE_SCRIPT = "scripts/mantis/stop-lease-keepalive.sh";
 const RUN_WITH_LEASE_FENCE_SCRIPT = "scripts/mantis/run-with-lease-fence.sh";
 const CREDENTIAL_SCRIPT = "scripts/e2e/telegram-user-credential.ts";
@@ -128,6 +129,32 @@ describe("Mantis Telegram Desktop proof workflow", () => {
       (step) => step.name === "Checkout harness ref",
     );
     expect(proofCheckout?.with?.["fetch-depth"]).toBe(1);
+  });
+
+  it("installs the lifecycle controller outside the candidate checkout as immutable root code", () => {
+    const install = workflowStep("Install local proof tools").run ?? "";
+    const wrapper = readFileSync(SUT_CONTAINER_WRAPPER, "utf8");
+
+    expect(existsSync(SUT_LIFECYCLE_CONTROLLER)).toBe(true);
+    expect(install).toContain(
+      "node_modules/.bin/esbuild scripts/mantis/mantis-sut-lifecycle-controller.ts",
+    );
+    expect(install).toContain(
+      '--outfile="$toolchain_build/scripts/mantis/mantis-sut-lifecycle-controller.mjs"',
+    );
+    expect(install).toContain(
+      'sudo install -m 0444 "$toolchain_build/scripts/mantis/mantis-sut-lifecycle-controller.mjs"',
+    );
+    expect(install).toContain(
+      "/usr/local/lib/mantis-toolchain/scripts/mantis/mantis-sut-lifecycle-controller.mjs",
+    );
+    expect(wrapper).toContain(
+      'readonly lifecycle_controller="/usr/local/lib/mantis-toolchain/scripts/mantis/mantis-sut-lifecycle-controller.mjs"',
+    );
+    expect(wrapper).toContain('readonly lifecycle_node="/usr/local/lib/mantis-toolchain/node"');
+    expect(wrapper).toContain('[[ "$(stat -c %u "$file")" == "0" ]]');
+    expect(wrapper).toContain('find "$file" -perm /022 -print -quit');
+    expect(wrapper).not.toMatch(/lifecycle_controller=.*(?:candidate|worktree)/u);
   });
 
   it("serializes on the shared credential rather than on other runs", () => {
@@ -1342,7 +1369,8 @@ describe("Mantis Telegram Desktop proof workflow", () => {
     expect(wrapper).toContain("exec timeout exceeds 1800 seconds");
     expect(wrapper).toContain('--workdir "$runtime_source"');
     expect(wrapper).toContain("/usr/bin/timeout --signal=TERM --kill-after=5s");
-    expect(wrapper).toContain('sh -c "$restart_command"');
+    expect(wrapper).not.toContain("restart_command");
+    expect(wrapper).toContain('run_lifecycle_with_deadline "$@"');
     expect(wrapper).toContain('chmod 1770 "$safe_runtime"');
     expect(wrapper).toContain('chown root:mantis-proof "$safe_runtime"');
     const teardown = laneScript.slice(
@@ -1538,7 +1566,7 @@ describe("Mantis Telegram Desktop proof workflow", () => {
     expect(wrapper).toContain("refusing to destroy runtime with pending network cleanup");
     expect(wrapper).toContain('remove_claimed_runtime_input "$runtime_parent/$1-input"');
     expect(wrapper).toContain(
-      '*) die "expected build, check, run, exec, restart, stop, or destroy"',
+      '*) die "expected build, check, run, exec, lifecycle, stop, or destroy"',
     );
     expect(wrapper).toContain("chown mantis-sut:mantis-proof");
     expect(wrapper).toContain("install -T -o mantis-sut -g mantis-proof -m 0600");
