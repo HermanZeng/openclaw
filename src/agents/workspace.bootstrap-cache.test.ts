@@ -173,13 +173,10 @@ describe("workspace bootstrap file caching", () => {
     // Linux and macOS stamp ctime from a coarse per-tick clock, so an edit landing inside
     // the cached stat's tick leaves ctimeMs equal and the ctime-only scenario never occurs.
     // Re-touch until the kernel advances it, so a failure means the cache ignored ctime.
+    const ctimeAdvanceDeadline = Date.now() + 1000;
     let editedStat = await fs.stat(filePath);
-    for (
-      let attempt = 0;
-      editedStat.ctimeMs === cachedStat.ctimeMs && attempt < 100;
-      attempt += 1
-    ) {
-      await sleep(2);
+    while (editedStat.ctimeMs === cachedStat.ctimeMs && Date.now() < ctimeAdvanceDeadline) {
+      await sleep(5);
       await fs.utimes(filePath, cleanTime, cleanTime);
       editedStat = await fs.stat(filePath);
     }

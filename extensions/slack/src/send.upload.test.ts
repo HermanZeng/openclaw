@@ -339,7 +339,10 @@ describe("sendMessageSlack file upload with user IDs", () => {
     expect(client.files.completeUploadExternal).not.toHaveBeenCalled();
   });
 
-  it("marks messages_tab_disabled from files.completeUploadExternal as a permanent non-dispatch", async () => {
+  it("keeps a definitive completeUploadExternal rejection ambiguous", async () => {
+    // Dispatch is recorded before this call, so even a code that reads as a final
+    // verdict cannot prove the file was never shared; it must not become a
+    // non-dispatch assertion. Pairs with the pre-dispatch getUploadURLExternal case.
     const rejection = slackPlatformError("messages_tab_disabled");
     const onPlatformSendDispatch = vi.fn();
     client.files.completeUploadExternal.mockRejectedValueOnce(rejection);
@@ -349,11 +352,9 @@ describe("sendMessageSlack file upload with user IDs", () => {
       onPlatformSendDispatch,
     }).catch((error: unknown) => error);
 
-    expect(caught).toBeInstanceOf(PlatformMessageNotDispatchedError);
-    expect(caught).toMatchObject({ retryable: false, cause: rejection });
-    expect(globalThis.fetch).toHaveBeenCalledOnce();
     expect(onPlatformSendDispatch).toHaveBeenCalledOnce();
-    expect(client.files.completeUploadExternal).toHaveBeenCalledOnce();
+    expect(caught).toBe(rejection);
+    expect(caught).not.toBeInstanceOf(PlatformMessageNotDispatchedError);
   });
 
   it("keeps getUploadURLExternal network failures ambiguous", async () => {

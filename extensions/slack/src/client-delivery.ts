@@ -46,6 +46,8 @@ const SLACK_DNS_RETRY_BASE_DELAY_MS = 250;
 // `data.error`; these two mean no recipient can ever see the message, so durable
 // recovery must stop retrying. Everything else rethrows by identity — the
 // `invalid_blocks` and custom-identity fallbacks match on the original value.
+// Pre-dispatch calls only: PlatformMessageNotDispatchedError asserts no send began,
+// so a call made after onPlatformSendDispatch must stay ambiguous instead.
 export function rethrowSlackPermanentOutboundApiRejection(err: unknown): never {
   const rawData =
     isRecord(err) && err.code === "slack_webapi_platform_error" ? err.data : undefined;
@@ -370,6 +372,8 @@ export async function uploadSlackFile(params: {
   await params.onPlatformSendDispatch?.();
   // Slack allows this finalize call only once. Keep only the pre-connect DNS
   // retry; a timeout or broader retry would create an unknown-send state.
+  // Dispatch is already recorded above, so this call is the ambiguous send:
+  // no rejection here may claim non-dispatch, however definitive its code reads.
   const completionClient = params.completionClient ?? params.client;
   const completeResp = await withSlackDnsRequestRetry("files.completeUploadExternal", () =>
     completionClient.files.completeUploadExternal({
@@ -378,7 +382,7 @@ export async function uploadSlackFile(params: {
       ...(params.caption ? { initial_comment: params.caption } : {}),
       ...(params.threadTs ? { thread_ts: params.threadTs } : {}),
     }),
-  ).catch(rethrowSlackPermanentOutboundApiRejection);
+  );
   if (!completeResp.ok) {
     throw new Error(`Failed to complete upload: ${completeResp.error ?? "unknown error"}`);
   }
