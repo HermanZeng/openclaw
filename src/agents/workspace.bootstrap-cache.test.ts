@@ -4,7 +4,8 @@
  */
 import fs from "node:fs/promises";
 import path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { setTimeout as sleep } from "node:timers/promises";
+import { beforeEach, describe, expect, it } from "vitest";
 import { makeTempWorkspace, writeWorkspaceFile } from "../test-helpers/workspace.js";
 import { getOrLoadBootstrapFiles } from "./bootstrap-cache.js";
 import { loadWorkspaceBootstrapFiles, DEFAULT_AGENTS_FILENAME } from "./workspace.js";
@@ -159,21 +160,32 @@ describe("workspace bootstrap file caching", () => {
     // only changed stat field after the in-place edit.
     const cleanTime = new Date(Math.floor(Date.now() / 1000) * 1000);
     await fs.utimes(filePath, cleanTime, cleanTime);
-    const originalStat = await fs.stat(filePath);
 
     const agentsFile1 = await loadAgentsFile(workspaceDir);
     expectAgentsContent(agentsFile1, content1);
+    // Compare against the identity the cache actually stored, not a pre-load stat.
+    const cachedStat = await fs.stat(filePath);
 
-    // A loaded runner can complete both writes within one ctime tick. Wait for the
-    // fixture's cache identity to change before asserting the production reload.
-    await vi.waitFor(
-      async () => {
-        await fs.writeFile(filePath, content2, "utf-8");
-        await fs.utimes(filePath, originalStat.atime, originalStat.mtime);
-        expect((await fs.stat(filePath)).ctimeMs).not.toBe(originalStat.ctimeMs);
-      },
-      { interval: 1, timeout: 1_000 },
-    );
+    // In-place edit: same path, same size, restore mtime — only ctime changes.
+    await fs.writeFile(filePath, content2, "utf-8");
+    await fs.utimes(filePath, cleanTime, cleanTime);
+
+    // Linux and macOS stamp ctime from a coarse per-tick clock, so an edit landing inside
+    // the cached stat's tick leaves ctimeMs equal and the ctime-only scenario never occurs.
+    // Re-touch until the kernel advances it, so a failure means the cache ignored ctime.
+    let editedStat = await fs.stat(filePath);
+    for (
+      let attempt = 0;
+      editedStat.ctimeMs === cachedStat.ctimeMs && attempt < 100;
+      attempt += 1
+    ) {
+      await sleep(2);
+      await fs.utimes(filePath, cleanTime, cleanTime);
+      editedStat = await fs.stat(filePath);
+    }
+    expect(editedStat.ctimeMs).not.toBe(cachedStat.ctimeMs);
+    expect(editedStat.mtimeMs).toBe(cachedStat.mtimeMs);
+    expect(editedStat.size).toBe(cachedStat.size);
 
     const agentsFile2 = await loadAgentsFile(workspaceDir);
     expectAgentsContent(agentsFile2, content2);
