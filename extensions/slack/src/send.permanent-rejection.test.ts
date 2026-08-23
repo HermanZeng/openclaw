@@ -131,27 +131,26 @@ describe("sendMessageSlack permanent provider rejections", () => {
     expect(caught).not.toBeInstanceOf(PlatformMessageNotDispatchedError);
   });
 
-  it("normalizes a null Slack API rejection without reclassifying it", () => {
+  it.each([
+    ["null", null],
+    ["an unlisted platform error code", slackPlatformError("channel_not_found")],
+  ])("rethrows %s by identity", (_name, rejection) => {
     let caught: unknown = "not thrown";
     try {
-      rethrowSlackPermanentOutboundApiRejection(null);
+      rethrowSlackPermanentOutboundApiRejection(rejection);
     } catch (error) {
       caught = error;
     }
-    expect(caught).toBeInstanceOf(Error);
-    expect(caught).toMatchObject({ cause: null });
-    expect(caught).not.toBeInstanceOf(PlatformMessageNotDispatchedError);
+    expect(caught).toBe(rejection);
   });
 
-  it("preserves invalid_blocks fallback classification through non-Error normalization", () => {
+  it("keeps a non-Error invalid_blocks rejection matchable after the send boundary", () => {
     let caught: unknown = "not thrown";
     try {
       rethrowSlackPermanentOutboundApiRejection({ data: { error: "invalid_blocks" } });
     } catch (error) {
       caught = error;
     }
-    expect(caught).toBeInstanceOf(Error);
     expect(isSlackInvalidBlocksError(caught)).toBe(true);
-    expect(caught).not.toBeInstanceOf(PlatformMessageNotDispatchedError);
   });
 });

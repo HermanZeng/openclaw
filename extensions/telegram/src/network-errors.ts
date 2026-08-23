@@ -36,15 +36,11 @@ export function rethrowTelegramSendError(err: unknown): never {
   if (isTelegramRequestNotStartedError(err)) {
     throw new PlatformMessageNotDispatchedError("Telegram request not started", { cause: err });
   }
-  const migration = getTelegramSupergroupMigration(err);
-  throw migration === undefined
-    ? err
-    : new PlatformMessageNotDispatchedError(
-        migration.migratedChatId === undefined
-          ? "Telegram rejected send: group migrated to a supergroup"
-          : `Telegram rejected send: group migrated to supergroup ${migration.migratedChatId}`,
-        { cause: err, retryable: false },
-      );
+  const migrationRejection = describeTelegramSupergroupMigration(err);
+  if (migrationRejection === undefined) {
+    throw err;
+  }
+  throw new PlatformMessageNotDispatchedError(migrationRejection, { cause: err, retryable: false });
 }
 
 const TELEGRAM_ADDITIONAL_TRANSIENT_ERROR_CODES = new Set([
@@ -153,7 +149,11 @@ function getNumericHttpStatus(err: unknown): number | undefined {
   return undefined;
 }
 
-function getTelegramSupergroupMigration(err: unknown): { migratedChatId?: number } | undefined {
+// Once a basic group is upgraded, its old id answers every send with this exact Bot API
+// 400 (https://core.telegram.org/bots/api#making-requests). Matching the description
+// literally keeps every other 400 retryable; `migrate_to_chat_id` is bounded at 52
+// significant bits, so a non-safe integer is not the documented id and stays unreported.
+function describeTelegramSupergroupMigration(err: unknown): string | undefined {
   for (const candidate of collectTelegramErrorCandidates(err)) {
     if (!isRecord(candidate) || getNumericHttpStatus(candidate) !== 400) {
       continue;
@@ -165,8 +165,8 @@ function getTelegramSupergroupMigration(err: unknown): { migratedChatId?: number
       ? candidate.parameters.migrate_to_chat_id
       : undefined;
     return typeof migratedChatId === "number" && Number.isSafeInteger(migratedChatId)
-      ? { migratedChatId }
-      : {};
+      ? `Telegram rejected send: group migrated to supergroup ${migratedChatId}`
+      : "Telegram rejected send: group migrated to a supergroup";
   }
   return undefined;
 }

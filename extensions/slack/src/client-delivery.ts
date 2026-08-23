@@ -42,17 +42,16 @@ const SLACK_DNS_RETRY_CODES = new Set(["EAI_AGAIN", "ENOTFOUND", "UND_ERR_DNS_RE
 const SLACK_DNS_RETRY_ATTEMPTS = 2;
 const SLACK_DNS_RETRY_BASE_DELAY_MS = 250;
 
+// Slack reports provider verdicts as `slack_webapi_platform_error` with the code in
+// `data.error`; these two mean no recipient can ever see the message, so durable
+// recovery must stop retrying. Everything else rethrows by identity — the
+// `invalid_blocks` and custom-identity fallbacks match on the original value.
 export function rethrowSlackPermanentOutboundApiRejection(err: unknown): never {
-  if (!(err instanceof Error) || !isRecord(err)) {
-    throw new Error("Slack outbound API rejected with a non-Error value", { cause: err });
-  }
-  const data = isRecord(err.data) ? err.data : undefined;
+  const rawData =
+    isRecord(err) && err.code === "slack_webapi_platform_error" ? err.data : undefined;
+  const data = isRecord(rawData) ? rawData : undefined;
   const code = data?.error;
-  if (
-    err.code === "slack_webapi_platform_error" &&
-    data?.ok === false &&
-    (code === "messages_tab_disabled" || code === "account_inactive")
-  ) {
+  if (data?.ok === false && (code === "messages_tab_disabled" || code === "account_inactive")) {
     throw new PlatformMessageNotDispatchedError(`Slack outbound delivery rejected: ${code}`, {
       cause: err,
       retryable: false,

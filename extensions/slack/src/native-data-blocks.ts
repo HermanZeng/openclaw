@@ -31,8 +31,9 @@ export function stripSlackNativeDataBlocks<T>(blocks?: readonly T[]): T[] {
   });
 }
 
-function hasSlackInvalidBlocksShape(value: unknown): boolean {
-  const record = asOptionalRecord(value);
+/** Match Slack's Web API and response_url `invalid_blocks` error shapes. */
+export function isSlackInvalidBlocksError(error: unknown): boolean {
+  const record = asOptionalRecord(error);
   const rawData = record?.data;
   const data = asOptionalRecord(rawData);
   const rawResponseData = asOptionalRecord(record?.response)?.data;
@@ -44,12 +45,6 @@ function hasSlackInvalidBlocksShape(value: unknown): boolean {
     (typeof rawResponseData === "string" ? rawResponseData : undefined) ??
     record?.error;
   return typeof code === "string" && code.trim().toLowerCase() === "invalid_blocks";
-}
-
-/** Match Slack's Web API and response_url `invalid_blocks` error shapes. */
-export function isSlackInvalidBlocksError(error: unknown): boolean {
-  const record = asOptionalRecord(error);
-  return hasSlackInvalidBlocksShape(record) || hasSlackInvalidBlocksShape(record?.cause);
 }
 
 type SlackResponseLike = {
