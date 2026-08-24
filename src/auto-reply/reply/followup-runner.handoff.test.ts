@@ -45,10 +45,8 @@ const { scheduleFollowupDrainAfterReplyOperationClear } = await import("./agent-
 const { createFollowupRunner } = await import("./followup-runner.js");
 const { clearSessionQueues, enqueueFollowupRun } = await import("./queue.js");
 const { createQueueTestRun } = await import("./queue.test-helpers.js");
-const {
-  consumeQueuedReplyCompletionHandoff,
-  recordReplyOperationCompletedSourceReply,
-} = await import("./reply-completion-handoff.js");
+const { consumeQueuedReplyCompletionHandoff, recordReplyOperationCompletedSourceReply } =
+  await import("./reply-completion-handoff.js");
 const { createReplyOperation } = await import("./reply-run-registry.js");
 
 function createQueuedRun(key: string, prompt: string): FollowupRun {
@@ -130,10 +128,7 @@ describe("queued completion handoff through FollowupRunner", () => {
       resetTriggered: false,
     });
     const operations = [ownerA];
-    const observed = new Map<
-      string,
-      ReturnType<typeof consumeQueuedReplyCompletionHandoff>
-    >();
+    const observed = new Map<string, ReturnType<typeof consumeQueuedReplyCompletionHandoff>>();
     const done = createDeferred();
 
     state.admit.mockImplementation(async ({ queued }: { queued: FollowupRun }) => {
