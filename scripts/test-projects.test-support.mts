@@ -1953,6 +1953,9 @@ function resolveToolingChangedTestTargets(changedPaths: string[], cwd = process.
       return null;
     }
     targets.push(...testTargets);
+    if (CHANNEL_PLUGIN_SHAPE_PARITY_WIRING_PATHS.has(changedPath)) {
+      targets.push(CHANNEL_PLUGIN_SHAPE_PARITY_TEST_TARGET);
+    }
   }
   return [...new Set(targets)];
 }
