@@ -562,6 +562,14 @@ const PRECISE_SOURCE_TEST_TARGETS = new Map<string, string[]>([
     ],
   ],
   [
+    "extensions/slack/src/channel-actions.ts",
+    [
+      "extensions/slack/src/actions.reactions-limit.test.ts",
+      "extensions/slack/src/channel-actions-setup-status.contract.test.ts",
+      "extensions/slack/src/message-tools.test.ts",
+    ],
+  ],
+  [
     "src/gateway/worker-environments/worker-turn-launcher.ts",
     [
       "src/gateway/worker-environments/worker-turn-launcher.test.ts",
