@@ -972,6 +972,53 @@ describe("capability cli", () => {
     expect(mocks.loadAuthProfileStoreForRuntime).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { position: "parent", systemAgent: undefined },
+    { position: "leaf", systemAgent: undefined },
+    { position: "parent", systemAgent: "alpha" },
+    { position: "leaf", systemAgent: "alpha" },
+  ])(
+    "scopes audio providers to the $position-level agent with system owner $systemAgent",
+    async ({ position, systemAgent }) => {
+      const cfg = {
+        agents: {
+          ownership: "explicit" as const,
+          ...(systemAgent ? { defaults: { systemAgent: { agentId: systemAgent } } } : {}),
+          entries: { alpha: {}, beta: {} },
+        },
+      };
+      mocks.loadConfig.mockReturnValue(cfg);
+      mocks.buildMediaUnderstandingRegistry.mockReturnValueOnce(
+        new Map([["openai", { id: "openai", capabilities: ["audio"] }]]),
+      );
+      mocks.loadAuthProfileStoreForRuntime.mockImplementation(
+        (agentDir) =>
+          ({
+            version: 1,
+            profiles:
+              agentDir === "/tmp/agent-beta" ? { "openai:beta": { provider: "openai" } } : {},
+            order: {},
+          }) as never,
+      );
+      mocks.listProfilesForProvider.mockImplementation((store, provider) =>
+        Object.entries(store.profiles as Record<string, { provider: string }>)
+          .filter(([, profile]) => profile.provider === provider)
+          .map(([id]) => id),
+      );
+
+      if (position === "parent") {
+        await runCapabilityWithParentAgent("audio", "providers", "beta", "--json");
+      } else {
+        await runCapability("audio", "providers", "--agent", "beta", "--json");
+      }
+
+      expect(mocks.loadAuthProfileStoreForRuntime).toHaveBeenCalledWith("/tmp/agent-beta");
+      expect(firstJsonOutput()).toEqual([
+        expect.objectContaining({ id: "openai", configured: true }),
+      ]);
+    },
+  );
+
   it("scopes web search auth inspection to the selected agent", async () => {
     mocks.loadConfig.mockReturnValue({
       agents: {
@@ -1537,6 +1584,22 @@ describe("capability cli", () => {
     expect(outputs).toHaveLength(1);
     expect(outputs[0]?.kind).toBe("image.description");
   });
+
+  it.each([
+    { domain: "audio", action: "transcribe", file: "memo.m4a", result: "meeting notes" },
+    { domain: "image", action: "describe", file: "photo.jpg", result: "friendly lobster" },
+    { domain: "image", action: "describe-many", file: "photo.jpg", result: "friendly lobster" },
+    { domain: "video", action: "describe", file: "clip.mp4", result: "friendly lobster" },
+  ])(
+    "prints both the input path and result for $domain $action by default",
+    async ({ domain, action, file, result }) => {
+      await runCapability(domain, action, "--file", file);
+
+      const output = mocks.runtime.log.mock.calls.at(-1)?.[0];
+      expect(output).toContain(path.resolve(file));
+      expect(output).toContain(result);
+    },
+  );
 
   it("keeps encoded image describe HTTP URLs intact", async () => {
     const mediaUrl = "https://cdn.example.com/clip%2Emp4?download=1#preview";
