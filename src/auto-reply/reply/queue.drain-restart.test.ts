@@ -29,6 +29,7 @@ import {
   installQueueRuntimeErrorSilencer,
 } from "./queue.test-helpers.js";
 import { resetRecentQueuedMessageIdDedupe } from "./queue/enqueue.test-support.js";
+import { resolveFollowupReplyDeliveryTargetKey } from "./queue/delivery-target.js";
 import { clearFollowupQueue, getExistingFollowupQueue } from "./queue/state.js";
 import {
   consumeQueuedReplyCompletionHandoff,
@@ -62,12 +63,9 @@ function createCompletionHandoff(key: string): ReplyCompletionHandoff {
     ownerKey: key,
     ownerSessionId: "session-1",
     ownerLifecycleGeneration: getAgentEventLifecycleGeneration(),
-    route: Object.freeze({
-      channel: "telegram",
-      to: "chat-1",
-      accountId: "primary",
-      threadId: "7",
-    }),
+    deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(
+      createCompletionEligibleRun(key, "source"),
+    ),
   });
 }
 

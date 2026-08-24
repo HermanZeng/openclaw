@@ -1,15 +1,7 @@
-import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { isAgentEventLifecycleGenerationCurrent } from "../../infra/agent-events.js";
+import { resolveFollowupReplyDeliveryTargetKey } from "./queue/delivery-target.js";
 import type { FollowupRun } from "./queue/types.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
-
-type ReplyCompletionRoute = Readonly<{
-  channel?: string;
-  to?: string;
-  accountId?: string;
-  chatId?: string;
-  threadId?: string;
-}>;
 
 /** Immutable process-local fact minted by the owner that completed a source reply. */
 export type ReplyCompletionHandoff = Readonly<{
@@ -17,7 +9,7 @@ export type ReplyCompletionHandoff = Readonly<{
   ownerKey: string;
   ownerSessionId: string;
   ownerLifecycleGeneration: string;
-  route: ReplyCompletionRoute;
+  deliveryTargetKey: string;
 }>;
 
 type ReplyCompletionQueueClaim = {
@@ -39,34 +31,6 @@ type QueuedCompletionCarrier = FollowupRun & {
     owner: ReplyCompletionQueueOwner;
   };
 };
-
-function normalizeRouteChannel(value: unknown): string | undefined {
-  return normalizeOptionalString(value)?.toLowerCase();
-}
-
-function resolveReplyCompletionRoute(run: FollowupRun): ReplyCompletionRoute {
-  const threadId = run.originatingThreadId;
-  return Object.freeze({
-    channel: normalizeRouteChannel(run.originatingChannel ?? run.run.messageProvider),
-    to: normalizeOptionalString(run.originatingTo),
-    accountId: normalizeOptionalString(run.originatingAccountId ?? run.run.agentAccountId),
-    chatId: normalizeOptionalString(run.originatingChatId),
-    threadId:
-      typeof threadId === "number" && Number.isFinite(threadId)
-        ? String(threadId)
-        : normalizeOptionalString(threadId),
-  });
-}
-
-function replyCompletionRoutesMatch(left: ReplyCompletionRoute, right: ReplyCompletionRoute) {
-  return (
-    left.channel === right.channel &&
-    left.to === right.to &&
-    left.accountId === right.accountId &&
-    left.chatId === right.chatId &&
-    left.threadId === right.threadId
-  );
-}
 
 function clearReplyCompletionQueueClaim(owner: ReplyCompletionQueueOwner): void {
   completionClaimsByQueueOwner.delete(owner);
@@ -92,7 +56,7 @@ export function recordReplyOperationCompletedSourceReply(
       ownerKey: operation.key,
       ownerSessionId: operation.sessionId,
       ownerLifecycleGeneration: lifecycleGeneration,
-      route: resolveReplyCompletionRoute(source),
+      deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(source),
     }),
   );
 }
@@ -173,7 +137,7 @@ export function bindReplyCompletionHandoffToQueuedRun(params: {
     params.queued.run.sessionKey === handoff.ownerKey &&
     (params.queued.admissionSessionId ?? params.queued.run.sessionId) === handoff.ownerSessionId &&
     params.queued.currentInboundEventKind !== "room_event" &&
-    replyCompletionRoutesMatch(handoff.route, resolveReplyCompletionRoute(params.queued));
+    handoff.deliveryTargetKey === resolveFollowupReplyDeliveryTargetKey(params.queued);
   if (!eligible) {
     clearReplyCompletionQueueClaim(params.owner);
     return;
@@ -213,7 +177,7 @@ export function consumeQueuedReplyCompletionHandoff(
     queued.run.sessionKey === handoff.ownerKey &&
     (queued.admissionSessionId ?? queued.run.sessionId) === handoff.ownerSessionId &&
     queued.currentInboundEventKind !== "room_event" &&
-    replyCompletionRoutesMatch(handoff.route, resolveReplyCompletionRoute(queued))
+    handoff.deliveryTargetKey === resolveFollowupReplyDeliveryTargetKey(queued)
     ? handoff
     : undefined;
 }

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { getAgentEventLifecycleGeneration } from "../../infra/agent-events.js";
 import type { FollowupRun } from "./queue.js";
+import { resolveFollowupReplyDeliveryTargetKey } from "./queue/delivery-target.js";
 import {
   bindReplyCompletionHandoffToQueuedRun,
   replaceReplyCompletionQueuePredecessor,
@@ -106,13 +107,13 @@ function createOperation(
   };
 }
 
-function createCompletionHandoff(): ReplyCompletionHandoff {
+function createCompletionHandoff(source = createCompletionEligibleRun()): ReplyCompletionHandoff {
   return Object.freeze({
     kind: "completed_source_reply",
     ownerKey: "main",
     ownerSessionId: "queued-session",
     ownerLifecycleGeneration: getAgentEventLifecycleGeneration(),
-    route: Object.freeze({ channel: "telegram", to: "chat-1", accountId: "primary" }),
+    deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(source),
   });
 }
 
@@ -136,9 +137,9 @@ function createCompletionEligibleRun(overrides: Partial<FollowupRun> = {}): Foll
   });
 }
 
-function bindCompletionHandoff(queued: FollowupRun) {
+function bindCompletionHandoff(queued: FollowupRun, source?: FollowupRun) {
   const owner = {};
-  replaceReplyCompletionQueuePredecessor(owner, createCompletionHandoff());
+  replaceReplyCompletionQueuePredecessor(owner, createCompletionHandoff(source));
   bindReplyCompletionHandoffToQueuedRun({ owner, queueKey: "main", queued });
   return owner;
 }
@@ -244,6 +245,33 @@ describe("admitFollowupTurn reply-completion handoff", () => {
     expect(result.kind).toBe("admitted");
     if (result.kind === "admitted") {
       expect(result.turn.queued.currentInboundEventKind).toBe("room_event");
+      expect(result.turn.currentInboundContext?.text).toBe("Authenticated inbound context");
+    }
+  });
+
+  it.each([
+    ["reply anchor", { originatingReplyToId: "reply-2" }],
+    ["reply policy", { originatingReplyToMode: "off" as const }],
+    ["chat type", { originatingChatType: "group" }],
+  ])("does not cross a mismatched %s", async (_label, mismatch) => {
+    const source = createCompletionEligibleRun({
+      originatingReplyToId: "reply-1",
+      originatingReplyToMode: "all",
+      originatingChatType: "direct",
+    });
+    const queued = createCompletionEligibleRun({
+      originatingReplyToId: "reply-1",
+      originatingReplyToMode: "all",
+      originatingChatType: "direct",
+      ...mismatch,
+    });
+    bindCompletionHandoff(queued, source);
+    state.admitReply.mockResolvedValue({ status: "owned", operation: createOperation() });
+
+    const result = await admitFollowupTurn({ queued, defaults: createDefaults() });
+
+    expect(result.kind).toBe("admitted");
+    if (result.kind === "admitted") {
       expect(result.turn.currentInboundContext?.text).toBe("Authenticated inbound context");
     }
   });
