@@ -63,9 +63,7 @@ function createCompletionHandoff(key: string): ReplyCompletionHandoff {
     ownerKey: key,
     ownerSessionId: "session-1",
     ownerLifecycleGeneration: getAgentEventLifecycleGeneration(),
-    deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(
-      createCompletionEligibleRun(key, "source"),
-    ),
+    deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(createCompletionEligibleRun(key, "source")),
   });
 }
 

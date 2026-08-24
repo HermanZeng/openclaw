@@ -1726,6 +1726,7 @@ describe("followup queue collect routing", () => {
       ownerLifecycleGeneration: generation,
       deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(
         createRun({
+          prompt: "source",
           originatingChannel: "telegram",
           originatingTo: "chat-1",
           originatingAccountId: "primary",
