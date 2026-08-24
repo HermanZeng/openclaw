@@ -28,6 +28,29 @@ function runBuiltCli(tempHome: string, args: string[], envOverrides: NodeJS.Proc
   });
 }
 
+async function seedTrajectorySession(tempHome: string, sessionKey: string) {
+  const stateDir = path.join(tempHome, "isolated-state");
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: tempHome,
+    USERPROFILE: tempHome,
+    OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+    OPENCLAW_STATE_DIR: stateDir,
+  };
+  delete env.OPENCLAW_HOME;
+  const [{ upsertSessionEntryCore }, { closeOpenClawAgentDatabaseByPath }] = await Promise.all([
+    import("../src/config/sessions/session-accessor.js"),
+    import("../src/state/openclaw-agent-db.js"),
+  ]);
+  await upsertSessionEntryCore(
+    { agentId: "main", env, sessionKey },
+    { sessionId: "trajectory-process-session", updatedAt: 1 },
+  );
+  closeOpenClawAgentDatabaseByPath(
+    path.join(stateDir, "agents", "main", "agent", "openclaw-agent.sqlite"),
+  );
+}
+
 describe("cli json stdout contract", () => {
   it.each([
     {
@@ -276,6 +299,517 @@ describe("cli json stdout contract", () => {
     );
   });
 
+  it.each([
+    {
+      name: "routed status with JSON before its timeout",
+      args: ["status", "--json", "--timeout", "nope"],
+    },
+    {
+      name: "routed health with JSON after its timeout",
+      args: ["health", "--timeout", "0", "--json"],
+    },
+    {
+      name: "Commander status with JSON after its timeout",
+      args: ["status", "--timeout", "nope", "--json"],
+      commander: true,
+    },
+    {
+      name: "Commander health with JSON before its timeout",
+      args: ["health", "--json", "--timeout", "0"],
+      commander: true,
+    },
+    {
+      name: "routed status through dual-TTY finalization",
+      args: ["status", "--json", "--timeout", "nope"],
+      tty: true,
+    },
+  ])("renders invalid status/health timeouts as canonical JSON for $name", async (testCase) => {
+    await withTempHome(
+      async (tempHome) => {
+        const preload = `data:text/javascript,${encodeURIComponent(
+          'Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true }); Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });',
+        )}`;
+        const result = runBuiltCli(tempHome, testCase.args, {
+          OPENCLAW_STATE_DIR: path.join(tempHome, "isolated-state"),
+          OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+          OPENCLAW_GATEWAY_PORT: "29791",
+          ...("commander" in testCase ? { OPENCLAW_DISABLE_ROUTE_FIRST: "1" } : {}),
+          ...("tty" in testCase ? { NODE_OPTIONS: `--import=${preload}`, FORCE_COLOR: "1" } : {}),
+        });
+        const message = "--timeout must be a positive integer (milliseconds)";
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stdout, result.stderr).not.toContain("\u001B");
+        expect(result.stdout, result.stderr).not.toContain("\u0007");
+        expect(JSON.parse(result.stdout)).toEqual({
+          ok: false,
+          error: { type: "cli_error", message },
+        });
+        expect(result.stderr).toContain(message);
+        if ("tty" in testCase) {
+          expect(result.stderr).toContain("\u001B[?25h");
+        }
+      },
+      { prefix: "openclaw-status-health-json-timeout-e2e-" },
+    );
+  });
+
+  it.each([
+    {
+      name: "bare list active filter in human mode",
+      args: ["sessions", "--active", "0"],
+      message: "--active must be a positive number of minutes, for example --active 30.",
+      human: true,
+    },
+    {
+      name: "bare list limit in human mode through forced Commander",
+      args: ["sessions", "--limit", "0"],
+      message: '--limit must be a positive integer or "all", for example --limit 25.',
+      human: true,
+      commander: true,
+    },
+    {
+      name: "routed bare list active filter with JSON before its option",
+      args: ["sessions", "--json", "--active", "0"],
+      message: "--active must be a positive number of minutes, for example --active 30.",
+    },
+    {
+      name: "routed bare list limit with JSON after its option",
+      args: ["sessions", "--limit", "0", "--json"],
+      message: '--limit must be a positive integer or "all", for example --limit 25.',
+    },
+    {
+      name: "Commander bare list active filter with JSON after its option",
+      args: ["sessions", "--active", "0", "--json"],
+      message: "--active must be a positive number of minutes, for example --active 30.",
+      commander: true,
+    },
+    {
+      name: "Commander bare list limit with JSON before its option",
+      args: ["sessions", "--json", "--limit", "0"],
+      message: '--limit must be a positive integer or "all", for example --limit 25.',
+      commander: true,
+    },
+    {
+      name: "list alias active filter with inherited parent JSON",
+      args: ["sessions", "--json", "list", "--active", "0"],
+      message: "--active must be a positive number of minutes, for example --active 30.",
+    },
+    {
+      name: "list alias limit with leaf JSON",
+      args: ["sessions", "list", "--limit", "0", "--json"],
+      message: '--limit must be a positive integer or "all", for example --limit 25.',
+    },
+    {
+      name: "bare list active filter before an invalid limit",
+      args: ["sessions", "--json", "--limit", "0", "--active", "0"],
+      message: "--active must be a positive number of minutes, for example --active 30.",
+    },
+    {
+      name: "routed bare list active filter through dual-TTY finalization",
+      args: ["sessions", "--json", "--active", "0"],
+      message: "--active must be a positive number of minutes, for example --active 30.",
+      tty: true,
+    },
+    {
+      name: "Commander bare list limit through dual-TTY finalization",
+      args: ["sessions", "--limit", "0", "--json"],
+      message: '--limit must be a positive integer or "all", for example --limit 25.',
+      commander: true,
+      tty: true,
+    },
+    {
+      name: "cleanup with an inherited filter in human mode",
+      args: ["sessions", "--active", "5", "cleanup"],
+      message:
+        "`sessions cleanup` does not support the parent `sessions` option --active; session-list filters cannot scope session maintenance.",
+      human: true,
+    },
+    {
+      name: "cleanup inherited filter with leaf JSON",
+      args: ["sessions", "--active", "5", "cleanup", "--json"],
+      message:
+        "`sessions cleanup` does not support the parent `sessions` option --active; session-list filters cannot scope session maintenance.",
+    },
+    {
+      name: "cleanup inherited limit with parent JSON",
+      args: ["sessions", "--json", "--limit", "1", "cleanup"],
+      message:
+        "`sessions cleanup` does not support the parent `sessions` option --limit; session-list filters cannot scope session maintenance.",
+    },
+    {
+      name: "trajectory export inherited all-agent scope",
+      args: [
+        "sessions",
+        "--all-agents",
+        "export-trajectory",
+        "--session-key",
+        "agent:main:main",
+        "--json",
+      ],
+      message:
+        "`sessions export-trajectory` does not support the parent `sessions` option --all-agents; trajectory export targets one session and cannot apply session-list filters.",
+    },
+    {
+      name: "trajectory export missing session key in human mode",
+      args: ["sessions", "export-trajectory"],
+      message: "--session-key is required. Run openclaw sessions to choose a session.",
+      human: true,
+    },
+    {
+      name: "trajectory export missing session key with leaf JSON",
+      args: ["sessions", "export-trajectory", "--json"],
+      message: "--session-key is required. Run openclaw sessions to choose a session.",
+    },
+    {
+      name: "trajectory export missing session key with parent JSON through forced Commander",
+      args: ["sessions", "--json", "export-trajectory"],
+      message: "--session-key is required. Run openclaw sessions to choose a session.",
+      commander: true,
+    },
+    {
+      name: "trajectory export malformed encoded request",
+      args: [
+        "sessions",
+        "export-trajectory",
+        "--request-json-base64",
+        Buffer.from("not json", "utf8").toString("base64url"),
+        "--json",
+      ],
+      message:
+        "Failed to decode trajectory export request: Encoded trajectory export request is invalid JSON",
+    },
+    {
+      name: "trajectory export noncanonical encoded request with parent JSON",
+      args: [
+        "sessions",
+        "--json",
+        "export-trajectory",
+        "--request-json-base64",
+        ` ${Buffer.from(JSON.stringify({ sessionKey: "agent:main:test" })).toString("base64url")} `,
+      ],
+      message:
+        "Failed to decode trajectory export request: Encoded trajectory export request is invalid",
+    },
+    {
+      name: "trajectory export blank explicit agent",
+      args: [
+        "sessions",
+        "export-trajectory",
+        "--session-key",
+        "agent:main:test",
+        "--agent",
+        "",
+        "--json",
+      ],
+      message: "--agent must not be blank",
+    },
+    {
+      name: "trajectory export unconfigured explicit agent",
+      args: [
+        "sessions",
+        "export-trajectory",
+        "--session-key",
+        "agent:main:test",
+        "--agent",
+        "unknown-agent",
+        "--json",
+      ],
+      message:
+        'Unknown agent id "unknown-agent". Run openclaw agents list to see configured agents.',
+    },
+    {
+      name: "trajectory export missing session through dual-TTY finalization",
+      args: ["sessions", "export-trajectory", "--session-key", "agent:main:missing", "--json"],
+      message:
+        "Session not found: agent:main:missing. Run openclaw sessions to see available sessions.",
+      tty: true,
+    },
+    {
+      name: "trajectory export invalid explicit store",
+      args: [
+        "sessions",
+        "export-trajectory",
+        "--session-key",
+        "agent:main:trajectory-process",
+        "--store",
+        "$MISSING_STORE",
+        "--json",
+      ],
+      message:
+        "Session store target does not exist: $MISSING_STORE. Pass a selector whose resolved SQLite target exists.",
+    },
+    {
+      name: "trajectory exporter operational failure",
+      args: [
+        "sessions",
+        "export-trajectory",
+        "--session-key",
+        "agent:main:trajectory-process",
+        "--workspace",
+        "$TRAJECTORY_WORKSPACE",
+        "--json",
+      ],
+      message: "Failed to export trajectory: injected trajectory exporter failure",
+      exporterFailure: true,
+    },
+    {
+      name: "archive inherited store with leaf JSON",
+      args: ["sessions", "--store", "/tmp/other.sqlite", "archive", "agent:main:test", "--json"],
+      message:
+        "`sessions archive` does not support the parent `sessions` option --store; the gateway resolves target stores from each key and --agent.",
+    },
+    {
+      name: "archive invalid timeout with parent JSON",
+      args: ["sessions", "--json", "archive", "agent:main:test", "--timeout", "0"],
+      message: "--timeout must be a positive integer (milliseconds).",
+    },
+    {
+      name: "delete inherited all-agent scope",
+      args: ["sessions", "--all-agents", "delete", "agent:main:test", "--yes", "--json"],
+      message:
+        "`sessions delete` does not support the parent `sessions` option --all-agents; the gateway resolves target stores from each key and --agent.",
+    },
+    {
+      name: "delete invalid timeout with leaf JSON",
+      args: ["sessions", "delete", "agent:main:test", "--timeout", "nope", "--yes", "--json"],
+      message: "--timeout must be a positive integer (milliseconds).",
+    },
+    {
+      name: "compact inherited all-agent scope",
+      args: ["sessions", "--all-agents", "compact", "agent:main:test", "--json"],
+      message:
+        "`sessions compact` does not support the parent `sessions` option --all-agents; the gateway resolves the target store from <key> and --agent.",
+    },
+    {
+      name: "compact invalid max-lines with leaf JSON",
+      args: ["sessions", "compact", "agent:main:test", "--max-lines", "0", "--json"],
+      message: "--max-lines must be a positive integer.",
+    },
+    {
+      name: "compact invalid timeout with parent JSON",
+      args: ["sessions", "--json", "compact", "agent:main:test", "--timeout", "0"],
+      message: "--timeout must be a positive integer (milliseconds).",
+    },
+    {
+      name: "human-only tail rejecting inherited JSON",
+      args: ["sessions", "--json", "tail"],
+      message:
+        "`sessions tail` does not support the parent `sessions` option --json; trajectory tail emits human-readable progress and selects sessions separately.",
+    },
+    {
+      name: "cleanup inherited filter through forced Commander",
+      args: ["sessions", "--active", "5", "cleanup", "--json"],
+      message:
+        "`sessions cleanup` does not support the parent `sessions` option --active; session-list filters cannot scope session maintenance.",
+      commander: true,
+    },
+    {
+      name: "compact invalid max-lines through dual-TTY finalization",
+      args: ["sessions", "compact", "agent:main:test", "--max-lines", "0", "--json"],
+      message: "--max-lines must be a positive integer.",
+      tty: true,
+    },
+  ])("renders sessions list and registration validation failures for $name", async (testCase) => {
+    await withTempHome(
+      async (tempHome) => {
+        if ("exporterFailure" in testCase) {
+          await seedTrajectorySession(tempHome, "agent:main:trajectory-process");
+        }
+        const preload = Buffer.from(
+          [
+            'import net from "node:net";',
+            'net.Socket.prototype.connect = function () { throw new Error("AUTOQA_NETWORK_FORBIDDEN"); };',
+            'globalThis.fetch = async () => { throw new Error("AUTOQA_NETWORK_FORBIDDEN"); };',
+            ...("exporterFailure" in testCase
+              ? [
+                  'import fs from "node:fs/promises";',
+                  "const originalRealpath = fs.realpath;",
+                  `fs.realpath = async (target, ...args) => { if (target === ${JSON.stringify(tempHome)}) { throw new Error("injected trajectory exporter failure"); } return originalRealpath(target, ...args); };`,
+                ]
+              : []),
+            ...("tty" in testCase
+              ? [
+                  'Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });',
+                  'Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });',
+                ]
+              : []),
+          ].join("\n"),
+        ).toString("base64");
+        const missingStore = path.join(tempHome, "missing-store.sqlite");
+        const args = testCase.args.map((arg) =>
+          arg === "$TRAJECTORY_WORKSPACE"
+            ? tempHome
+            : arg === "$MISSING_STORE"
+              ? missingStore
+              : arg,
+        );
+        const message = testCase.message.replace("$MISSING_STORE", missingStore);
+        const result = runBuiltCli(tempHome, args, {
+          NODE_OPTIONS: `--import=data:text/javascript;base64,${preload}`,
+          OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+          OPENCLAW_GATEWAY_PORT: "29791",
+          OPENCLAW_STATE_DIR: path.join(tempHome, "isolated-state"),
+          ...("commander" in testCase ? { OPENCLAW_DISABLE_ROUTE_FIRST: "1" } : {}),
+          ...("tty" in testCase ? { FORCE_COLOR: "1" } : {}),
+        });
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stdout, result.stderr).not.toContain("\u001B");
+        expect(result.stdout, result.stderr).not.toContain("\u0007");
+        if ("human" in testCase) {
+          expect(result.stdout).toBe("");
+        } else {
+          expect(JSON.parse(result.stdout)).toEqual({
+            ok: false,
+            error: { type: "cli_error", message },
+          });
+        }
+        expect(result.stderr).toContain(message);
+        expect(result.stderr.split(message)).toHaveLength(2);
+        expect(result.stderr).not.toContain("AUTOQA_NETWORK_FORBIDDEN");
+        if ("tty" in testCase) {
+          expect(result.stderr).toContain("\u001B[?25h");
+        }
+      },
+      { prefix: "openclaw-sessions-registration-json-failure-e2e-" },
+    );
+  });
+
+  it.each([
+    { name: "direct JSON export", encoded: false, json: true },
+    { name: "encoded request precedence with plain output", encoded: true, json: false },
+  ])("preserves successful trajectory $name", async (testCase) => {
+    await withTempHome(
+      async (tempHome) => {
+        const sessionKey = "agent:main:trajectory-process";
+        await seedTrajectorySession(tempHome, sessionKey);
+        const output = testCase.encoded ? "encoded-export" : "direct-export";
+        const args = [
+          "sessions",
+          "export-trajectory",
+          "--session-key",
+          testCase.encoded ? "agent:main:missing" : sessionKey,
+          "--output",
+          "direct-export",
+          "--workspace",
+          tempHome,
+        ];
+        if (testCase.encoded) {
+          args.push(
+            "--request-json-base64",
+            Buffer.from(JSON.stringify({ sessionKey, output }), "utf8").toString("base64url"),
+          );
+        }
+        if (testCase.json) {
+          args.push("--json");
+        }
+
+        const result = runBuiltCli(tempHome, args, {
+          OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+          OPENCLAW_GATEWAY_PORT: "29791",
+          OPENCLAW_STATE_DIR: path.join(tempHome, "isolated-state"),
+        });
+
+        expect(result.status, result.stderr).toBe(0);
+        if (testCase.json) {
+          expect(JSON.parse(result.stdout)).toMatchObject({
+            displayPath: `.openclaw/trajectory-exports/${output}`,
+            sessionId: "trajectory-process-session",
+          });
+        } else {
+          expect(result.stdout).toContain("✅ Trajectory exported!");
+          expect(result.stdout).toContain(`.openclaw/trajectory-exports/${output}`);
+          expect(result.stdout).toContain("trajectory-process-session");
+        }
+        await expect(
+          fs.access(
+            path.join(tempHome, ".openclaw", "trajectory-exports", output, "manifest.json"),
+          ),
+        ).resolves.toBeUndefined();
+      },
+      { prefix: "openclaw-trajectory-success-e2e-" },
+    );
+  });
+
+  it.each([
+    {
+      name: "account validation in human mode",
+      args: ["channels", "capabilities", "--account", "ghost"],
+      message: "--account requires a specific --channel. Run openclaw channels list to choose one.",
+      human: true,
+    },
+    {
+      name: "account validation with JSON before its option",
+      args: ["channels", "capabilities", "--json", "--account", "ghost"],
+      message: "--account requires a specific --channel. Run openclaw channels list to choose one.",
+    },
+    {
+      name: "target validation with JSON after its option and explicit Commander routing",
+      args: ["channels", "capabilities", "--target", "channel:1", "--json"],
+      message: "--target requires a specific --channel. Run openclaw channels list to choose one.",
+      commander: true,
+    },
+    {
+      name: "unknown channel validation with JSON before its option",
+      args: ["channels", "capabilities", "--json", "--channel", "definitely-not-a-channel"],
+      message:
+        'Unknown channel "definitely-not-a-channel". Run `openclaw channels list --all` to see configured and installable channels.',
+    },
+    {
+      name: "account validation through dual-TTY finalization",
+      args: ["channels", "capabilities", "--account", "ghost", "--json"],
+      message: "--account requires a specific --channel. Run openclaw channels list to choose one.",
+      tty: true,
+    },
+  ])(
+    "renders channels capabilities $name through the canonical failure owner",
+    async (testCase) => {
+      await withTempHome(
+        async (tempHome) => {
+          const preload = Buffer.from(
+            [
+              'import net from "node:net";',
+              'net.Socket.prototype.connect = function () { throw new Error("AUTOQA_NETWORK_FORBIDDEN"); };',
+              'globalThis.fetch = async () => { throw new Error("AUTOQA_NETWORK_FORBIDDEN"); };',
+              ...("tty" in testCase
+                ? [
+                    'Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });',
+                    'Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });',
+                  ]
+                : []),
+            ].join("\n"),
+          ).toString("base64");
+          const result = runBuiltCli(tempHome, testCase.args, {
+            NODE_OPTIONS: `--import=data:text/javascript;base64,${preload}`,
+            OPENCLAW_STATE_DIR: path.join(tempHome, "isolated-state"),
+            OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+            OPENCLAW_GATEWAY_PORT: "29871",
+            ...("commander" in testCase ? { OPENCLAW_DISABLE_ROUTE_FIRST: "1" } : {}),
+            ...("tty" in testCase ? { FORCE_COLOR: "1" } : {}),
+          });
+
+          expect(result.status, result.stderr).toBe(1);
+          if ("human" in testCase) {
+            expect(result.stdout).toBe("");
+          } else {
+            expect(result.stdout, result.stderr).not.toMatch(/[\u001B\u0007]/u);
+            expect(JSON.parse(result.stdout)).toEqual({
+              ok: false,
+              error: { type: "cli_error", message: testCase.message },
+            });
+          }
+          expect(result.stderr).toContain(testCase.message);
+          expect(result.stderr).not.toContain("AUTOQA_NETWORK_FORBIDDEN");
+          if ("tty" in testCase) {
+            expect(result.stderr).toContain("\u001B[?25h");
+          }
+        },
+        { prefix: "openclaw-channels-capabilities-failure-e2e-" },
+      );
+    },
+  );
+
   it("returns one canonical document for a command that previously failed on stderr only", async () => {
     await withTempHome(
       async (tempHome) => {
@@ -313,6 +847,107 @@ describe("cli json stdout contract", () => {
         expect(result.stderr).toBe("");
       },
       { prefix: "openclaw-task-flow-json-failure-e2e-" },
+    );
+  });
+
+  it.each([
+    {
+      name: "audit limit in human mode",
+      args: ["tasks", "audit", "--limit", "5abc"],
+      message: "--limit must be a positive integer, for example --limit 25.",
+      human: true,
+    },
+    {
+      name: "notify policy in human mode",
+      args: ["tasks", "notify", "task-123", "sometimes"],
+      message: "Notify policy must be done_only, state_changes, or silent.",
+      human: true,
+    },
+    {
+      name: "routed audit limit with leaf JSON",
+      args: ["tasks", "audit", "--json", "--limit", "5abc"],
+      message: "--limit must be a positive integer, for example --limit 25.",
+    },
+    {
+      name: "routed audit limit with parent JSON",
+      args: ["tasks", "--json", "audit", "--limit", "5abc"],
+      message: "--limit must be a positive integer, for example --limit 25.",
+    },
+    {
+      name: "Commander audit limit with leaf JSON",
+      args: ["tasks", "audit", "--limit", "5abc", "--json"],
+      message: "--limit must be a positive integer, for example --limit 25.",
+      commander: true,
+    },
+    {
+      name: "Commander audit limit with parent JSON",
+      args: ["tasks", "--json", "audit", "--limit", "5abc"],
+      message: "--limit must be a positive integer, for example --limit 25.",
+      commander: true,
+    },
+    {
+      name: "routed audit with an inherited runtime",
+      args: ["tasks", "--json", "--runtime", "cli", "audit"],
+      message: "`tasks audit` does not support inherited option --runtime.",
+    },
+    {
+      name: "Commander audit with an inherited status",
+      args: ["tasks", "--json", "--status", "running", "audit"],
+      message: "`tasks audit` does not support inherited option --status.",
+      commander: true,
+    },
+    {
+      name: "routed maintenance with an inherited runtime",
+      args: ["tasks", "--runtime", "cli", "maintenance", "--json"],
+      message: "`tasks maintenance` does not support inherited option --runtime.",
+    },
+    {
+      name: "routed TaskFlow list with an inherited task status",
+      args: ["tasks", "--json", "--status", "running", "flow", "list"],
+      message: "`tasks flow list` does not support inherited option --status.",
+    },
+    {
+      name: "Commander TaskFlow show with an inherited runtime",
+      args: ["tasks", "--runtime", "cli", "flow", "--json", "show", "flow-123"],
+      message: "`tasks flow show` does not support inherited option --runtime.",
+      commander: true,
+    },
+    {
+      name: "routed audit limit through dual-TTY finalization",
+      args: ["tasks", "audit", "--json", "--limit", "5abc"],
+      message: "--limit must be a positive integer, for example --limit 25.",
+      tty: true,
+    },
+  ])("renders task registration validation failures for $name", async (testCase) => {
+    await withTempHome(
+      async (tempHome) => {
+        const preload = `data:text/javascript,${encodeURIComponent(
+          'Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true }); Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });',
+        )}`;
+        const result = runBuiltCli(tempHome, testCase.args, {
+          OPENCLAW_STATE_DIR: path.join(tempHome, "isolated-state"),
+          OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+          ...("commander" in testCase ? { OPENCLAW_DISABLE_ROUTE_FIRST: "1" } : {}),
+          ...("tty" in testCase ? { NODE_OPTIONS: `--import=${preload}`, FORCE_COLOR: "1" } : {}),
+        });
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stdout, result.stderr).not.toMatch(/[\u001B\u0007]/u);
+        if ("human" in testCase) {
+          expect(result.stdout).toBe("");
+        } else {
+          expect(JSON.parse(result.stdout)).toEqual({
+            ok: false,
+            error: { type: "cli_error", message: testCase.message },
+          });
+        }
+        expect(result.stderr).toContain(testCase.message);
+        expect(result.stderr.split(testCase.message)).toHaveLength(2);
+        if ("tty" in testCase) {
+          expect(result.stderr).toContain("\u001B[?25h");
+        }
+      },
+      { prefix: "openclaw-task-registration-json-failure-e2e-" },
     );
   });
 
@@ -471,6 +1106,74 @@ describe("cli json stdout contract", () => {
         expect(result.stderr).not.toContain("AUTOQA_NETWORK_FORBIDDEN");
       },
       { prefix: "openclaw-nodes-json-failure-e2e-" },
+    );
+  });
+
+  it.each([
+    {
+      name: "the search query is missing",
+      args: ["plugins", "search", "--json"],
+      message: "Usage: openclaw plugins search <query>",
+    },
+    {
+      name: "ClawHub transport fails",
+      args: ["plugins", "search", "fixture", "--json"],
+      message: "offline fixture",
+    },
+  ])("returns one canonical JSON document when plugins $name", async (testCase) => {
+    await withTempHome(
+      async (tempHome) => {
+        const preload = `data:text/javascript,${encodeURIComponent(
+          'globalThis.fetch = async () => { throw new Error("offline fixture"); };',
+        )}`;
+        const result = runBuiltCli(tempHome, testCase.args, {
+          NODE_OPTIONS: `--import=${preload}`,
+          OPENCLAW_STATE_DIR: path.join(tempHome, "isolated-state"),
+          OPENCLAW_CONFIG_PATH: path.join(tempHome, "missing-openclaw.json"),
+          CLAWHUB_CONFIG_PATH: path.join(tempHome, "missing-clawhub.json"),
+          CLAWHUB_TOKEN: "",
+          CLAWHUB_AUTH_TOKEN: "",
+        });
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(result.stdout, result.stderr).not.toBe("");
+        expect(result.stdout).not.toMatch(/[\u001B\u0007]/u);
+        expect(JSON.parse(result.stdout)).toEqual({
+          ok: false,
+          error: {
+            type: "cli_error",
+            message: testCase.message,
+          },
+        });
+        expect(result.stderr).toContain(testCase.message);
+      },
+      { prefix: "openclaw-plugins-json-failure-e2e-" },
+    );
+  });
+
+  it("keeps plugins search JSON failures clean through dual-TTY finalization", async () => {
+    await withTempHome(
+      async (tempHome) => {
+        const preload = `data:text/javascript,${encodeURIComponent(
+          'Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true }); Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });',
+        )}`;
+        const result = runBuiltCli(tempHome, ["plugins", "search", "--json"], {
+          NODE_OPTIONS: `--import=${preload}`,
+        });
+
+        expect(result.status, result.stderr).toBe(1);
+        expect(JSON.parse(result.stdout)).toEqual({
+          ok: false,
+          error: {
+            type: "cli_error",
+            message: "Usage: openclaw plugins search <query>",
+          },
+        });
+        expect(result.stdout).not.toMatch(/[\u001B\u0007]/u);
+        expect(result.stderr).toContain("Usage: openclaw plugins search <query>");
+        expect(result.stderr).toContain("\u001B[?25h");
+      },
+      { prefix: "openclaw-plugins-json-tty-failure-e2e-" },
     );
   });
 

@@ -1504,6 +1504,26 @@ ${actionRun}`;
 }
 
 describe("ci workflow guards", () => {
+  it("gates frozen runtime-pair compatibility on the trusted suite outcome", () => {
+    const workflow = readReleaseChecksWorkflow();
+    const laneJob = workflow.jobs.qa_lab_runtime_pair_lane_release_checks;
+    const suiteValidation = laneJob.steps.find(
+      (step: WorkflowStep) => step.name === "Validate runtime-pair lane",
+    );
+    const reportValidation = laneJob.steps.find(
+      (step: WorkflowStep) => step.name === "Validate runtime-pair lane report",
+    );
+
+    for (const step of [suiteValidation, reportValidation]) {
+      expect(step?.env?.CANDIDATE_SUITE_OUTCOME).toBe(
+        "${{ steps.candidate_runtime_pair.outcome }}",
+      );
+      expect(step?.run).toContain('--candidate-suite-outcome "$CANDIDATE_SUITE_OUTCOME"');
+      expect(step?.run).toContain('--target-sha "$RELEASE_CHECK_TARGET_SHA"');
+      expect(step?.run).toContain('--lane "$RUNTIME_PAIR_LANE"');
+    }
+  });
+
   it("retains pending same-SHA QA calls in the shared concurrency group", () => {
     const workflowPath = ".github/workflows/qa-live-transports-convex.yml";
     const workflowSource = readFileSync(workflowPath, "utf8");
@@ -5175,8 +5195,24 @@ server.listen(0, "127.0.0.1", () => writeFileSync(readyPath, String(server.addre
     }
   });
 
-  it("bounds mantis discord smoke validation git fetches", () => {
-    const workflowPath = ".github/workflows/mantis-discord-smoke.yml";
+  it("bounds docs publish-repository Git transports", () => {
+    const source = readFileSync(".github/workflows/docs-sync-publish.yml", "utf8");
+    const transports = source
+      .split("\n")
+      .filter((line) => line.includes("git clone") || line.includes("git fetch origin main:"));
+
+    expect(transports).toHaveLength(3);
+    expect(
+      transports.every((line) =>
+        line.trimStart().startsWith("if timeout --signal=TERM --kill-after=10s 120s git"),
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    [".github/workflows/mantis-discord-smoke.yml"],
+    [".github/workflows/plugin-clawhub-release.yml"],
+  ])("bounds %s git fetches", (workflowPath) => {
     const source = readFileSync(workflowPath, "utf8");
     const gitFetchLines = source.split("\n").filter((line) => line.includes("git fetch"));
 
