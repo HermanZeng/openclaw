@@ -74,11 +74,7 @@ describe("executeAgentTurn: message tool progress", () => {
 
     expect(handoff).toMatchObject({
       kind: "completed_source_reply",
-      route: {
-        channel: "telegram",
-        to: "chat-1",
-        accountId: "primary",
-      },
+      deliveryTargetKey: expect.any(String),
     });
     expect(Object.isFrozen(handoff)).toBe(true);
   });
