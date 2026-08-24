@@ -890,6 +890,11 @@ describe("followup queue completed-reply handoff", () => {
     const predecessorB = createCompletionHandoff(key);
     const observed: Array<ReplyCompletionHandoff | undefined> = [];
     const done = createDeferred();
+    const operationB = createReplyOperation({
+      sessionKey: key,
+      sessionId: "session-1",
+      resetTriggered: false,
+    });
 
     try {
       enqueueFollowupRun(key, createCompletionEligibleRun(key, "B"), settings);
@@ -904,7 +909,14 @@ describe("followup queue completed-reply handoff", () => {
           );
           if (queued.prompt === "B") {
             // B completes while A's original drain callback still owns the loop.
-            scheduleFollowupDrain(key, async () => {}, { predecessorHandoff: predecessorB });
+            // Its after-clear path must replace A before that loop selects C.
+            recordReplyOperationCompletedSourceReply(operationB, queued);
+            scheduleFollowupDrainAfterReplyOperationClear({
+              operation: operationB,
+              queueKey: key,
+              runFollowup: async () => {},
+            });
+            operationB.complete();
           } else {
             done.resolve();
           }
@@ -915,6 +927,7 @@ describe("followup queue completed-reply handoff", () => {
       await done.promise;
       expect(observed).toEqual([predecessorA, predecessorB]);
     } finally {
+      operationB.complete();
       clearSessionQueues([key]);
     }
   });
