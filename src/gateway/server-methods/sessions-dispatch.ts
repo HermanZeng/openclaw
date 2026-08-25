@@ -334,6 +334,7 @@ export const sessionDispatchHandlers: GatewayRequestHandlers = {
       dispatchTarget = destination.value;
     }
     if (
+      !autoDevice &&
       dispatchTarget &&
       !(await validateDispatchExecutionMode({
         context,
@@ -422,13 +423,15 @@ export const sessionDispatchHandlers: GatewayRequestHandlers = {
           return;
         }
         dispatchTarget = destination.value;
+      }
+      if (autoDevice) {
         const eligibility = await resolveDevicePlacementEligibility({
           environmentService: context.workerEnvironmentService,
-          deviceId: dispatchTarget.deviceId!,
+          deviceId: candidates[attempt]!,
           runtimeId: sessionRuntime,
           requirement: devicePlacement,
           config: cfg,
-          currentNode: context.nodeRegistry.get(dispatchTarget.deviceId!),
+          currentNode: context.nodeRegistry.get(candidates[attempt]!),
         });
         if (!eligibility.ok) {
           lastEligibilityError = eligibility.error;
@@ -570,7 +573,11 @@ export const sessionDispatchHandlers: GatewayRequestHandlers = {
       if (error instanceof SessionMutationAuthorizationChangedError) {
         throw error;
       }
-      emitSessionsChanged(context, { reason: "move", sessionKey: target.canonicalKey });
+      try {
+        emitSessionsChanged(context, { reason: "move", sessionKey: target.canonicalKey });
+      } catch {
+        // Reporting cannot replace the placement owner's failure response.
+      }
       respondWorkerDispatchError(error, respond);
     }
   },
@@ -599,6 +606,22 @@ export const sessionDispatchHandlers: GatewayRequestHandlers = {
     }
     const { target, entry, sessionId } = resolved;
     const existingPlacement = placementReader.getMany([sessionId]).get(sessionId);
+    const reportPlacementChange = (placement: WorkerSessionPlacementRecord | undefined): void => {
+      if (
+        !placement ||
+        (existingPlacement &&
+          placement.state === existingPlacement.state &&
+          placement.generation === existingPlacement.generation &&
+          placement.updatedAtMs === existingPlacement.updatedAtMs)
+      ) {
+        return;
+      }
+      try {
+        emitSessionsChanged(context, { reason: "reclaim", sessionKey: target.canonicalKey });
+      } catch {
+        // Reporting cannot replace a committed reclaim outcome.
+      }
+    };
     if (
       existingPlacement?.state !== "failed" &&
       !resolveManagedSessionWorktree({
@@ -610,8 +633,9 @@ export const sessionDispatchHandlers: GatewayRequestHandlers = {
     ) {
       return;
     }
+    let placement: WorkerSessionPlacementRecord;
     try {
-      const placement = await placementService.reclaim(
+      placement = await placementService.reclaim(
         {
           sessionId,
           sessionKey: target.canonicalKey,
@@ -619,9 +643,15 @@ export const sessionDispatchHandlers: GatewayRequestHandlers = {
         },
         sessionMutationAuthorization?.assertCurrent,
       );
-      respondWorkerPlacement({ respond, key: target.canonicalKey, sessionId, context, placement });
     } catch (error) {
+      if (error instanceof SessionMutationAuthorizationChangedError) {
+        throw error;
+      }
+      reportPlacementChange(placementReader.getMany([sessionId]).get(sessionId));
       respondWorkerDispatchError(error, respond);
+      return;
     }
+    reportPlacementChange(placement);
+    respondWorkerPlacement({ respond, key: target.canonicalKey, sessionId, context, placement });
   },
 };

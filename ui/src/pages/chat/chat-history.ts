@@ -101,6 +101,7 @@ type ChatHistoryPaneRequests = {
   historyVersion: number;
   branchVersion: number;
   subscriptionGeneration: number;
+  subscriptionError?: string;
   pendingSubscriptionReleases: Set<SessionMessageSubscription>;
   inFlightHistory?: InFlightChatHistoryRequest;
 };
@@ -290,7 +291,6 @@ export type ChatHistoryResult = {
   verboseLevel?: string;
   defaults?: GatewaySessionsDefaults;
   sessionInfo?: GatewaySessionRow;
-  agentsList?: AgentsListResult;
   metadata?: ChatMetadataResult;
   inFlightRun?: {
     runId: string;
@@ -313,7 +313,6 @@ type ChatHistoryDeltaResult = {
   messages: unknown[];
   deltaCursor: string;
   sessionInfo: GatewaySessionRow;
-  agentsList?: AgentsListResult;
   metadata?: ChatMetadataResult;
 };
 
@@ -589,6 +588,7 @@ function isCurrentSelectedSessionMessageSubscriptionSync(
   params: {
     generation: number;
     client: GatewayBrowserClient;
+    connectionEpoch: number;
     requestedKey: string;
     requestedAgentId?: string | null;
   },
@@ -596,6 +596,7 @@ function isCurrentSelectedSessionMessageSubscriptionSync(
   return (
     getChatHistoryPaneRequests(state).subscriptionGeneration === params.generation &&
     state.client === params.client &&
+    state.connectionEpoch === params.connectionEpoch &&
     state.connected &&
     state.sessionKey.trim() === params.requestedKey &&
     resolveSelectedSessionMessageSubscriptionAgentId(state, params.requestedKey) ===
@@ -668,6 +669,7 @@ export async function syncSelectedSessionMessageSubscription(
     return;
   }
   const client = state.client;
+  const connectionEpoch = state.connectionEpoch;
   const nextKey = state.sessionKey.trim();
   if (!nextKey) {
     return;
@@ -696,16 +698,45 @@ export async function syncSelectedSessionMessageSubscription(
     selectedAgentChanged ||
     previousCanonicalKey === null ||
     previousRequestedKey === null;
-  if (!shouldUnsubscribePrevious && !shouldSubscribe) {
-    return;
-  }
   const isCurrent = () =>
     isCurrentSelectedSessionMessageSubscriptionSync(state, {
       generation,
       client,
+      connectionEpoch,
       requestedKey: nextKey,
       requestedAgentId: nextSubscriptionAgentId,
     });
+  const clearRecoveredError = () => {
+    const message = paneRequests.subscriptionError;
+    if (!message || paneRequests.pendingSubscriptionReleases.size > 0) {
+      return;
+    }
+    paneRequests.subscriptionError = undefined;
+    for (const field of ["sessionsError", "lastError", "chatError"] as const) {
+      if (state[field] === message) {
+        state[field] = null;
+      }
+    }
+    state.requestUpdate?.();
+  };
+  const publishError = (error: unknown) => {
+    const message = formatUiError(error);
+    paneRequests.subscriptionError = message;
+    state.sessionsError = message;
+    setChatError(state, message);
+    state.requestUpdate?.();
+  };
+  if (!shouldUnsubscribePrevious && !shouldSubscribe) {
+    if (
+      isCurrent() &&
+      previousSubscription &&
+      areUiSessionKeysEquivalent(previousSubscription.key, nextKey) &&
+      (previousSubscription.agentId ?? null) === nextSubscriptionAgentId
+    ) {
+      clearRecoveredError();
+    }
+    return;
+  }
   try {
     let unsubscribePromise: Promise<void> = Promise.resolve();
     if (shouldUnsubscribePrevious && previousSubscription) {
@@ -736,7 +767,9 @@ export async function syncSelectedSessionMessageSubscription(
             }
             state.chatSessionMessageSubscriptionRequestedKey = nextKey;
             state.chatSessionMessageSubscription = subscribeResult.value;
-            state.sessionsError = `${formatUiError(unsubscribeResult.reason)}; replacement release failed: ${formatUiError(replacementReleaseError)}`;
+            publishError(
+              `${formatUiError(unsubscribeResult.reason)}; replacement release failed: ${formatUiError(replacementReleaseError)}`,
+            );
           } else {
             paneRequests.pendingSubscriptionReleases.add(subscribeResult.value);
           }
@@ -744,7 +777,7 @@ export async function syncSelectedSessionMessageSubscription(
         }
       }
       if (isCurrent()) {
-        state.sessionsError = formatUiError(unsubscribeResult.reason);
+        publishError(unsubscribeResult.reason);
       }
       return;
     }
@@ -776,9 +809,10 @@ export async function syncSelectedSessionMessageSubscription(
     }
     state.chatSessionMessageSubscriptionRequestedKey = nextKey;
     state.chatSessionMessageSubscription = subscribed;
+    clearRecoveredError();
   } catch (err) {
     if (isCurrent()) {
-      state.sessionsError = formatUiError(err);
+      publishError(err);
     }
   }
 }
@@ -1455,9 +1489,6 @@ export function applyChatAgentsList(
   if (!agentsList || state.client !== client || !state.connected) {
     return;
   }
-  if (state.onAgentsList && !state.onAgentsList(agentsList, client)) {
-    return;
-  }
   state.agentsList = agentsList;
   state.agentsError = null;
   const selectedId =
@@ -1565,7 +1596,6 @@ async function loadChatHistoryUncached(
       for (const payload of response.messages) {
         applySessionMessagePayload(state, payload, runActive, { kind: "history-delta" });
       }
-      applyChatAgentsList(state, response.agentsList, client);
       if (Object.hasOwn(response.sessionInfo, "activeLeafEntryId")) {
         state.chatDisplayedLeafEntryId = response.sessionInfo.activeLeafEntryId?.trim() || null;
       }
@@ -1586,7 +1616,6 @@ async function loadChatHistoryUncached(
         messages: state.chatMessages,
         deltaCursor: response.deltaCursor,
         sessionInfo: response.sessionInfo,
-        ...(response.agentsList ? { agentsList: response.agentsList } : {}),
         ...(response.metadata ? { metadata: response.metadata } : {}),
         sourceCanonicalListRevision: response.sourceCanonicalListRevision,
       };
@@ -1608,7 +1637,6 @@ async function loadChatHistoryUncached(
     const messages = Array.isArray(res.messages) ? res.messages : [];
     const nextPagination = resolveChatHistoryPagination(res);
     const nextSessionId = resolveChatHistorySessionId(res);
-    applyChatAgentsList(state, res.agentsList, client);
     const visibleMessages = visibleChatHistoryMessages(messages);
     const previousTerminalMessages = reconcileAuthoritativeTerminalHistory({
       host: state,

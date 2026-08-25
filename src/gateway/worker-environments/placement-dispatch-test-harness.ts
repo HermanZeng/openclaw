@@ -20,6 +20,7 @@ import { createWorkerPlacementRunnerAvailabilityReader } from "./placement-proje
 import { completeReclaimedWorkspaceTeardown } from "./placement-teardown.js";
 import { WorkerTunnelOwnerDisconnectedError } from "./tunnel-contract.js";
 import type { WorkerTunnelHandle } from "./tunnel.js";
+import type { WorkerWorkspaceRecoveryFailureReport } from "./workspace-conflicts.js";
 import {
   createWorkerWorkspaceOperationCoordinator,
   type WorkerWorkspaceOperationCoordinator,
@@ -61,6 +62,9 @@ export function createHarness(
     >[0]["publishAcceptedWorkspace"];
     beforeMoveBegin?: (abandoned: { runId: string } | undefined) => Promise<void>;
     afterMoveBegin?: () => void;
+    afterDestroy?: () => Promise<void> | void;
+    afterReconcile?: () => Promise<void> | void;
+    afterStopTunnel?: () => Promise<void> | void;
     deviceRunnerAvailable?: boolean;
   } = {},
 ) {
@@ -71,6 +75,9 @@ export function createHarness(
   let verifyCalls = 0;
   const log: string[] = [];
   const reportWorkspaceResultConflict = vi.fn(async () => {});
+  const reportWorkspaceResultRecoveryFailure = vi.fn(
+    async (_recovery: WorkerWorkspaceRecoveryFailureReport) => {},
+  );
   const fail = (stage: DispatchStage) => {
     log.push(stage);
     if (options.failAt === stage) {
@@ -257,6 +264,7 @@ export function createHarness(
       if (options.reconcileConflictPaths?.length && request.stagedResult) {
         request.stagedResult.record(request.stagedResult.ref);
       }
+      await options.afterReconcile?.();
       return {
         manifestRef: reconciledManifestRef,
         changed: options.reconcileChanged ?? true,
@@ -344,6 +352,7 @@ export function createHarness(
     }),
     stopTunnel: vi.fn(async () => {
       log.push("teardown:stop");
+      await options.afterStopTunnel?.();
     }),
     destroy: vi.fn(async () => {
       log.push("teardown:destroy");
@@ -362,6 +371,7 @@ export function createHarness(
       }
       const destroyed = destroyedEnvironment((currentEnvironment?.ownerEpoch ?? 1) + 1);
       currentEnvironment = destroyed;
+      await options.afterDestroy?.();
       return destroyed;
     }),
     reconcileOnce: vi.fn(async () => {
@@ -439,17 +449,18 @@ export function createHarness(
         : { requiredNodeCommands: [], consumesWorkerSlot: true },
     runReclaimBarrier: async ({ authorize, begin, reclaim }) => {
       authorize?.();
-      return await reclaim(options.workspacePath ?? "/gateway/workspace", begin());
+      return await reclaim(options.workspacePath ?? "/gateway/workspace", begin(), authorize);
     },
     runFailedReclaimBarrier: async ({ authorize, reclaim }) => {
       authorize?.();
-      return await reclaim();
+      return await reclaim(authorize);
     },
     resolveWorkspacePath: async () => {
       fail("workspace");
       return options.workspacePath ?? "/gateway/workspace";
     },
     reportWorkspaceResultConflict,
+    reportWorkspaceResultRecoveryFailure,
     resolveWorkspaceResultConflict: vi.fn(async () => options.priorWorkspaceResultConflict),
     ...(options.prepareAcceptedWorkspacePublication
       ? { prepareAcceptedWorkspacePublication: options.prepareAcceptedWorkspacePublication }
@@ -483,6 +494,7 @@ export function createHarness(
     },
     environments,
     reportWorkspaceResultConflict,
+    reportWorkspaceResultRecoveryFailure,
     markEnvironmentDestroyed: () => {
       currentEnvironment = destroyedEnvironment((currentEnvironment?.ownerEpoch ?? 1) + 1);
     },
