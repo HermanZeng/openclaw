@@ -16,7 +16,7 @@ safe_runtime="$output_root/safe-runtime"
 claim_root="$output_root/claim-root"
 fake_bin="$output_root/bin"
 mkdir -p "$safe_runtime" "$claim_root/claims" "$fake_bin"
-chmod 0755 "$safe_runtime"
+chmod 1770 "$safe_runtime"
 /usr/bin/stat -c '%u %a' "$safe_runtime" >"$output_root/runtime-metadata"
 : >"$safe_runtime/lifecycle-control.lock"
 

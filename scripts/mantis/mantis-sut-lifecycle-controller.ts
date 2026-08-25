@@ -402,19 +402,30 @@ export function transitionMantisLifecycle(
   };
 }
 
+interface MantisLifecycleRuntimeStat {
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+  mode: number;
+  uid: number;
+}
+
+export function isRootOwnedMantisLifecycleRuntime(stat: MantisLifecycleRuntimeStat): boolean {
+  return (
+    stat.isDirectory() &&
+    !stat.isSymbolicLink() &&
+    stat.uid === 0 &&
+    (stat.mode & 0o1777) === 0o1770
+  );
+}
+
 function requireRootRuntime(runtimeRoot: string): string {
   if (process.platform !== "linux" || process.getuid?.() !== 0) {
     throw new Error("the Mantis lifecycle controller must run as root on Linux.");
   }
   const resolved = fs.realpathSync(runtimeRoot);
   const stat = fs.lstatSync(resolved);
-  if (
-    !stat.isDirectory() ||
-    stat.isSymbolicLink() ||
-    stat.uid !== 0 ||
-    (stat.mode & 0o777) !== 0o755
-  ) {
-    throw new Error("the Mantis lifecycle runtime must be a root-owned 0755 directory.");
+  if (!isRootOwnedMantisLifecycleRuntime(stat)) {
+    throw new Error("the Mantis lifecycle runtime must be a root-owned 1770 directory.");
   }
   return resolved;
 }

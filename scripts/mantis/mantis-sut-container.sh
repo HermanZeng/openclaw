@@ -750,7 +750,7 @@ locked_runtime_root() {
   [[ "$resolved" == "$expected" ]] || die "locked runtime target mismatch"
   [[ -d "$resolved" && ! -L "$resolved" ]] || die "locked runtime is not a directory"
   [[ "$(stat -c %u "$resolved")" == "0" ]] || die "locked runtime owner mismatch"
-  [[ "$(stat -c %a "$resolved")" == "755" ]] || die "locked runtime mode mismatch"
+  [[ "$(stat -c %a "$resolved")" == "1770" ]] || die "locked runtime mode mismatch"
   printf '%s\n' "$resolved"
 }
 

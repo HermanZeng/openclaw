@@ -1,6 +1,8 @@
+import fs from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   createMantisLifecycleState,
+  isRootOwnedMantisLifecycleRuntime,
   transitionMantisLifecycle,
   type MantisLifecycleState,
   validateMantisLifecycleJournal,
@@ -13,6 +15,22 @@ const MOCK_CONTAINER = "c".repeat(64);
 const PROXY_CONTAINER = "d".repeat(64);
 const REQUEST_A = "11111111-1111-4111-8111-111111111111";
 const REQUEST_B = "22222222-2222-4222-8222-222222222222";
+
+function runtimeStat(
+  params: {
+    directory?: boolean;
+    mode?: number;
+    symlink?: boolean;
+    uid?: number;
+  } = {},
+) {
+  return {
+    isDirectory: () => params.directory ?? true,
+    isSymbolicLink: () => params.symlink ?? false,
+    mode: params.mode ?? 0o41_770,
+    uid: params.uid ?? 0,
+  };
+}
 
 function readyInitialState(): MantisLifecycleState {
   let state = createMantisLifecycleState(AT).state;
@@ -56,6 +74,27 @@ function requestRestart(
 }
 
 describe("Mantis lifecycle generation state", () => {
+  it("matches the wrapper's exact locked-runtime permission contract", () => {
+    const wrapper = fs.readFileSync("scripts/mantis/mantis-sut-container.sh", "utf8");
+    const producer = wrapper.slice(
+      wrapper.indexOf("lock_runtime_root()"),
+      wrapper.indexOf("locked_runtime_root()"),
+    );
+    const consumer = wrapper.slice(
+      wrapper.indexOf("locked_runtime_root()"),
+      wrapper.indexOf("create_lifecycle_lock()"),
+    );
+
+    expect(producer).toContain('chmod 1770 "$safe_runtime"');
+    expect(consumer).toContain('== "1770"');
+    expect(isRootOwnedMantisLifecycleRuntime(runtimeStat())).toBe(true);
+    expect(isRootOwnedMantisLifecycleRuntime(runtimeStat({ mode: 0o40_770 }))).toBe(false);
+    expect(isRootOwnedMantisLifecycleRuntime(runtimeStat({ mode: 0o41_755 }))).toBe(false);
+    expect(isRootOwnedMantisLifecycleRuntime(runtimeStat({ uid: 1 }))).toBe(false);
+    expect(isRootOwnedMantisLifecycleRuntime(runtimeStat({ directory: false }))).toBe(false);
+    expect(isRootOwnedMantisLifecycleRuntime(runtimeStat({ symlink: true }))).toBe(false);
+  });
+
   it("binds a requested restart to a distinct ready successor", () => {
     let state = requestRestart(readyInitialState(), "graceful");
     const exited = transitionMantisLifecycle(

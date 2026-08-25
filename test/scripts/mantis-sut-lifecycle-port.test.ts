@@ -53,7 +53,7 @@ describe.skipIf(process.platform !== "linux")("Mantis lifecycle gateway port con
     const result = runHarness(portCase);
 
     expect(result.status, result.stderr).toBe(0);
-    expect(result.runtimeMetadata).toEqual(["0 755"]);
+    expect(result.runtimeMetadata).toEqual(["0 1770"]);
     expect(result.portMetadata).toEqual([`0 400 1 ${String(port).length + 1}`]);
     expect(result.tempResidue).toEqual([]);
     expect(result.dockerCalls).toEqual([
