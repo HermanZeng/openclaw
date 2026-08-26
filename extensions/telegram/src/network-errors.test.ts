@@ -378,6 +378,14 @@ describe("rethrowTelegramSendError", () => {
     ["server failure", errorWithTelegramCode("Bad Gateway", 502)],
     ["unrelated client rejection", errorWithTelegramCode("Bad Request: message is empty", 400)],
     ["ambiguous network failure", errorWithCode("read ECONNRESET", "ECONNRESET")],
+    ...(["status", "statusCode"] as const).map((statusField) => [
+      `non-Telegram ${statusField} lookalike`,
+      Object.assign(new Error("migration-shaped HTTP error"), {
+        [statusField]: 400,
+        description: "Bad Request: group chat was upgraded to a supergroup chat",
+        parameters: { migrate_to_chat_id: migratedChatId },
+      }),
+    ]),
     [
       "migration parameter without matching description",
       Object.assign(new Error("different bad request"), {

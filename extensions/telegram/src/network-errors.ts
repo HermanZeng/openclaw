@@ -155,7 +155,7 @@ function getNumericHttpStatus(err: unknown): number | undefined {
 // significant bits, so a non-safe integer is not the documented id and stays unreported.
 function describeTelegramSupergroupMigration(err: unknown): string | undefined {
   for (const candidate of collectTelegramErrorCandidates(err)) {
-    if (!isRecord(candidate) || getNumericHttpStatus(candidate) !== 400) {
+    if (!isRecord(candidate) || candidate.error_code !== 400) {
       continue;
     }
     if (candidate.description !== TELEGRAM_SUPERGROUP_MIGRATION_DESCRIPTION) {
