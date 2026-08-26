@@ -378,7 +378,7 @@ describe("rethrowTelegramSendError", () => {
     ["server failure", errorWithTelegramCode("Bad Gateway", 502)],
     ["unrelated client rejection", errorWithTelegramCode("Bad Request: message is empty", 400)],
     ["ambiguous network failure", errorWithCode("read ECONNRESET", "ECONNRESET")],
-    ...(["status", "statusCode"] as const).map((statusField) => [
+    ...(["status", "statusCode"] as const).map((statusField): [string, Error] => [
       `non-Telegram ${statusField} lookalike`,
       Object.assign(new Error("migration-shaped HTTP error"), {
         [statusField]: 400,
