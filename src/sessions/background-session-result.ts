@@ -118,7 +118,7 @@ export async function commitBackgroundResultToSession(params: {
         agentId: params.agentId,
         sessionKey,
         expectedSessionId,
-        ...(expectedLifecycleRevision ? { expectedLifecycleRevision } : {}),
+        expectedLifecycleRevision: expectedLifecycleRevision ?? null,
         idempotencyKey,
         message,
         storePath,

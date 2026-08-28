@@ -1,6 +1,6 @@
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTempDirTracker } from "../../test/helpers/temp-dir.js";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { loadTranscriptEvents, replaceSessionEntry } from "../config/sessions/session-accessor.js";
 import { closeOpenClawAgentDatabasesForTest } from "../state/openclaw-agent-db.js";
 import { commitBackgroundResultToSession } from "./background-session-result.js";
@@ -11,12 +11,12 @@ import {
 import { onSessionTranscriptUpdate } from "./transcript-events.js";
 
 describe("commitBackgroundResultToSession", () => {
-  const tempDirs = createTempDirTracker();
-
-  afterEach(() => {
-    closeOpenClawAgentDatabasesForTest();
-    tempDirs.cleanup();
-  });
+  const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
+    afterEach(() => {
+      closeOpenClawAgentDatabasesForTest();
+      cleanup();
+    }),
+  );
 
   async function createTarget() {
     const dir = tempDirs.make("openclaw-background-result-");
