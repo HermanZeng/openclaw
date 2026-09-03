@@ -140,34 +140,9 @@ function toWorkerDatabaseOptions(
 }
 
 function toWorkerDeleteParams(params: DeleteSessionEntryLifecycleParams): WorkerDeleteParams {
-  return {
-    ...(params.agentId !== undefined ? { agentId: params.agentId } : {}),
-    archiveTranscript: params.archiveTranscript,
-    ...(params.deleteTranscriptWithoutArchive !== undefined
-      ? { deleteTranscriptWithoutArchive: params.deleteTranscriptWithoutArchive }
-      : {}),
-    ...(params.deleteDeliveryArtifacts !== undefined
-      ? { deleteDeliveryArtifacts: params.deleteDeliveryArtifacts }
-      : {}),
-    ...(params.expectedEntry !== undefined ? { expectedEntry: params.expectedEntry } : {}),
-    ...(params.expectedTranscript !== undefined
-      ? { expectedTranscript: params.expectedTranscript }
-      : {}),
-    ...(params.expectedSessionId !== undefined
-      ? { expectedSessionId: params.expectedSessionId }
-      : {}),
-    ...(params.expectedLifecycleRevision !== undefined
-      ? { expectedLifecycleRevision: params.expectedLifecycleRevision }
-      : {}),
-    ...(params.expectedUpdatedAt !== undefined
-      ? { expectedUpdatedAt: params.expectedUpdatedAt }
-      : {}),
-    ...(params.requireWriteSuccess !== undefined
-      ? { requireWriteSuccess: params.requireWriteSuccess }
-      : {}),
-    storePath: params.storePath,
-    target: params.target,
-  };
+  const deleteParams = { ...params };
+  delete deleteParams.commitGuard;
+  return deleteParams;
 }
 
 function deleteSessionBoardRows(
