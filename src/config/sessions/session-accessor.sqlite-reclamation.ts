@@ -355,10 +355,9 @@ function reclaimSqliteFreePagesBestEffort(databaseOptions: ReclamationDatabaseOp
   try {
     const database = openOpenClawAgentDatabase(databaseOptions);
     database.walMaintenance.checkpoint();
-    // SAFETY: SQLite returns this fixed numeric column for PRAGMA freelist_count.
     const row = database.db /* sqlite-allow-raw: page accounting is exposed only via PRAGMA */
       .prepare("PRAGMA freelist_count")
-      .get() as { freelist_count: number | bigint };
+      .get() as { freelist_count: number | bigint }; // SAFETY: fixed numeric PRAGMA column.
     const freePages = Number(row.freelist_count);
     if (Number.isSafeInteger(freePages) && freePages > 0) {
       // sqlite-allow-raw -- incremental vacuum is a maintenance PRAGMA, not a data query.
