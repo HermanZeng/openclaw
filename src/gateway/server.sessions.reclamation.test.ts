@@ -83,9 +83,9 @@ function seedTranscriptState(storePath: string): void {
       )
       .run(HISTORICAL_SESSION_ID, SESSION_ID);
     for (let index = 0; index < ROWS; index += 1) {
-      insertEvent.run(HISTORICAL_SESSION_ID, index, eventJson, now + index);
-      insertActive.run(HISTORICAL_SESSION_ID, index, index, index);
-      insertFts.run(HISTORICAL_SESSION_ID, `${HISTORICAL_SESSION_ID}-message-${index}`, now);
+      insertEvent.run(SESSION_ID, index, eventJson, now + index);
+      insertActive.run(SESSION_ID, index, index, index);
+      insertFts.run(SESSION_ID, `${SESSION_ID}-message-${index}`, now);
     }
     database.db
       .prepare(
@@ -94,16 +94,16 @@ function seedTranscriptState(storePath: string): void {
            active_message_count, updated_at
          ) VALUES (?, ?, 0, ?, ?, ?)`,
       )
-      .run(HISTORICAL_SESSION_ID, ROWS - 1, ROWS, ROWS, now);
+      .run(SESSION_ID, ROWS - 1, ROWS, ROWS, now);
     database.db
       .prepare(
         `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at)
          VALUES (?, 'phase3-e2e-generation', ?)`,
       )
-      .run(HISTORICAL_SESSION_ID, now);
-    insertEvent.run(SESSION_ID, 0, eventJson, now);
-    insertActive.run(SESSION_ID, 0, 0, 0);
-    insertFts.run(SESSION_ID, `${SESSION_ID}-message-0`, now);
+      .run(SESSION_ID, now);
+    insertEvent.run(HISTORICAL_SESSION_ID, 0, eventJson, now);
+    insertActive.run(HISTORICAL_SESSION_ID, 0, 0, 0);
+    insertFts.run(HISTORICAL_SESSION_ID, `${HISTORICAL_SESSION_ID}-message-0`, now);
     database.db
       .prepare(
         `INSERT INTO session_transcript_index_state (
@@ -111,13 +111,13 @@ function seedTranscriptState(storePath: string): void {
            active_message_count, updated_at
          ) VALUES (?, 0, 0, 1, 1, ?)`,
       )
-      .run(SESSION_ID, now);
+      .run(HISTORICAL_SESSION_ID, now);
     database.db
       .prepare(
         `INSERT INTO transcript_rewrite_watermarks (session_id, generation, updated_at)
          VALUES (?, 'phase3-e2e-current-generation', ?)`,
       )
-      .run(SESSION_ID, now);
+      .run(HISTORICAL_SESSION_ID, now);
     insertEvent.run(
       UNRELATED_SESSION_ID,
       0,
@@ -152,7 +152,7 @@ function seedTranscriptState(storePath: string): void {
   }
 }
 
-test("sessions.delete keeps the Gateway responsive while reclaiming historical generations", async () => {
+test("sessions.delete keeps the Gateway responsive while reclaiming a large session", async () => {
   const { storePath } = await createSessionStoreDir();
   await writeSessionStore({
     entries: {
@@ -317,5 +317,6 @@ test("sessions.delete keeps the Gateway responsive while reclaiming historical g
     },
   ]);
   expect(archives.every((archive) => Number(archive.archive_bytes) > 0)).toBe(true);
+  expect(samples.length).toBeGreaterThan(0);
   expect(maxGatewayGapMs).toBeLessThan(500);
 }, 120_000);

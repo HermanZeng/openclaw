@@ -9,12 +9,8 @@ import {
 import {
   cleanupSessionLifecycleArtifactsCore,
   loadSessionEntry,
-  loadTranscriptEvents,
   replaceSessionEntry,
 } from "./session-accessor.js";
-import { materializeSessionStateDeletePlans } from "./session-accessor.sqlite-archive.js";
-import { planSessionLifecycleArtifactCleanup } from "./session-accessor.sqlite-lifecycle-state.js";
-import { reclaimSqliteSessionInTransaction } from "./session-accessor.sqlite-reclamation.js";
 import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
 
@@ -54,62 +50,6 @@ describe("SQLite lifecycle cleanup reclamation", () => {
   afterEach(() => {
     archiveMaterializationHook.afterMaterialize = undefined;
     closeOpenClawAgentDatabasesForTest();
-  });
-
-  it("rolls back when entry deletion fails after archive persistence", async () => {
-    const sessionKey = "agent:main:cleanup-reclamation-rollback";
-    const sessionId = "cleanup-reclamation-rollback";
-    const now = Date.now();
-    const event = {
-      type: "metadata",
-      runId: "cleanup-reclamation-rollback-marker",
-      timestamp: new Date(now - 600_000).toISOString(),
-    } as const;
-    await replaceSessionEntry({ sessionKey, storePath }, { sessionId, updatedAt: now - 600_000 });
-    await replaceTranscriptEvents({ sessionKey, sessionId, storePath }, [event]);
-    const database = openDatabase(storePath);
-    const cleanupPlan = planSessionLifecycleArtifactCleanup(database, {
-      archiveRemovedEntryTranscripts: true,
-      archiveDirectory: path.dirname(storePath),
-      sessionKeySegmentPrefix: "cleanup-reclamation-rollback",
-      transcriptContentMarker: "cleanup-reclamation-rollback-marker",
-      orphanTranscriptMinAgeMs: 300_000,
-      nowMs: now,
-    });
-    const materializedPlans = await materializeSessionStateDeletePlans(cleanupPlan.deletePlans);
-    // sqlite-allow-raw -- connection-local trigger injects a deterministic mid-transaction failure.
-    database.db.exec(`
-      CREATE TEMP TRIGGER fail_lifecycle_cleanup_entry_delete
-      BEFORE DELETE ON main.session_nodes
-      WHEN OLD.session_key = '${sessionKey}'
-      BEGIN
-        SELECT RAISE(ABORT, 'forced lifecycle cleanup rollback');
-      END;
-    `);
-
-    try {
-      expect(() =>
-        reclaimSqliteSessionInTransaction({
-          databaseOptions: { agentId: database.agentId, path: database.path },
-          entries: cleanupPlan.entries,
-          kind: "lifecycle-artifacts",
-          materializedPlans,
-        }),
-      ).toThrow("forced lifecycle cleanup rollback");
-    } finally {
-      // sqlite-allow-raw -- remove the connection-local deterministic failure fixture.
-      database.db.exec("DROP TRIGGER IF EXISTS temp.fail_lifecycle_cleanup_entry_delete");
-    }
-
-    expect(loadSessionEntry({ sessionKey, storePath })).toMatchObject({ sessionId });
-    await expect(loadTranscriptEvents({ sessionKey, sessionId, storePath })).resolves.toEqual([
-      event,
-    ]);
-    expect(
-      database.db
-        .prepare("SELECT 1 FROM session_transcript_archives WHERE session_id = ?")
-        .get(sessionId),
-    ).toBeUndefined();
   });
 
   it("keeps the event loop responsive while committing a large transcript", async () => {

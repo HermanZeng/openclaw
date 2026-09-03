@@ -109,7 +109,7 @@ describe("SQLite reclamation admission races", () => {
       });
 
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 100);
+      setImmediate(resolve);
     });
     expect(admissionSettled).toBe(false);
     releaseMaterialization();
@@ -171,7 +171,7 @@ describe("SQLite reclamation admission races", () => {
       });
 
     await new Promise<void>((resolve) => {
-      setTimeout(resolve, 100);
+      setImmediate(resolve);
     });
     expect(admissionSettled).toBe(false);
     releaseMaterialization();

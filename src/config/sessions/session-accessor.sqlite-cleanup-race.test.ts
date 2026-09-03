@@ -1,7 +1,6 @@
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../../test/helpers/temp-dir.js";
-import { onSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
 import {
   closeOpenClawAgentDatabasesForTest,
   openOpenClawAgentDatabase,
@@ -19,17 +18,16 @@ import {
 import { planSessionLifecycleArtifactCleanup } from "./session-accessor.sqlite-lifecycle-state.js";
 import { replaceTranscriptEvents } from "./session-accessor.sqlite-transcript-write.js";
 import { resolveSqliteTargetFromSessionStorePath } from "./session-sqlite-target.js";
+import { runByteLimitedArchiveCleanupFixture } from "./test-helpers.js";
 import type { SessionEntry } from "./types.js";
 
 const archiveMaterializationHook = vi.hoisted(() => ({
   beforeMaterialize: undefined as (() => Promise<void>) | undefined,
   afterMaterialize: undefined as (() => void) | undefined,
+  onMaterialize: undefined as ((sessionIds: string[]) => void) | undefined,
 }));
 const archivePublicationHook = vi.hoisted(() => ({
   failNext: undefined as Error | undefined,
-}));
-const reclamationHook = vi.hoisted(() => ({
-  afterLifecycleArtifactReclamation: undefined as (() => Promise<void>) | undefined,
 }));
 
 // Place test mutations after the real Worker finishes but before cleanup opens
@@ -42,6 +40,7 @@ vi.mock("./session-accessor.sqlite-archive.js", async (importOriginal) => {
       ...args: Parameters<typeof actual.materializeSessionStateDeletePlans>
     ) => {
       await archiveMaterializationHook.beforeMaterialize?.();
+      archiveMaterializationHook.onMaterialize?.(args[0].map((plan) => plan.sessionId));
       const result = await actual.materializeSessionStateDeletePlans(...args);
       archiveMaterializationHook.afterMaterialize?.();
       return result;
@@ -67,20 +66,6 @@ vi.mock("./session-accessor.sqlite-archive-store.js", async (importOriginal) => 
   };
 });
 
-vi.mock("./session-accessor.sqlite-reclamation.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./session-accessor.sqlite-reclamation.js")>();
-  return {
-    ...actual,
-    runSqliteLifecycleArtifactReclamation: async (
-      ...args: Parameters<typeof actual.runSqliteLifecycleArtifactReclamation>
-    ) => {
-      const result = await actual.runSqliteLifecycleArtifactReclamation(...args);
-      await reclamationHook.afterLifecycleArtifactReclamation?.();
-      return result;
-    },
-  };
-});
-
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
 describe("SQLite lifecycle cleanup races", () => {
@@ -95,8 +80,8 @@ describe("SQLite lifecycle cleanup races", () => {
   afterEach(() => {
     archiveMaterializationHook.beforeMaterialize = undefined;
     archiveMaterializationHook.afterMaterialize = undefined;
+    archiveMaterializationHook.onMaterialize = undefined;
     archivePublicationHook.failNext = undefined;
-    reclamationHook.afterLifecycleArtifactReclamation = undefined;
     closeOpenClawAgentDatabasesForTest();
   });
 
@@ -729,64 +714,6 @@ describe("SQLite lifecycle cleanup races", () => {
     expect(progressedDuringMaterialization).toBe(true);
   });
 
-  it("emits cleanup deletion before a queued replacement creates the same identity", async () => {
-    const now = Date.now();
-    const sessionKey = "agent:main:cleanup-event-order";
-    await replaceSessionEntry(
-      { sessionKey, storePath },
-      { sessionId: "cleanup-event-old", updatedAt: now - 600_000 },
-    );
-
-    let markReclamationCommitted: () => void = () => undefined;
-    const reclamationCommitted = new Promise<void>((resolve) => {
-      markReclamationCommitted = resolve;
-    });
-    let releaseReclamation: () => void = () => undefined;
-    const reclamationGate = new Promise<void>((resolve) => {
-      releaseReclamation = resolve;
-    });
-    reclamationHook.afterLifecycleArtifactReclamation = async () => {
-      markReclamationCommitted();
-      await reclamationGate;
-    };
-    const observedKinds: string[] = [];
-    const unsubscribe = onSessionIdentityMutation((mutation) => {
-      const keys =
-        mutation.kind === "delete"
-          ? mutation.previous.sessionKeys
-          : [...mutation.previous.sessionKeys, ...mutation.current.sessionKeys];
-      if (keys.includes(sessionKey)) {
-        observedKinds.push(mutation.kind);
-      }
-    });
-
-    try {
-      const cleanup = cleanupSessionLifecycleArtifactsCore({
-        storePath,
-        sessionKeySegmentPrefix: "cleanup-event-",
-        transcriptContentMarker: "unused-cleanup-event-marker",
-        orphanTranscriptMinAgeMs: 300_000,
-        nowMs: now,
-      });
-      await reclamationCommitted;
-      const replacement = replaceSessionEntry(
-        { sessionKey, storePath },
-        { sessionId: "cleanup-event-new", updatedAt: now + 1 },
-      );
-      releaseReclamation();
-
-      await expect(cleanup).resolves.toEqual({
-        removedEntries: 1,
-        archivedTranscriptArtifacts: 0,
-      });
-      await expect(replacement).resolves.toMatchObject({ sessionId: "cleanup-event-new" });
-      expect(observedKinds).toEqual(["delete", "create"]);
-    } finally {
-      unsubscribe();
-      releaseReclamation();
-    }
-  });
-
   it("releases the store writer while a lifecycle mutation archives a transcript", async () => {
     const removedKey = "agent:main:lifecycle-race-archived";
     const removedEntry: SessionEntry = {
@@ -925,6 +852,108 @@ describe("SQLite lifecycle cleanup races", () => {
       capped: 0,
     });
     expect(loadSessionEntry({ sessionKey, storePath })).toBeUndefined();
+  });
+
+  it("splits byte-limited cleanup into real worker batches", async () => {
+    const batches: string[][] = [];
+    archiveMaterializationHook.onMaterialize = (ids) => void batches.push(ids);
+    const ids = await runByteLimitedArchiveCleanupFixture(storePath);
+    expect(batches.toSorted((left, right) => left[0]!.localeCompare(right[0]!))).toEqual(
+      ids.toSorted((left, right) => left.localeCompare(right)).map((id) => [id]),
+    );
+  });
+  it("continues a maintenance batch after one entry changes", async () => {
+    const entryCount = 66;
+    const historicalSessionId = "maintenance-batch-historical-session";
+    const sessionKeyById = new Map<string, string>();
+    const sessionKeys = Array.from(
+      { length: entryCount },
+      (_, index) => `agent:main:subagent:maintenance-batch-${String(index).padStart(2, "0")}`,
+    );
+    for (const [index, sessionKey] of sessionKeys.entries()) {
+      const sessionId = `maintenance-batch-session-${String(index).padStart(2, "0")}`;
+      sessionKeyById.set(sessionId, sessionKey);
+      await replaceSessionEntry(
+        { sessionKey, storePath },
+        { sessionId, updatedAt: index === entryCount - 1 ? Date.now() : index + 1 },
+      );
+      await replaceTranscriptEvents({ sessionKey, sessionId, storePath }, [
+        { type: "session", id: sessionId, content: `batch transcript ${index}` },
+      ]);
+    }
+    const historicalOwnerKey = sessionKeys[entryCount - 2] ?? "";
+    await replaceTranscriptEvents(
+      { sessionKey: historicalOwnerKey, sessionId: historicalSessionId, storePath },
+      [{ type: "session", id: historicalSessionId, content: "historical batch transcript" }],
+    );
+
+    const batchSizes: number[] = [];
+    let currentBatchSessionIds: string[] = [];
+    let materializations = 0;
+    archiveMaterializationHook.onMaterialize = (sessionIds) => {
+      currentBatchSessionIds = sessionIds;
+      batchSizes.push(sessionIds.length);
+    };
+    let racedKey: string | undefined;
+    archiveMaterializationHook.afterMaterialize = () => {
+      materializations += 1;
+      if (materializations !== 2) {
+        return;
+      }
+      racedKey = sessionKeyById.get(currentBatchSessionIds[0] ?? "");
+      if (!racedKey) {
+        throw new Error("expected a maintenance entry in the second batch");
+      }
+      const current = loadSessionEntry({ sessionKey: racedKey, storePath });
+      if (!current) {
+        throw new Error("expected the raced maintenance entry to remain");
+      }
+      replaceSessionEntrySync(
+        { sessionKey: racedKey, storePath },
+        { ...current, label: "changed during batch materialization" },
+      );
+    };
+
+    const result = await applySessionEntryLifecycleMutation({
+      storePath,
+      maintenanceOverride: {
+        mode: "enforce",
+        maxEntries: entryCount,
+        pruneAfterMs: 60_000,
+      },
+    });
+
+    expect(batchSizes).toEqual([64, 2]);
+    expect(result).toMatchObject({
+      beforeCount: entryCount,
+      afterCount: 2,
+      modelRunPruned: 0,
+      pruned: 64,
+      capped: 0,
+    });
+    expect(loadSessionEntry({ sessionKey: racedKey ?? "", storePath })).toMatchObject({
+      label: "changed during batch materialization",
+    });
+    expect(loadSessionEntry({ sessionKey: sessionKeys.at(-1) ?? "", storePath })).toBeDefined();
+    await expect(
+      loadTranscriptEvents({
+        sessionKey: historicalOwnerKey,
+        sessionId: historicalSessionId,
+        storePath,
+      }),
+    ).resolves.toHaveLength(0);
+    const databasePath = resolveSqliteTargetFromSessionStorePath(storePath, {
+      agentId: "main",
+    }).path;
+    if (!databasePath) {
+      throw new Error("expected maintenance batch database path");
+    }
+    const database = openOpenClawAgentDatabase({ agentId: "main", path: databasePath });
+    expect(
+      database.db
+        .prepare("SELECT 1 AS present FROM session_nodes WHERE session_key = ?")
+        .get(historicalOwnerKey),
+    ).toBeDefined();
   });
 
   it("retains unplanned historical windows behind a placeholder node", async () => {

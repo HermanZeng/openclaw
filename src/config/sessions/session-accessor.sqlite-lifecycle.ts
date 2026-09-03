@@ -6,12 +6,13 @@ import {
   MODEL_SELECTION_LOCK_REMOVAL_MESSAGE,
   resolveAgentHarnessSessionStoreEntryError,
 } from "../../sessions/agent-harness-session-key.js";
-import { runExclusiveSessionLifecycleMutation } from "../../sessions/session-lifecycle-admission.js";
 import { emitSessionIdentityMutation } from "../../sessions/session-lifecycle-events.js";
+import { deletePersonalGitHubSessionReceipts } from "../../state/github-personal-publication-lifecycle.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../../state/openclaw-agent-db-readonly.js";
 import {
+  deferOpenClawAgentPostCommitPublication,
   openOpenClawAgentDatabase,
-  runOpenClawAgentWriteTransaction,
+  type OpenClawAgentDatabase,
 } from "../../state/openclaw-agent-db.js";
 import type { ResetSessionEntryLifecycleMutation } from "./session-accessor.lifecycle-types.js";
 import { publishSessionStateArchives } from "./session-accessor.sqlite-archive-store.js";
@@ -26,14 +27,17 @@ import type {
   SessionLifecycleArtifactCleanupResult,
 } from "./session-accessor.sqlite-contract.js";
 import {
+  hasPreparedNativeSessionDeletion,
+  runSqliteSessionDeletionTransaction as runOpenClawAgentWriteTransaction,
+  withSqliteSessionDeletions,
+} from "./session-accessor.sqlite-deletion.js";
+import {
   sqliteLifecycleTargetSnapshotsEqual,
   sqliteSessionEntriesEqual,
 } from "./session-accessor.sqlite-entry-equality.js";
 import {
   assertLifecycleTargetUnchanged,
-  deleteLegacySessionEntryRows,
   readLifecycleTargetSnapshot,
-  rehomeSessionWindows,
   writeSessionEntry,
 } from "./session-accessor.sqlite-entry-store.js";
 import { emitArchivedTranscriptUpdates } from "./session-accessor.sqlite-events.js";
@@ -45,12 +49,14 @@ import {
   planSessionStateAfterEntryRemoval,
   readReferencedSessionIdsAfterTargetMutation,
 } from "./session-accessor.sqlite-lifecycle-state.js";
+import { refreshSqliteSessionPlannerStatisticsBestEffort } from "./session-accessor.sqlite-maintenance.js";
 import { loadTranscriptEventsFromDatabase } from "./session-accessor.sqlite-read.js";
 import {
+  createHistoricalGenerationReclamationPlan,
+  createLifecycleArtifactReclamationPlan,
+  createSessionEntryReclamationPlan,
   runExclusiveSqliteSessionReclamation,
-  runSqliteHistoricalGenerationReclamation,
-  runSqliteLifecycleArtifactReclamation,
-  runSqliteSessionEntryReclamation,
+  runSqliteSessionReclamation,
   shouldDeleteSqliteSessionEntryLifecycle,
 } from "./session-accessor.sqlite-reclamation.js";
 import {
@@ -66,10 +72,39 @@ import {
   collectAdmissionProtectedSessionIds,
   kickSessionHistoryDiskBudgetMaintenance,
 } from "./session-history-eviction.js";
-import { buildSessionResetBoundaryPlan } from "./session-reset-boundary-event.js";
+import { buildSessionResetBoundaryEvent } from "./session-reset-boundary-event.js";
 import type { InternalSessionEntry as SessionEntry } from "./types.js";
 
 // Single-target lifecycle owner: cleanup, reset, guarded delete, and trusted rollback.
+
+async function withCommittedHistoryMaintenance<T>(
+  { agentId, storePath }: { agentId?: string; storePath: string },
+  run: (
+    recordCommit: (database: OpenClawAgentDatabase) => void,
+    markCommitted: () => void,
+  ) => Promise<T>,
+  options: { scheduleNext?: boolean } = {},
+): Promise<T> {
+  let committed = false;
+  try {
+    return await run(
+      (database) => {
+        deferOpenClawAgentPostCommitPublication(database, () => {
+          committed = true;
+        });
+      },
+      () => {
+        committed = true;
+      },
+    );
+  } finally {
+    // A partial commit still needs maintenance, but only after archive publication and
+    // lifecycle-owner cleanup finish. Rejected preparation or rollback creates no pressure.
+    if (committed && options.scheduleNext !== false) {
+      kickSessionHistoryDiskBudgetMaintenance({ agentId, storePath, force: true });
+    }
+  }
+}
 
 export async function cleanupSessionLifecycleArtifactsCore(
   params: SessionLifecycleArtifactCleanupParams,
@@ -103,19 +138,44 @@ export async function cleanupSessionLifecycleArtifactsCore(
       nowMs: params.nowMs ?? Date.now(),
     });
   });
-  const committed = await runExclusiveSqliteSessionReclamation(async () => {
-    const materializedPlans = await materializeSessionStateDeletePlans(cleanupPlan.deletePlans);
-    return await runExclusiveSqliteSessionWrite(resolved, async () => {
-      const result = await runSqliteLifecycleArtifactReclamation({
-        databaseOptions,
-        entries: cleanupPlan.entries,
-        materializedPlans,
-      });
-      // Keep identity observers in the same order as commits queued on this writer lane.
-      emitCommittedSessionEntryRemovals(cleanupPlan.entries);
-      return result;
-    });
-  });
+  const committed = await withSqliteSessionDeletions(
+    resolved,
+    cleanupPlan.entries.flatMap(({ expectedEntry: entry, sessionKey }) =>
+      entry ? [{ entry, sessionKey }] : [],
+    ),
+    async (assertCurrent) =>
+      await runExclusiveSqliteSessionReclamation(async () => {
+        const materializedPlans = await materializeSessionStateDeletePlans(cleanupPlan.deletePlans);
+        return await runExclusiveSqliteSessionWrite(resolved, async () => {
+          assertCurrent();
+          const plan = createLifecycleArtifactReclamationPlan({
+            databaseOptions,
+            entries: cleanupPlan.entries,
+            materializedPlans,
+          });
+          const reclaimed = await runSqliteSessionReclamation({
+            beforeInProcessMutation: assertCurrent,
+            forceInProcess: hasPreparedNativeSessionDeletion(),
+            plan,
+          });
+          if (reclaimed.kind !== plan.kind) {
+            throw new Error(
+              `SQLite session reclamation returned ${reclaimed.kind} for ${plan.kind}`,
+            );
+          }
+          emitCommittedSessionEntryRemovals(cleanupPlan.entries);
+          return reclaimed.value;
+        });
+      }),
+    { additionalIdentities: cleanupPlan.deletePlans.map((plan) => plan.sessionId) },
+  );
+  // The SQL commit survives a later archive-publication failure, so refresh
+  // planner statistics before crossing that separate artifact boundary.
+  const deletedEntries = Math.max(
+    committed.removedEntries,
+    new Set(cleanupPlan.deletePlans.map((plan) => plan.sessionId)).size,
+  );
+  await refreshSqliteSessionPlannerStatisticsBestEffort(resolved, deletedEntries);
   const archivedTranscripts = await publishSessionStateArchives(
     resolved,
     committed.archivedTranscripts,
@@ -132,99 +192,86 @@ export async function resetSessionEntryLifecycle(
 ): Promise<ResetSessionEntryLifecycleResult> {
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
   const resolved = resolveSqliteStoreScope(params.storePath, { agentId });
-  // Retained reset history is the store's growth event; give the throttled
-  // budget pass a chance to extract-and-evict once we finish.
-  try {
-    return await runExclusiveSqliteSessionWrite(resolved, async () => {
-      const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
-      const targetSnapshot = readLifecycleTargetSnapshot(database, params.target);
-      const current = targetSnapshot.primary;
-      const nextEntry = await params.buildNextEntry({
-        currentEntry: current ? cloneSessionEntry(current.entry) : undefined,
-        primaryKey: params.target.canonicalKey,
-      });
-      const resetBoundaryPlan =
-        params.resetBoundaryReason &&
-        current?.entry.sessionId &&
-        !sqliteSessionEntriesEqual(current.entry, nextEntry)
-          ? await buildSessionResetBoundaryPlan({
-              events: loadTranscriptEventsFromDatabase(database, current.entry.sessionId),
-              reason: params.resetBoundaryReason,
-            })
-          : undefined;
-      const mutation: ResetSessionEntryLifecycleMutation = {
-        nextEntry: cloneSessionEntry(nextEntry),
-        ...(current ? { previousEntry: cloneSessionEntry(current.entry) } : {}),
-        ...(current?.entry.sessionId ? { previousSessionId: current.entry.sessionId } : {}),
-      };
-      runOpenClawAgentWriteTransaction((transactionDb) => {
-        assertLifecycleTargetUnchanged(transactionDb, params.target, current?.entry, "reset");
-        if (resetBoundaryPlan && current?.entry.sessionId) {
-          const events = [...resetBoundaryPlan.seedEvents, resetBoundaryPlan.event];
-          const appended = appendTranscriptEventsInTransaction(
-            transactionDb,
-            {
-              ...resolved,
-              sessionId: current.entry.sessionId,
-              sessionKey: current.key,
-            },
-            events,
-          );
-          if (appended !== events.length) {
-            throw new Error(`Failed to append reset boundary for ${current.key}`);
+  return await withCommittedHistoryMaintenance(
+    { agentId: resolved.agentId, storePath: params.storePath },
+    async (recordCommit) =>
+      runExclusiveSqliteSessionWrite(resolved, async () => {
+        params.commitGuard?.();
+        const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
+        const targetSnapshot = readLifecycleTargetSnapshot(database, params.target);
+        const current = targetSnapshot[0];
+        const nextEntry = await params.buildNextEntry({
+          currentEntry: current ? cloneSessionEntry(current.entry) : undefined,
+          primaryKey: params.target.canonicalKey,
+        });
+        const shouldAppendResetBoundary =
+          params.resetBoundary &&
+          current?.entry.sessionId &&
+          !sqliteSessionEntriesEqual(current.entry, nextEntry);
+        const mutation: ResetSessionEntryLifecycleMutation = {
+          nextEntry: cloneSessionEntry(nextEntry),
+          ...(current ? { previousEntry: cloneSessionEntry(current.entry) } : {}),
+          ...(current?.entry.sessionId ? { previousSessionId: current.entry.sessionId } : {}),
+        };
+        runOpenClawAgentWriteTransaction((transactionDb) => {
+          params.commitGuard?.();
+          assertLifecycleTargetUnchanged(transactionDb, params.target, current?.entry, "reset");
+          if (shouldAppendResetBoundary && current?.entry.sessionId && params.resetBoundary) {
+            const event = buildSessionResetBoundaryEvent({
+              events: loadTranscriptEventsFromDatabase(transactionDb, current.entry.sessionId, {
+                projection: "reset-boundary",
+              }),
+              ...params.resetBoundary,
+            });
+            const appended = appendTranscriptEventsInTransaction(
+              transactionDb,
+              {
+                ...resolved,
+                sessionId: current.entry.sessionId,
+                sessionKey: current.sessionKey,
+              },
+              [event],
+            );
+            if (appended !== 1) {
+              throw new Error(`Failed to append reset boundary for ${current.sessionKey}`);
+            }
           }
+          writeSessionEntry(transactionDb, params.target.canonicalKey, nextEntry, {
+            previousEntry: current?.entry ?? null,
+          });
+          recordCommit(transactionDb);
+          // Reset only advances the live entry and route. Historical rows stay searchable;
+          // disk-budget cleanup owns durable extraction before reclaiming them.
+        }, toDatabaseOptions(resolved));
+        if (current) {
+          emitSessionIdentityMutation({
+            kind: "reset",
+            previous: {
+              ...(current.entry.sessionId ? { sessionId: current.entry.sessionId } : {}),
+              sessionKeys: targetSnapshot.map((row) => row.sessionKey),
+            },
+            current: {
+              ...(nextEntry.sessionId ? { sessionId: nextEntry.sessionId } : {}),
+              sessionKeys: [params.target.canonicalKey],
+            },
+          });
+        } else {
+          emitSessionIdentityMutation({
+            kind: "create",
+            previous: { sessionKeys: [] },
+            current: {
+              ...(nextEntry.sessionId ? { sessionId: nextEntry.sessionId } : {}),
+              sessionKeys: [params.target.canonicalKey],
+            },
+          });
         }
-        writeSessionEntry(transactionDb, params.target.canonicalKey, nextEntry, {
-          previousEntry: current?.entry ?? null,
-        });
-        rehomeSessionWindows(transactionDb, params.target.canonicalKey, params.target.storeKeys);
-        deleteLegacySessionEntryRows(
-          transactionDb,
-          params.target.storeKeys,
-          params.target.canonicalKey,
-          { rehomeMembers: current?.entry.sessionId === nextEntry.sessionId },
-        );
-        // Reset only advances the live entry and route. Historical rows stay searchable;
-        // disk-budget cleanup owns durable extraction before reclaiming them.
-      }, toDatabaseOptions(resolved));
-      if (current) {
-        emitSessionIdentityMutation({
-          kind: "reset",
-          previous: {
-            ...(current.entry.sessionId ? { sessionId: current.entry.sessionId } : {}),
-            sessionKeys: targetSnapshot.rows.map((row) => row.sessionKey),
-          },
-          current: {
-            ...(nextEntry.sessionId ? { sessionId: nextEntry.sessionId } : {}),
-            sessionKeys: [params.target.canonicalKey],
-          },
-        });
-      } else {
-        emitSessionIdentityMutation({
-          kind: "create",
-          previous: { sessionKeys: [] },
-          current: {
-            ...(nextEntry.sessionId ? { sessionId: nextEntry.sessionId } : {}),
-            sessionKeys: [params.target.canonicalKey],
-          },
-        });
-      }
-      await params.afterEntryMutation?.(mutation);
-      return {
-        ...mutation,
-        archivedTranscripts: [],
-      };
-    });
-  } finally {
-    // Reset is what turns the old generation into an eviction candidate; a
-    // throttled kick could be suppressed by a recent pre-reset pass and never
-    // retried if the agent idles, leaving an over-budget store unreclaimed.
-    kickSessionHistoryDiskBudgetMaintenance({
-      ...(resolved.agentId ? { agentId: resolved.agentId } : {}),
-      storePath: params.storePath,
-      force: true,
-    });
-  }
+        await params.afterEntryMutation?.(mutation);
+        return {
+          ...mutation,
+          archivedTranscripts: [],
+        };
+      }),
+  );
 }
 
 async function deleteSqliteSessionEntryLifecycleInternal(
@@ -234,23 +281,16 @@ async function deleteSqliteSessionEntryLifecycleInternal(
 ): Promise<DeleteSessionEntryLifecycleResult> {
   const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
   const resolved = resolveSqliteStoreScope(params.storePath, { agentId });
-  try {
-    return await deleteSqliteSessionEntryLifecycleLocked(
+  return await withCommittedHistoryMaintenance(params, async (recordCommit, markCommitted) =>
+    deleteSqliteSessionEntryLifecycleLocked(
       resolved,
       params,
       allowLockedEntryRemoval,
       expectedPluginOwnerId,
-    );
-  } finally {
-    // Deletion writes an archive per retained generation before reclaiming
-    // rows, so usage can spike well past the budget; force a pass instead of
-    // waiting up to the throttle interval (or forever, if the agent idles).
-    kickSessionHistoryDiskBudgetMaintenance({
-      ...(params.agentId ? { agentId: params.agentId } : {}),
-      storePath: params.storePath,
-      force: true,
-    });
-  }
+      recordCommit,
+      markCommitted,
+    ),
+  );
 }
 
 const DELETE_EXPECTED_ENTRY_MISMATCH = Symbol("delete-expected-entry-mismatch");
@@ -259,12 +299,16 @@ async function deleteSqliteSessionEntryLifecycleLocked(
   resolved: ReturnType<typeof resolveSqliteStoreScope>,
   params: DeleteSessionEntryLifecycleParams,
   allowLockedEntryRemoval: boolean,
-  expectedPluginOwnerId?: string,
+  expectedPluginOwnerId: string | undefined,
+  recordCommit: (database: OpenClawAgentDatabase) => void,
+  markCommitted: () => void,
 ): Promise<DeleteSessionEntryLifecycleResult> {
   const prepared = await runExclusiveSqliteSessionWrite(resolved, async () => {
+    // Opening a store can register durable ownership, even before the deletion transaction.
+    params.commitGuard?.();
     const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
     const targetSnapshot = readLifecycleTargetSnapshot(database, params.target);
-    const current = targetSnapshot.primary;
+    const current = targetSnapshot[0];
     if (!current) {
       return null;
     }
@@ -276,7 +320,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
     }
     if (
       expectedPluginOwnerId &&
-      targetSnapshot.rows.some(
+      targetSnapshot.some(
         ({ entry, sessionKey }) =>
           isAgentHarnessSessionKey(sessionKey) ||
           entry.agentHarnessId !== undefined ||
@@ -296,7 +340,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
     // marker. Materialization dedupes aliases that share the same state owner.
     const archiveDirectory = resolveSqliteTranscriptArchiveDirectory(resolved);
     const entryPlans = deleteTranscriptState
-      ? targetSnapshot.rows.flatMap(({ entry }) =>
+      ? targetSnapshot.flatMap(({ entry }) =>
           planSessionStateAfterEntryRemoval({
             archiveDirectory,
             archiveTranscript: params.archiveTranscript,
@@ -314,7 +358,7 @@ async function deleteSqliteSessionEntryLifecycleLocked(
       ? readSessionGenerationIdsForKeys(database, [
           params.target.canonicalKey,
           ...params.target.storeKeys,
-          ...targetSnapshot.rows.map((row) => row.sessionKey),
+          ...targetSnapshot.map((row) => row.sessionKey),
         ]).filter((sessionId) => !entryPlanIds.has(sessionId))
       : [];
     // Historical generations are reclaimed BEFORE the entry-removing
@@ -347,27 +391,19 @@ async function deleteSqliteSessionEntryLifecycleLocked(
     return expectedEntryMismatchResult([]);
   }
 
-  const historicalArchivedTranscripts: SessionLifecycleArchivedTranscript[] = [];
-  for (const sessionId of prepared.historicalGenerationIds) {
-    const reclamation = await runExclusiveSessionLifecycleMutation({
-      scope: params.storePath,
-      identities: [
-        params.target.canonicalKey,
-        ...params.target.storeKeys,
-        ...prepared.targetSnapshot.rows.map((row) => row.sessionKey),
-        sessionId,
-      ],
-      run: async () => {
+  return await withSqliteSessionDeletions(
+    resolved,
+    prepared.targetSnapshot,
+    async (assertCurrent) => {
+      const historicalArchivedTranscripts: SessionLifecycleArchivedTranscript[] = [];
+      for (const sessionId of prepared.historicalGenerationIds) {
         const plan = await runExclusiveSqliteSessionWrite(resolved, async () => {
+          params.commitGuard?.();
           const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
           const targetSnapshot = readLifecycleTargetSnapshot(database, params.target);
           if (
             !sqliteLifecycleTargetSnapshotsEqual(prepared.targetSnapshot, targetSnapshot) ||
-            !shouldDeleteSqliteSessionEntryLifecycle(
-              database,
-              targetSnapshot.primary?.entry,
-              params,
-            )
+            !shouldDeleteSqliteSessionEntryLifecycle(database, targetSnapshot[0]?.entry, params)
           ) {
             return DELETE_EXPECTED_ENTRY_MISMATCH;
           }
@@ -378,6 +414,15 @@ async function deleteSqliteSessionEntryLifecycleLocked(
           if (referencedAfterDelete.has(sessionId)) {
             return null;
           }
+          const admissionProtected = collectAdmissionProtectedSessionIds({
+            database,
+            storePath: params.storePath,
+          });
+          if (admissionProtected.has(sessionId)) {
+            throw new Error(
+              `cannot delete session history while work is in flight for ${sessionId}; retry after the run completes`,
+            );
+          }
           return planSessionStateDeleteIfUnreferenced({
             archiveDirectory: prepared.archiveDirectory,
             archiveTranscript: params.archiveTranscript,
@@ -387,118 +432,145 @@ async function deleteSqliteSessionEntryLifecycleLocked(
             sessionId,
           });
         });
-        if (!plan || plan === DELETE_EXPECTED_ENTRY_MISMATCH) {
-          return plan;
+        if (plan === DELETE_EXPECTED_ENTRY_MISMATCH) {
+          return expectedEntryMismatchResult(historicalArchivedTranscripts);
         }
-        return await runExclusiveSqliteSessionReclamation(async () => {
+        if (!plan) {
+          continue;
+        }
+        const archivedGeneration = await runExclusiveSqliteSessionReclamation(async () => {
           const materializedGeneration = await materializeSessionStateDeletePlans([plan]);
-          const fenceAtDelete = await runExclusiveSqliteSessionWrite(resolved, async () => {
+          return await runExclusiveSqliteSessionWrite(resolved, async () => {
+            params.commitGuard?.();
+            assertCurrent();
             const database = openOpenClawAgentDatabase(toDatabaseOptions(resolved));
             const targetSnapshot = readLifecycleTargetSnapshot(database, params.target);
             if (
               !sqliteLifecycleTargetSnapshotsEqual(prepared.targetSnapshot, targetSnapshot) ||
-              !shouldDeleteSqliteSessionEntryLifecycle(
-                database,
-                targetSnapshot.primary?.entry,
-                params,
-              )
+              !shouldDeleteSqliteSessionEntryLifecycle(database, targetSnapshot[0]?.entry, params)
             ) {
               return DELETE_EXPECTED_ENTRY_MISMATCH;
             }
-            return collectAdmissionProtectedSessionIds({
+            const protectedSessionIds = collectAdmissionProtectedSessionIds({
               database,
               storePath: params.storePath,
             });
-          });
-          if (fenceAtDelete === DELETE_EXPECTED_ENTRY_MISMATCH) {
-            return fenceAtDelete;
-          }
-          if (fenceAtDelete.has(sessionId)) {
-            throw new Error(
-              `cannot delete session history while work is in flight for ${sessionId}; retry after the run completes`,
-            );
-          }
-          return await runExclusiveSqliteSessionWrite(resolved, async () =>
-            runSqliteHistoricalGenerationReclamation({
+            if (protectedSessionIds.has(sessionId)) {
+              throw new Error(
+                `cannot delete session history while work is in flight for ${sessionId}; retry after the run completes`,
+              );
+            }
+            const reclamationPlan = createHistoricalGenerationReclamationPlan({
               databaseOptions: toDatabaseOptions(resolved),
               deleteParams: params,
               materializedPlans: materializedGeneration,
               preparedTargetSnapshot: prepared.targetSnapshot,
-              protectedSessionIds: fenceAtDelete,
+              protectedSessionIds,
               sessionId,
-            }),
-          );
+            });
+            const reclaimed = await runSqliteSessionReclamation({
+              beforeInProcessMutation: () => {
+                params.commitGuard?.();
+                assertCurrent();
+              },
+              forceInProcess: hasPreparedNativeSessionDeletion(),
+              onInProcessCommit: recordCommit,
+              plan: reclamationPlan,
+            });
+            if (reclaimed.kind !== reclamationPlan.kind) {
+              throw new Error(
+                `SQLite session reclamation returned ${reclaimed.kind} for ${reclamationPlan.kind}`,
+              );
+            }
+            return reclaimed.value;
+          });
         });
-      },
-    });
-    if (reclamation === DELETE_EXPECTED_ENTRY_MISMATCH) {
-      return expectedEntryMismatchResult(historicalArchivedTranscripts);
-    }
-    if (!reclamation) {
-      continue;
-    }
-    if (reclamation.expectedEntryMismatch) {
-      return expectedEntryMismatchResult(historicalArchivedTranscripts);
-    }
-    if (!reclamation.deleted) {
-      continue;
-    }
-    // Publish each committed generation immediately: a later archive or
-    // transaction failure aborts the deletion, and observers must still see
-    // the removals that already happened (retry completes the remainder).
-    const publishedGeneration = await publishSessionStateArchives(
-      resolved,
-      reclamation.archivedTranscripts,
-    );
-    emitArchivedTranscriptUpdates(publishedGeneration);
-    historicalArchivedTranscripts.push(...publishedGeneration);
-  }
+        if (archivedGeneration === DELETE_EXPECTED_ENTRY_MISMATCH) {
+          return expectedEntryMismatchResult(historicalArchivedTranscripts);
+        }
+        if (archivedGeneration.expectedEntryMismatch) {
+          return expectedEntryMismatchResult(historicalArchivedTranscripts);
+        }
+        if (archivedGeneration.deleted) {
+          markCommitted();
+        }
+        // Publish each committed generation immediately: a later archive or
+        // transaction failure aborts the deletion, and observers must still see
+        // the removals that already happened (retry completes the remainder).
+        const publishedGeneration = await publishSessionStateArchives(
+          resolved,
+          archivedGeneration.archivedTranscripts,
+        );
+        emitArchivedTranscriptUpdates(publishedGeneration);
+        historicalArchivedTranscripts.push(...publishedGeneration);
+      }
 
-  // Archive materialization remains outside the store writer lane. The global
-  // reclamation lane bounds whole-buffer residency until the Worker exits.
-  const result = await runExclusiveSessionLifecycleMutation({
-    scope: params.storePath,
-    identities: [
-      params.target.canonicalKey,
-      ...params.target.storeKeys,
-      ...prepared.targetSnapshot.rows.flatMap((row) => [row.sessionKey, row.entry.sessionId]),
-      ...prepared.entryPlans.map((plan) => plan.sessionId),
-    ],
-    run: async () =>
-      await runExclusiveSqliteSessionReclamation(async () => {
+      // Archive materialization is the expensive phase. It must run between short
+      // writer-lane sections so unrelated writes to this store can keep progressing.
+      const result = await runExclusiveSqliteSessionReclamation(async () => {
         const materializedPlans = await materializeSessionStateDeletePlans(prepared.entryPlans);
         return await runExclusiveSqliteSessionWrite(resolved, async () => {
-          const reclaimed = await runSqliteSessionEntryReclamation({
+          params.commitGuard?.();
+          assertCurrent();
+          const reclamationPlan = createSessionEntryReclamationPlan({
             databaseOptions: toDatabaseOptions(resolved),
             deleteParams: params,
             materializedPlans,
             preparedTargetSnapshot: prepared.targetSnapshot,
           });
-          if (reclaimed.deleted) {
-            // Emit before this writer lane admits a replacement for the same identity.
-            emitSessionIdentityMutation({
-              kind: "delete",
-              previous: {
-                ...(prepared.current.entry.sessionId
-                  ? { sessionId: prepared.current.entry.sessionId }
-                  : {}),
-                sessionKeys: prepared.targetSnapshot.rows.map((row) => row.sessionKey),
-              },
-            });
+          const reclaimed = await runSqliteSessionReclamation({
+            beforeInProcessMutation: () => {
+              params.commitGuard?.();
+              assertCurrent();
+            },
+            forceInProcess: hasPreparedNativeSessionDeletion(),
+            onInProcessCommit: recordCommit,
+            plan: reclamationPlan,
+          });
+          if (reclaimed.kind !== reclamationPlan.kind) {
+            throw new Error(
+              `SQLite session reclamation returned ${reclaimed.kind} for ${reclamationPlan.kind}`,
+            );
           }
-          return reclaimed;
+          return reclaimed.value;
         });
-      }),
-  });
-  result.archivedTranscripts = await publishSessionStateArchives(
-    resolved,
-    result.archivedTranscripts,
+      });
+      if (result.deleted) {
+        markCommitted();
+      }
+      if (result.deleted) {
+        // The deletion is committed; observers must invalidate even if receipt cleanup fails.
+        emitSessionIdentityMutation({
+          kind: "delete",
+          previous: {
+            ...(prepared.current.entry.sessionId
+              ? { sessionId: prepared.current.entry.sessionId }
+              : {}),
+            sessionKeys: prepared.targetSnapshot.map((row) => row.sessionKey),
+          },
+        });
+        deletePersonalGitHubSessionReceipts({
+          agentId: resolved.agentId,
+          env: resolved.env,
+          sessionKeys: [
+            params.target.canonicalKey,
+            ...params.target.storeKeys,
+            ...prepared.targetSnapshot.map((row) => row.sessionKey),
+          ],
+        });
+      }
+      result.archivedTranscripts = await publishSessionStateArchives(
+        resolved,
+        result.archivedTranscripts,
+      );
+      emitArchivedTranscriptUpdates(result.archivedTranscripts);
+      // Historical generations were emitted per commit above; merge them into
+      // the result after the final emit so callers still see every archive.
+      result.archivedTranscripts.push(...historicalArchivedTranscripts);
+      return result;
+    },
+    { additionalIdentities: prepared.historicalGenerationIds },
   );
-  emitArchivedTranscriptUpdates(result.archivedTranscripts);
-  // Historical generations were emitted per commit above; merge them into
-  // the result after the final emit so callers still see every archive.
-  result.archivedTranscripts.push(...historicalArchivedTranscripts);
-  return result;
 }
 
 function expectedEntryMismatchResult(
@@ -512,6 +584,27 @@ export async function deleteSessionEntryLifecycle(
   params: DeleteSessionEntryLifecycleParams,
 ): Promise<DeleteSessionEntryLifecycleResult> {
   return await deleteSqliteSessionEntryLifecycleInternal(params, false);
+}
+
+/** Disk-budget owner: delete one exact archived row without recursively scheduling another pass. */
+export async function deleteDiskBudgetSessionEntryLifecycle(
+  params: DeleteSessionEntryLifecycleParams,
+): Promise<DeleteSessionEntryLifecycleResult> {
+  const agentId = params.agentId ?? parseAgentSessionKey(params.target.canonicalKey)?.agentId;
+  const resolved = resolveSqliteStoreScope(params.storePath, { agentId });
+  return await withCommittedHistoryMaintenance(
+    params,
+    async (recordCommit, markCommitted) =>
+      await deleteSqliteSessionEntryLifecycleLocked(
+        resolved,
+        params,
+        false,
+        undefined,
+        recordCommit,
+        markCommitted,
+      ),
+    { scheduleNext: false },
+  );
 }
 
 /** Rolls back one exact locked row created by failed trusted harness initialization. */
