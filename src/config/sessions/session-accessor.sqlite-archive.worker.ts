@@ -452,6 +452,7 @@ if (isSqliteTranscriptArchiveWorkerData(workerData)) {
     }
     runPublishWorkerPort(parentPort, plans);
   } else if (operation === "reclaim") {
+    // SAFETY: the parent creates this internal structured-clone payload from the typed plan.
     await runReclamationWorkerPort(parentPort, workerData as SqliteSessionReclamationWorkerData);
   } else {
     throw new Error("SQLite transcript archive worker requires a supported operation");
