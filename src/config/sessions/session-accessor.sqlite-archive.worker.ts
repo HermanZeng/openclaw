@@ -54,9 +54,11 @@ async function settleReclamationDatabase(
     if (outcome.settled) {
       break;
     }
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 25 * 2 ** attempt);
-    });
+    if (attempt + 1 < WORKER_CLOSE_MAX_ATTEMPTS) {
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, 25 * 2 ** attempt);
+      });
+    }
   }
   return { cleanupWarnings: [...warnings], settled: outcome.settled };
 }
@@ -412,7 +414,14 @@ async function runReclamationWorkerPort(
   try {
     result = reclaimSqliteSessionInTransaction(data.plan);
   } catch (error) {
-    await settleReclamationDatabase(data.plan.databaseOptions.path);
+    const cleanup = await settleReclamationDatabase(data.plan.databaseOptions.path);
+    if (!cleanup.settled) {
+      throw new AggregateError(
+        [error, ...cleanup.cleanupWarnings.map((warning) => new Error(warning))],
+        "SQLite session reclamation failed and Worker cleanup is incomplete; restart OpenClaw before deleting the owning agent",
+        { cause: error },
+      );
+    }
     throw error;
   }
   const cleanup = await settleReclamationDatabase(data.plan.databaseOptions.path);
