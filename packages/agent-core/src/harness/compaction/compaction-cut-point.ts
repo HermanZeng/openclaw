@@ -138,6 +138,8 @@ interface CompactionRetentionBudget {
 }
 
 export interface CompactionRetentionConstraints {
+  /** Host model-facing message costs without replacing canonical summary excerpts. */
+  estimateTokens?: (message: AgentMessage) => number;
   /** An admitted, unprocessed user remains intact even before its budget is prepared. */
   preserveFromEntryId?: string;
   budget?: CompactionRetentionBudget;
@@ -247,7 +249,11 @@ export function findCutPoint(
     if (isCutPointMessage(message)) {
       cutIndex = resolveCutPoint(i);
     }
-    accumulatedTokens += retention?.estimateTokens(message) ?? estimateTokens(message);
+    accumulatedTokens += (
+      retention?.estimateTokens ??
+      constraints?.estimateTokens ??
+      estimateTokens
+    )(message);
     if (accumulatedTokens >= keepRecentTokens) {
       break;
     }

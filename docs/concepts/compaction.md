@@ -20,6 +20,12 @@ Built-in compaction summarizes the older history in one model request, whatever 
 
 The full conversation history stays on disk. Compaction only changes what the model sees on the next turn.
 
+For uploaded documents, client-side compaction counts and summarizes the frozen
+text that was supplied to the model, not just the attachment's caption. It does
+not reread the attachment or rewrite the saved user message. Direct recent-turn
+excerpts and timeout fallback text still use the original conversation text;
+generated summaries remain subject to the summarizer's input and output limits.
+
 OpenAI Responses native compaction and checkpoint replay follow
 [context-engine compaction ownership](/concepts/context-engine#provider-compaction-ownership),
 including legacy defaults, explicit opt-in, and handling of preexisting checkpoints
@@ -39,7 +45,7 @@ retrying. If no valid summary is produced, the original history remains in conte
 and no compaction entry is written. Branch navigation also rejects truncated
 summaries and leaves the current branch unchanged.
 
-Built-in summarization receives text, not image pixels. Omitted images and other non-text input receive markers such as `[image data omitted from summary input]`, without claiming that a model processed the data. The first eight affected messages receive at most two fixed markers each; further omissions receive one aggregate statement. These additions, including newly retained role labels and separators, total at most 847 UTF-8 bytes per summarizer request and count toward token estimates. Existing text is not capped by this omission budget. Custom compaction providers still receive the original message content.
+Built-in summarization receives text, not image pixels. Omitted images and other non-text input receive markers such as `[image data omitted from summary input]`, without claiming that a model processed the data. The first eight affected messages receive at most two fixed markers each; further omissions receive one aggregate statement. These additions, including newly retained role labels and separators, total at most 847 UTF-8 bytes per summarizer request and count toward token estimates. Existing text is not capped by this omission budget. Custom compaction providers still receive model-facing message content, including non-text blocks.
 
 <Note>
 New configs default `agents.defaults.compaction.mode` to `"safeguard"` (stricter guardrails, summary quality audits). Set `mode: "default"` explicitly to opt out.
