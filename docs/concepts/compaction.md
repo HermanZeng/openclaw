@@ -8,6 +8,12 @@ title: "Compaction"
 
 Every model has a context window: the maximum number of tokens it can process. When a conversation approaches that limit, OpenClaw **compacts** older messages into a summary so the chat can continue.
 
+For uploaded documents, client-side compaction counts and summarizes the frozen
+text that was supplied to the model, not just the attachment's caption. It does
+not reread the attachment or rewrite the saved user message. Direct recent-turn
+excerpts and timeout fallback text still use the original conversation text;
+generated summaries remain subject to the summarizer's input and output limits.
+
 ## How it works
 
 1. Older conversation turns are summarized into a compact entry.
@@ -19,12 +25,6 @@ OpenClaw keeps assistant tool calls paired with their matching `toolResult` entr
 Built-in compaction summarizes the older history in one model request, whatever the size of the session or the context window. A split turn adds one request for the turn prefix, and a failed safeguard quality audit adds one request per corrective attempt. Each request's conversation input is capped at 160,000 characters (about 40,000 tokens), or less when the summarizer's own context window is smaller. A larger history is filled in this order: the newest messages verbatim, in half of that budget; your older messages, which carry the asks, decisions and corrections, in a quarter, each trimmed to at most 2,000 characters and spread evenly across the history when they do not all fit; the oldest messages, in a tenth; and evenly spaced runs of the remaining messages, trimmed to 6,000 characters each. Each gap is marked with the number of messages left out, and the summarizer is told not to guess their content and to keep the previous summary's facts. Chinese, Japanese, and Korean (CJK) characters count by their approximate token weight. The bound applies to the summarizer input only; the transcript keeps every message.
 
 The full conversation history stays on disk. Compaction only changes what the model sees on the next turn.
-
-For uploaded documents, client-side compaction counts and summarizes the frozen
-text that was supplied to the model, not just the attachment's caption. It does
-not reread the attachment or rewrite the saved user message. Direct recent-turn
-excerpts and timeout fallback text still use the original conversation text;
-generated summaries remain subject to the summarizer's input and output limits.
 
 OpenAI Responses native compaction and checkpoint replay follow
 [context-engine compaction ownership](/concepts/context-engine#provider-compaction-ownership),
@@ -45,7 +45,11 @@ retrying. If no valid summary is produced, the original history remains in conte
 and no compaction entry is written. Branch navigation also rejects truncated
 summaries and leaves the current branch unchanged.
 
-Built-in summarization receives text, not image pixels. Omitted images and other non-text input receive markers such as `[image data omitted from summary input]`, without claiming that a model processed the data. The first eight affected messages receive at most two fixed markers each; further omissions receive one aggregate statement. These additions, including newly retained role labels and separators, total at most 847 UTF-8 bytes per summarizer request and count toward token estimates. Existing text is not capped by this omission budget. Custom compaction providers still receive model-facing message content, including non-text blocks.
+Built-in summarization receives text, not image pixels. Omitted images and other non-text input receive markers such as `[image data omitted from summary input]`, without claiming that a model processed the data. The first eight affected messages receive at most two fixed markers each; further omissions receive one aggregate statement. These additions, including newly retained role labels and separators, total at most 847 UTF-8 bytes per summarizer request and count toward token estimates. Existing text is not capped by this omission budget. Custom compaction providers still receive the original message content.
+
+For custom providers, this is the model-facing message content: uploaded documents
+include their frozen text projection rather than only the persisted caption.
+Other content blocks, including non-text blocks, are preserved.
 
 <Note>
 New configs default `agents.defaults.compaction.mode` to `"safeguard"` (stricter guardrails, summary quality audits). Set `mode: "default"` explicitly to opt out.
