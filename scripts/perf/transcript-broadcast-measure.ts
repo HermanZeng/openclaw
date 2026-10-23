@@ -106,7 +106,7 @@ const { values } = parseArgs({
     "activity-summaries": { type: "boolean", default: false },
     "recap-burst-repeats": { type: "string", default: "0" },
     "recap-burst-interval-ms": { type: "string", default: "50" },
-    runs: { type: "string", default: "20" },
+    runs: { type: "string" },
     sessions: { type: "string", default: "100" },
     "history-turns": { type: "string", default: "0" },
     "history-last-turns": { type: "string", default: "0" },
@@ -125,6 +125,7 @@ const { values } = parseArgs({
     chunks: { type: "string", default: "100" },
     "chunk-interval-ms": { type: "string", default: "10" },
     "prompt-kib": { type: "string", default: "128" },
+    "chat-attachment-kib": { type: "string", default: "0" },
     "heap-snapshot": { type: "boolean", default: false },
     "session-census": { type: "boolean", default: false },
     "fingerprint-retention": { type: "boolean", default: false },
@@ -236,6 +237,14 @@ if (
   );
 }
 const toolScenario = scenario === "chat.send" || reasoningScenario;
+const chatAttachmentBytes =
+  integer(values["chat-attachment-kib"], "--chat-attachment-kib", 0) * 1024;
+if (chatAttachmentBytes && (scenario !== "chat.send" || values["session-event-wake"])) {
+  throw new Error("--chat-attachment-kib requires direct --scenario chat.send");
+}
+const chatAttachmentContent = chatAttachmentBytes
+  ? Buffer.alloc(chatAttachmentBytes, "Synthetic attachment text.\n").toString("base64")
+  : undefined;
 const turnScenario =
   scenario === "chat.send" ||
   scenario === "transcript-broadcast" ||
@@ -247,6 +256,7 @@ if (
   !values["stream-start-allocations"] &&
   !values["workload-cpu-profile"] &&
   !values["operator-access-policy"] &&
+  !(scenario === "chat.send" && values.diagnostics) &&
   !(["sessions.list", "sessions.patch"].includes(scenario) && values["capture-responses"]) &&
   scenario !== "transcript-broadcast" &&
   scenario !== "plugin.scope" &&
@@ -255,7 +265,7 @@ if (
   !soakScenario
 ) {
   throw new Error(
-    "--scenario requires --allocations, --workload-cpu-profile, or --capture-responses for sessions.list/sessions.patch",
+    "--scenario requires --allocations, --workload-cpu-profile, --diagnostics for chat.send, or --capture-responses for sessions.list/sessions.patch",
   );
 }
 const operations = integer(
@@ -300,7 +310,7 @@ const exactClients = integer(
 if (exactClients > clientCount) {
   throw new Error("--exact-clients must not exceed --clients");
 }
-const runCount = scenario === "chat.send" ? 1 : integer(values.runs, "--runs");
+const runCount = integer(values.runs ?? (scenario === "chat.send" ? "1" : "20"), "--runs");
 const sessionCount = idleScenario ? integer(values.sessions, "--sessions") : runCount;
 const historyBytesPerTurn = 16 * 1024;
 const historyReasoningBytes = 4 * 1024;
@@ -373,10 +383,10 @@ if (values["stress-session-store"] && !values["stress-tools"]) {
 }
 if (
   values["operator-access-policy"] &&
-  (scenario !== "chat.send" || !values["stress-tools"] || listIntervalMs !== 0)
+  (scenario !== "chat.send" || !values["stress-tools"] || runCount !== 1 || listIntervalMs !== 0)
 ) {
   throw new Error(
-    "--operator-access-policy requires --scenario chat.send --stress-tools and no polling",
+    "--operator-access-policy requires --scenario chat.send --stress-tools --runs 1 and no polling",
   );
 }
 if (values["session-event-wake"] && !values["operator-access-policy"]) {
@@ -833,10 +843,14 @@ import fs from "node:fs";
 import { registerHooks, syncBuiltinESMExports } from "node:module";
 import { isMainThread } from "node:worker_threads";
 if (isMainThread) {
-  const state = { active: false, counts: {}, installed: {}, firstAuthPolicyStacks: [],
+  const state = { active: false, counts: {}, callers: {}, installed: {}, firstAuthPolicyStacks: [],
     count(key) {
       if (!this.active) return;
       this.counts[key] = (this.counts[key] ?? 0) + 1;
+      if (key.endsWith(".assertSettled") || key.endsWith(".readProfileAuthority")) {
+        const caller = key + " <- " + new Error().stack.split("\n").slice(3, 6).join(" <- ").trim();
+        this.callers[caller] = (this.callers[caller] ?? 0) + 1;
+      }
       if (key === "auth-policy.stableStringify" && this.firstAuthPolicyStacks.length < 8)
         this.firstAuthPolicyStacks.push(new Error("auth-policy stringify caller").stack);
     } };
@@ -847,7 +861,8 @@ if (isMainThread) {
   const owners = new Set([
     "session-source-authority", "admitted-run-context", "operator-run-authority",
     "session-delivery-generation", "session-entry-source-authority", "session-event-handoff",
-    "session-tool-overrides", "auth-policy", "sqlite-worker-identity"
+    "session-tool-overrides", "auth-policy", "sqlite-worker-identity",
+    "user-profile-events", "user-profile-authority"
   ]);
   registerHooks({ load(url, context, nextLoad) {
     const loaded = nextLoad(url, context);
@@ -867,6 +882,14 @@ if (isMainThread) {
       (match, name) => match + count(name));
     source = source.replace(/function (assert\w+)\([^{}]*\)(?::[^{}]+)? \{/g,
       (match, name) => match + count(name));
+    if (owner === "user-profile-events") {
+      source = source.replace(/assertSettled\(this: void, profileIds: string \| readonly string\[\]\): void \{/g,
+        (match) => match + count("assertSettled"));
+    }
+    if (owner === "user-profile-authority") {
+      source = source.replace(/function readProfileAuthority\([^{}]+\{/g,
+        (match) => match + count("readProfileAuthority"));
+    }
     if (owner === "session-source-authority") {
       source = source.replace(/\(\) => \{\s*const scoped = sessionSourceScopes/g,
         (match) => match.replace("{", "{" + count("composedAssertion")));
@@ -963,10 +986,10 @@ module.exports = { id: ${JSON.stringify(id)}, register(api) {
     active = message.action === "start";
     if (active) { for (const key of Object.keys(counts)) counts[key] = 0; messages.clear(); }
     const host = globalThis[Symbol.for("openclaw.benchmark.authorityCounts")];
-    if (host) { host.active = active; if (active) { host.counts = {}; host.firstAuthPolicyStacks = []; } }
+    if (host) { host.active = active; if (active) { host.counts = {}; host.callers = {}; host.firstAuthPolicyStacks = []; } }
     process.send?.({ channel, id: message.id, counts: { ...counts }, profileId,
       sourceOverlay: globalThis[Symbol.for("openclaw.benchmark.sourceOverlay")],
-      ...(host ? { hostCounts: host.counts, installed: host.installed, firstAuthPolicyStacks: host.firstAuthPolicyStacks } : {}) });
+      ...(host ? { hostCounts: host.counts, hostCallers: host.callers, installed: host.installed, firstAuthPolicyStacks: host.firstAuthPolicyStacks } : {}) });
   }
   api.registerService({ id: "synthetic-authority-counters",
     start() {
@@ -1391,8 +1414,11 @@ const mock = createServer((req, res) => {
         : [];
     const toolOutput = toolOutputs.at(-1);
     const continuation = toolScenario && toolOutput !== undefined;
+    const primaryMessage = cohort
+      ? `Reply with benchmark stream ${index}. Transcript-broadcast cohort ${cohort.id}.`
+      : undefined;
     const primary =
-      cohort &&
+      primaryMessage !== undefined &&
       facts.purpose === "benchmark-turn" &&
       !facts.hasToolOutput &&
       !continuation &&
@@ -1401,11 +1427,12 @@ const mock = createServer((req, res) => {
       index <= runCount &&
       lastUser !== undefined &&
       (values["session-event-wake"]
-        ? lastUser.includes(
-            `Reply with benchmark stream ${index}. Transcript-broadcast cohort ${cohort.id}.`,
-          )
-        : stripInboundMetadata(lastUser).trim().split("\n")[0] ===
-          `Reply with benchmark stream ${index}. Transcript-broadcast cohort ${cohort.id}.`);
+        ? lastUser.includes(primaryMessage)
+        : chatAttachmentContent
+          ? lastUser
+              .split("\n")
+              .some((line) => stripInboundMetadata(line).trim() === primaryMessage)
+          : stripInboundMetadata(lastUser).trim().split("\n")[0] === primaryMessage);
     const requestPhase = primary
       ? `primary:${index}`
       : continuation
@@ -2343,6 +2370,7 @@ async function controlAuthorityCounters(child: ChildProcess, action: "start" | "
               }
               return {
                 counts: message.hostCounts,
+                callers: message.hostCallers,
                 installed: message.installed,
                 firstAuthPolicyStacks: message.firstAuthPolicyStacks,
               };
@@ -2440,6 +2468,15 @@ async function rpc(
   if (!response.ok) {
     throw new Error(`${method}: ${JSON.stringify(response.error)}`);
   }
+  if (
+    method === "chat.send" &&
+    (!isRecord(params) ||
+      !isRecord(response.payload) ||
+      response.payload.status !== "started" ||
+      response.payload.runId !== params.idempotencyKey)
+  ) {
+    throw new Error("chat.send did not acknowledge the requested fresh turn");
+  }
   if (values["github-options-connected"] && method === "sessions.github.options") {
     validateDashboardRpc(method, response.payload);
     if (
@@ -2512,6 +2549,7 @@ function latencySummary(latenciesMs: number[]) {
     p50Ms: sorted[Math.ceil(sorted.length * 0.5) - 1] ?? null,
     p95Ms: sorted[Math.ceil(sorted.length * 0.95) - 1] ?? null,
     p99Ms: sorted[Math.ceil(sorted.length * 0.99) - 1] ?? null,
+    maxMs: sorted.at(-1) ?? null,
     latenciesMs,
   };
 }
@@ -2959,6 +2997,19 @@ async function runRound(
             message,
             deliver: false,
             idempotencyKey: runId,
+            ...(chatAttachmentContent
+              ? {
+                  attachments: [
+                    {
+                      type: "file",
+                      mimeType: "text/plain",
+                      fileName: "synthetic-attachment.txt",
+                      origin: "paste",
+                      content: chatAttachmentContent,
+                    },
+                  ],
+                }
+              : {}),
             ...(image
               ? {
                   attachments: [
@@ -5014,6 +5065,14 @@ try {
     recapBurstRepeats,
     recapBurstIntervalMs,
     runCount,
+    ...(scenario === "chat.send" && !values["session-event-wake"]
+      ? {
+          chatSendAck: latencySummary(
+            samples.flatMap((sample) => sample.rpc["chat.send"]?.latenciesMs ?? []),
+          ),
+          chatAttachmentBytes,
+        }
+      : {}),
     ...(scenario === "sessions.cleanup" ? { sessionMaintenanceMode: "warn" } : {}),
     chunks: chunkCount,
     chunkIntervalMs,
