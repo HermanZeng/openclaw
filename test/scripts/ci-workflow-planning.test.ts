@@ -2787,7 +2787,8 @@ describe("ci workflow guards", () => {
   );
 
   it.each([
-    ["macos-swift", false, "workflow_dispatch", false, ["release", "tests", "packages"]],
+    ["macos-swift", false, "workflow_dispatch", false, ["release", "tests"]],
+    ["macos-swift-packages", false, "workflow_dispatch", false, ["packages"]],
     ["ios-build", false, "workflow_dispatch", false, ["release", "tests"]],
     ["ios-build", true, "workflow_dispatch", false, ["tests"]],
     ["ios-build", false, "pull_request", false, ["smoke"]],
@@ -2824,43 +2825,44 @@ describe("ci workflow guards", () => {
       expect(job.strategy["fail-fast"]).toBe(false);
       expect(job.strategy["max-parallel"]).toBe(2);
       expect(job["continue-on-error"]).not.toBe(true);
-      expect(job.needs).toEqual(["preflight"]);
-      const workloads =
-        jobName === "macos-swift"
-          ? {
-              smoke: [],
-              release: [
-                "Native state schema version contract",
-                "Swift lint",
-                "Swift build (release)",
-              ],
-              tests: ["Build Swift tests", "Swift test"],
-              packages: [
-                "OpenClawKit Talk-trait opt-out (no ElevenLabsKit when default traits disabled)",
-                "OpenClawKit tests",
-                "Swabble tests",
-              ],
-            }
-          : {
-              smoke: [
-                ...(historical ? [] : ["Configure iOS build and report simulator selection"]),
-                ...(historical ? [] : ["Prepare iOS simulator"]),
-                "Build iOS app",
-                ...(historical ? ["Swift lint"] : []),
-                ...(historical ? [] : ["Run focused iOS voice cleanup simulator tests"]),
-                ...(historical ? [] : ["Run focused iOS lifecycle simulator tests"]),
-              ],
-              release: ["Build iOS app (Release)"],
-              tests: [
-                "Test Watch RTC engine",
-                "Configure iOS build and report simulator selection",
-                "Prepare iOS simulator",
-                "Build iOS app",
-                "Run focused iOS voice cleanup simulator tests",
-                "Run focused iOS lifecycle simulator tests",
-                "Run focused Apple Watch operation simulator tests",
-              ],
-            };
+      expect(job.needs).toEqual(
+        jobName === "macos-swift" ? ["preflight", "build-artifacts"] : ["preflight"],
+      );
+      const workloads = jobName.startsWith("macos-swift")
+        ? {
+            smoke: [],
+            release: [
+              "Native state schema version contract",
+              "Swift lint",
+              "Swift build (release)",
+            ],
+            tests: ["Build Swift tests", "Swift test"],
+            packages: [
+              "OpenClawKit Talk-trait opt-out (no ElevenLabsKit when default traits disabled)",
+              "OpenClawKit tests",
+              "Swabble tests",
+            ],
+          }
+        : {
+            smoke: [
+              ...(historical ? [] : ["Configure iOS build and report simulator selection"]),
+              ...(historical ? [] : ["Prepare iOS simulator"]),
+              "Build iOS app",
+              ...(historical ? ["Swift lint"] : []),
+              ...(historical ? [] : ["Run focused iOS voice cleanup simulator tests"]),
+              ...(historical ? [] : ["Run focused iOS lifecycle simulator tests"]),
+            ],
+            release: ["Build iOS app (Release)"],
+            tests: [
+              "Test Watch RTC engine",
+              "Configure iOS build and report simulator selection",
+              "Prepare iOS simulator",
+              "Build iOS app",
+              "Run focused iOS voice cleanup simulator tests",
+              "Run focused iOS lifecycle simulator tests",
+              "Run focused Apple Watch operation simulator tests",
+            ],
+          };
       const names = [];
       for (const phase of phases) {
         const phaseContext = { ...context, matrix: { phase } };
@@ -2921,7 +2923,9 @@ describe("ci workflow guards", () => {
     "retains macOS tests and one guard/cache owner for %j",
     ({ eventName, releaseGate, full, ...target }) => {
       const historical = "historical" in target && target.historical;
-      const job = readCiWorkflow().jobs["macos-swift"];
+      const workflow = readCiWorkflow();
+      const job = workflow.jobs["macos-swift"];
+      const packages = workflow.jobs["macos-swift-packages"];
       const manifest = runCiManifestFixture({
         bundledPlanner: true,
         eventName,
@@ -2947,10 +2951,12 @@ describe("ci workflow guards", () => {
           "scripts/test-macos-app-host.sh": "present",
         },
       };
-      const phases: string[] = Array.isArray(job.strategy.matrix.phase)
+      const appPhases: string[] = Array.isArray(job.strategy.matrix.phase)
         ? job.strategy.matrix.phase
         : evaluateWorkflowExpression(job.strategy.matrix.phase, context);
-      expect(phases).toEqual(full ? ["release", "tests", "packages"] : ["tests", "packages"]);
+      expect(appPhases).toEqual(full ? ["release", "tests"] : ["tests"]);
+      expect(packages.strategy.matrix.phase).toEqual(["packages"]);
+      const phases = [...appPhases, ...packages.strategy.matrix.phase];
       expect(job.strategy["max-parallel"]).toBe(2);
       const env = Object.fromEntries(
         Object.entries(job.env).map(([key, value]) => [
@@ -5080,6 +5086,7 @@ describe("ci workflow guards", () => {
       }
       for (const [job, admitted] of [
         ["macos-swift", false],
+        ["macos-swift-packages", false],
         ["ios-build", false],
         ["android", nativeChecks.android],
       ] as const) {
@@ -8813,7 +8820,13 @@ describe("ci workflow guards", () => {
       screenshots: true,
       changedPath: ".github/actions/git-owner/owner.py",
       eventName: "workflow_dispatch",
-      selectedJobs: ["macos-node", "macos-swift", "checks-windows", "ios-build"],
+      selectedJobs: [
+        "macos-node",
+        "macos-swift",
+        "macos-swift-packages",
+        "checks-windows",
+        "ios-build",
+      ],
     },
     {
       label: "historical manual Mac source without native Node output",
@@ -8821,7 +8834,7 @@ describe("ci workflow guards", () => {
       eventName: "workflow_dispatch",
       releaseGate: false,
       legacyOutput: true,
-      selectedJobs: ["macos-node", "macos-swift", "checks-windows"],
+      selectedJobs: ["macos-node", "macos-swift", "macos-swift-packages", "checks-windows"],
     },
     {
       label: "historical manual config source without native Node output",
@@ -8829,7 +8842,7 @@ describe("ci workflow guards", () => {
       eventName: "workflow_dispatch",
       releaseGate: false,
       legacyOutput: true,
-      selectedJobs: ["macos-node", "macos-swift", "checks-windows"],
+      selectedJobs: ["macos-node", "macos-swift", "macos-swift-packages", "checks-windows"],
     },
   ])(
     "routes native CI jobs through scope output and manifest ($label)",
@@ -8891,6 +8904,7 @@ describe("ci workflow guards", () => {
       for (const jobName of [
         "macos-node",
         "macos-swift",
+        "macos-swift-packages",
         "checks-windows",
         "ios-build",
         "android",
@@ -10448,7 +10462,9 @@ describe("ci workflow guards", () => {
         },
       };
       expect(evaluateWorkflowCondition(suiteStep.if, context)).toBe(hasSuiteTargets);
-      expect(evaluateWorkflowCondition(desktopStep.if, context)).toBe(row.run_desktop);
+      expect(evaluateWorkflowCondition(desktopStep.if, context)).toBe(
+        row.run_desktop && !hasSuiteTargets,
+      );
       if (!hasSuiteTargets) {
         expect(row.run_desktop).toBe(true);
       }
@@ -10734,7 +10750,7 @@ describe("ci workflow guards", () => {
     expect(uiE2eSetup.uses).toBe("./.ci-harness/.github/actions/setup-node-env");
     const expectedSharedUiE2eSetup = {
       "cache-mode": "${{ needs.preflight.outputs.cache_mode }}",
-      "node-version": "24.x",
+      "node-version": "24.22.1",
       "install-bun": "false",
       "dependency-cache": expect.any(String),
     } as const;
@@ -11065,7 +11081,7 @@ describe("ci workflow guards", () => {
     );
     expect(desktopProof).toEqual({
       name: "Prove desktop resize over node and SSH",
-      if: "${{ !cancelled() && steps.real_gateway_build.outcome == 'success' && matrix.run_desktop }}",
+      if: "${{ !cancelled() && steps.real_gateway_build.outcome == 'success' && matrix.run_desktop && (needs.preflight.outputs.frozen_target == 'true' || !matrix.run_tests || steps.ui_chromium.outcome != 'success') }}",
       env: {
         FROZEN_TARGET: "${{ needs.preflight.outputs.frozen_target }}",
         DESKTOP_PROOF_CHECKOUT_SHA: "${{ needs.preflight.outputs.checkout_revision }}",
@@ -11077,6 +11093,25 @@ describe("ci workflow guards", () => {
     });
     expect(uiE2eRealGateway.steps.indexOf(desktopProof)).toBeGreaterThan(realGatewayBuildIndex);
     expect(uiE2eRealGateway.steps.indexOf(desktopProof)).toBeLessThan(realGatewayIndex);
+    for (const frozen of [false, true]) {
+      for (const chromiumReady of [false, true]) {
+        for (const runTests of [false, true]) {
+          expect(
+            evaluateWorkflowCondition(desktopProof.if, {
+              eventName: "push",
+              repository: "openclaw/openclaw",
+              runAttempt: 1,
+              preflightOutputs: { frozen_target: String(frozen) },
+              matrix: { run_desktop: true, run_tests: runTests },
+              steps: {
+                real_gateway_build: { outputs: {}, outcome: "success" },
+                ui_chromium: { outputs: {}, outcome: chromiumReady ? "success" : "failure" },
+              },
+            }),
+          ).toBe(frozen || !runTests || !chromiumReady);
+        }
+      }
+    }
     const desktopUpload = expectDefined(
       uiE2eRealGateway.steps.find(
         (step: WorkflowStep) => step.name === "Upload sanitized desktop resize proof",
@@ -11103,6 +11138,11 @@ describe("ci workflow guards", () => {
       OPENCLAW_UI_E2E_DIAGNOSTIC_DIR:
         ".artifacts/control-ui-e2e-timeouts/real-gateway-attempt-${{ github.run_attempt }}",
       OPENCLAW_NODE_TEST_GROUPS_GZIP_BASE64: "${{ matrix.test_groups_gzip_base64 }}",
+      OPENCLAW_UI_E2E_RUN_DESKTOP: "${{ matrix.run_desktop }}",
+      DESKTOP_PROOF_CHECKOUT_SHA: "${{ needs.preflight.outputs.checkout_revision }}",
+      DESKTOP_PROOF_PR_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+      DESKTOP_PROOF_PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+      DESKTOP_PROOF_WORKFLOW_SHA: "${{ github.workflow_sha }}",
     });
     expect(proofUploadIndex).toBeGreaterThan(realGatewayIndex);
     expect(proofUpload.with.name).toBe(
@@ -12213,6 +12253,7 @@ describe("ci workflow guards", () => {
       "checks-windows",
       "macos-node",
       "macos-swift",
+      "macos-swift-packages",
       "ios-build",
       "ios-release-e2e",
       "ios-screenshot-capture",

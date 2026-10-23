@@ -8,21 +8,22 @@ import {
   type MenuEntry,
   type MenuHandle,
 } from "../../../components/solid/menu.tsx";
-import { copyToClipboard } from "../../../lib/clipboard.ts";
 import type { PresentationValue } from "../../../lib/presentation.ts";
 import { t } from "../../../lib/reactive/i18n.ts";
 import { projectPresentation } from "../../../lib/reactive/presentation.ts";
 import { sessionPullRequestStateIcons } from "../../../lib/session-pull-request-presentation.ts";
 import { ContentPresentation } from "../../../lib/solid/presentation.ts";
 import { showToast } from "../../../lib/toast.ts";
+import { createPullRequestCopy } from "./chat-pull-request-copy.ts";
 import {
   ChecksRows,
+  PullRequestCopyError,
   StatusWarning,
   STATE_LABEL_KEYS,
   type ChatPullRequestsProps,
 } from "./chat-pull-request-shared.tsx";
-import "./chat-ci-details.ts";
-import "./chat-ci-automation-control.ts";
+import "./chat-ci-details.tsx";
+import "./chat-ci-automation-control.tsx";
 
 const CHECK_ROLLUP = {
   failing: ["failed", "chat.pullRequests.checksFailed", "circleX"],
@@ -43,45 +44,27 @@ export function PullRequestActions(props: {
   const controls = createMenuControls();
   const parentPresented = useContext(ContentPresentation);
   let menu: MenuHandle | undefined;
-  const [copying, setCopying] = createSignal(false);
-  const [copyFailed, setCopyFailed] = createSignal(false);
   const [page, setPage] = createSignal<"home" | "checks" | "monitoring">("home");
-  let backButton: HTMLButtonElement | undefined;
-  let checksButton: HTMLButtonElement | undefined;
-  let monitoringButton: HTMLButtonElement | undefined;
   const navigate = (next: "checks" | "monitoring") => {
     setPage(next);
-    queueMicrotask(() => backButton?.focus());
+    queueMicrotask(() => menu?.itemElement("back")?.focus());
   };
   const back = () => {
-    const previous = page();
+    const previous = page() === "checks" ? "checks" : "monitoring";
     setPage("home");
-    queueMicrotask(() => (previous === "checks" ? checksButton : monitoringButton)?.focus());
+    queueMicrotask(() => menu?.itemElement(previous)?.focus());
   };
   const [menuOpen, setMenuOpen] = createSignal(false);
   const presentation = createMemo(() => projectPresentation(props.presented));
   const presented = () => parentPresented() && !props.dismissed && presentation().read();
-  const copy = async () => {
-    if (copying()) {
-      return;
-    }
-    const url = props.pullRequest.url;
-    setCopying(true);
-    setCopyFailed(false);
-    const current = () =>
-      presented() && menu?.overlay.open === true && props.pullRequest.url === url;
-    const copied = await copyToClipboard(url, current);
-    setCopying(false);
-    if (!current()) {
-      return;
-    }
-    if (copied) {
+  const clipboard = createPullRequestCopy({
+    url: () => props.pullRequest.url,
+    presented: () => presented() && menu?.overlay.open === true,
+    onCopied: () => {
       menu?.close();
       showToast({ message: t("chat.pullRequests.linkCopied") });
-    } else {
-      setCopyFailed(true);
-    }
-  };
+    },
+  });
   const checks = () => props.pullRequest.checks;
   const rollup = () => {
     const current = checks();
@@ -167,14 +150,7 @@ export function PullRequestActions(props: {
     label: t("common.back"),
     closeOnSelect: false,
     render: (attributes) => (
-      <button
-        {...attributes}
-        ref={(element) => {
-          backButton = element;
-        }}
-        class="oc-menu-item chat-pr-menu__back"
-        type="button"
-      >
+      <button {...attributes} class="oc-menu-item chat-pr-menu__back" type="button">
         <span class="oc-menu-item__icon">
           <Icon name="arrowLeft" />
         </span>
@@ -278,9 +254,6 @@ export function PullRequestActions(props: {
                 render: (attributes) => (
                   <button
                     {...attributes}
-                    ref={(element) => {
-                      checksButton = element;
-                    }}
                     class="oc-menu-item chat-pr-menu__drill-trigger"
                     type="button"
                   >
@@ -317,19 +290,13 @@ export function PullRequestActions(props: {
                 id: "copy",
                 label: t("chat.pullRequests.copyLink"),
                 icon: <Icon name="link" />,
-                disabled: copying(),
+                disabled: clipboard.copying(),
                 closeOnSelect: false,
               },
               {
                 kind: "content",
                 id: "copy-error",
-                content: (
-                  <Show when={copyFailed()}>
-                    <p class="chat-pr-menu__error" role="alert">
-                      {t("chat.pullRequests.copyFailed")}
-                    </p>
-                  </Show>
-                ),
+                content: <PullRequestCopyError clipboard={clipboard} />,
               },
             ],
           },
@@ -340,9 +307,6 @@ export function PullRequestActions(props: {
             render: (attributes) => (
               <button
                 {...attributes}
-                ref={(element) => {
-                  monitoringButton = element;
-                }}
                 class="oc-menu-item chat-pr-menu__drill-trigger"
                 type="button"
               >
@@ -393,7 +357,7 @@ export function PullRequestActions(props: {
       onOpenChange={(open) => {
         setMenuOpen(open);
         if (!open) {
-          setCopyFailed(false);
+          clipboard.retire();
           setPage("home");
         }
       }}
@@ -415,7 +379,7 @@ export function PullRequestActions(props: {
           props.onDismiss();
         }
         if (item.id === "copy") {
-          void copy();
+          void clipboard.copy();
         }
       }}
     />

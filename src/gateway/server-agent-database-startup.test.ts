@@ -214,9 +214,13 @@ it.for([
         bootstrapSecrets = getActiveSecretsRuntimeSnapshot();
         return startEarly(params);
       });
-      vi.spyOn(subagents, "activateSubagentRegistry").mockImplementation(async () => {
+      vi.spyOn(subagents, "activateSubagentRegistry").mockImplementation(() => {
         restorationEntered.resolve();
-        await restorationRelease.promise;
+        return {
+          initial: restorationRelease.promise,
+          pending: new Map(),
+          settled: restorationRelease.promise,
+        };
       });
     }
     const nativeBroker = process.platform === "linux" && !process.versions.bun;
@@ -515,7 +519,9 @@ it.for([
       await waitForHealthyAgent();
       expect(readAgentDatabaseAdmissionRefusal(healthyAgentId, { env })).toBeUndefined();
       const readiness = await probeGateway(port, "/readyz");
-      expect(readiness.status).toBe(agentId === "main" && paused ? 503 : 200);
+      expect(readiness.status).toBe(
+        (agentId === "main" && paused) || holdSubagentRestoration ? 503 : 200,
+      );
       if (agentId === "main" && paused) {
         await expect(readiness.json()).resolves.toMatchObject({
           ready: false,
@@ -702,11 +708,17 @@ it.for([
         expect(snapshot?.degradedOwners?.some((owner) => owner.paths.includes(agentPath))).toBe(
           false,
         );
-        expect((await probeGateway(port, "/readyz")).status).toBe(200);
         if (holdSubagentRestoration) {
           // Fresh chat waits for restored sources even after database readiness.
           await withinTest(restorationEntered.promise, signal);
           expect(startupSettled).toBe(true);
+          const recoveringReadiness = await probeGateway(port, "/readyz");
+          expect(recoveringReadiness.status).toBe(503);
+          await expect(recoveringReadiness.json()).resolves.toMatchObject({
+            ready: false,
+            coreReady: false,
+            failing: ["chat-recovery"],
+          });
           expect(await rpcReq(chatClient!, "chat.send", chatParams)).toMatchObject({
             ok: false,
             error: {
@@ -719,6 +731,7 @@ it.for([
           expect(subagentRecoverySettled).toBeDefined();
           await withinTest(subagentRecoverySettled!, signal);
         }
+        expect((await probeGateway(port, "/readyz")).status).toBe(200);
         expect(await rpcReq(chatClient!, "chat.send", chatParams)).toMatchObject({ ok: true });
         await withinTest(dispatched.promise, signal);
         if (checkHostJournalReads) {

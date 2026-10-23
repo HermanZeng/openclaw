@@ -32,15 +32,27 @@ import { withExistingOpenClawStateDatabaseReadOnly } from "../state/openclaw-sta
 import { runOpenClawStateWriteTransaction } from "../state/openclaw-state-db.js";
 import { shortenHomePath } from "../utils.js";
 import { ensureHeartbeatMonitorJobs } from "./doctor-heartbeat-cadence-migration.js";
-import { resolveLegacyHeartbeatAgents } from "./doctor-heartbeat-legacy.js";
+import {
+  resolveLegacyHeartbeatAgents,
+  resolveLegacyHeartbeatConfig,
+} from "./doctor-heartbeat-legacy.js";
 import { noteDoctorMigrationResult } from "./doctor-migration-notes.js";
 
 const LEGACY_HEARTBEAT_FILENAME = "HEARTBEAT.md";
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
+function resolveHeartbeatFileAgentIds(cfg: OpenClawConfig): string[] {
+  const enrolled = new Set(resolveLegacyHeartbeatAgents(cfg).map((agent) => agent.agentId));
+  // Explicit settings still own files when another agent's enrollment excludes them.
+  return listAgentIds(cfg).filter(
+    (agentId) => enrolled.has(agentId) || resolveLegacyHeartbeatConfig(cfg, agentId) !== undefined,
+  );
+}
+
 type HeartbeatScratchMigrationResult = {
   changes: string[];
   warnings: string[];
+  notices?: string[];
 };
 
 type HeartbeatSource = {
@@ -51,7 +63,7 @@ type HeartbeatSource = {
   sha256: string;
 };
 
-export async function readHeartbeatSource(
+async function readHeartbeatSource(
   cfg: OpenClawConfig,
   agentId: string,
   options?: { recoverClaims?: boolean; env?: NodeJS.ProcessEnv },
@@ -120,27 +132,27 @@ export async function readHeartbeatSource(
   };
 }
 
-export function completedHeartbeatSourceWarning(agentId: string): string {
-  return `Agent "${agentId}" has completed cutover; its newly present HEARTBEAT.md was retained without changing the operator-owned automation.`;
+function completedHeartbeatSourceWarning(agentId: string): string {
+  return `Agent "${agentId}" has completed cutover; its HEARTBEAT.md was retained without changing the operator-owned automation.`;
 }
 
-export function shouldInspectHeartbeatScratchSource(
+function shouldInspectHeartbeatScratchSource(
   hasMonitor: boolean,
   receipt: DefaultProactiveJobReceipt | undefined,
 ): boolean {
   return hasMonitor || receipt?.phase === "complete";
 }
 
-export function heartbeatScratchMigrationConflict(
+function heartbeatScratchMigrationConflict(
   agentId: string,
   content: string,
   state: CronJobScratchState,
 ): string | undefined {
   if (state.currentRevision > 0 && !state.scratch) {
-    return `Agent "${agentId}" scratch was explicitly unset; it was left unchanged.`;
+    return `Agent "${agentId}" scratch was explicitly unset; it was left unchanged and HEARTBEAT.md was retained for review.`;
   }
   if (state.scratch && state.scratch.content !== content && !state.scratch.sourceSha256) {
-    return `Agent "${agentId}" already has different cron scratch; it was left unchanged.`;
+    return `Agent "${agentId}" already has different cron scratch; the automation keeps it and HEARTBEAT.md was retained for review.`;
   }
   return undefined;
 }
@@ -395,39 +407,38 @@ export async function collectHeartbeatScratchMigrationFindings(
     fixHint: `Run ${formatCliCommand("openclaw doctor --fix")} to migrate HEARTBEAT.md into cron scratch.`,
   } as const;
   const findings: HealthFinding[] = [];
-  const migrationAgents = resolveLegacyHeartbeatAgents(cfg);
-  for (const agent of migrationAgents) {
+  for (const agentId of resolveHeartbeatFileAgentIds(cfg)) {
     const heartbeatPath = path.join(
-      resolveAgentWorkspaceDir(cfg, agent.agentId, env),
+      resolveAgentWorkspaceDir(cfg, agentId, env),
       LEGACY_HEARTBEAT_FILENAME,
     );
     try {
-      const source = await readHeartbeatSource(cfg, agent.agentId, { env });
+      const source = await readHeartbeatSource(cfg, agentId, { env });
       if (!source) {
         continue;
       }
       findings.push({
         ...MIGRATION_FINDING_DEFAULTS,
-        target: agent.agentId,
+        target: agentId,
         path: heartbeatPath,
         requirement: "legacy-heartbeat-file",
-        message: `Agent "${agent.agentId}" still stores heartbeat instructions in HEARTBEAT.md.`,
+        message: `Agent "${agentId}" still stores heartbeat instructions in HEARTBEAT.md.`,
       });
     } catch (error) {
       findings.push({
         ...MIGRATION_FINDING_DEFAULTS,
-        target: agent.agentId,
+        target: agentId,
         path: heartbeatPath,
         requirement: "heartbeat-file-migration-blocked",
         severity: "error",
-        message: `Agent "${agent.agentId}" HEARTBEAT.md cannot be migrated: ${errorMessage(error)}`,
+        message: `Agent "${agentId}" HEARTBEAT.md cannot be migrated: ${errorMessage(error)}`,
       });
     }
   }
   return findings;
 }
 
-/** Migrates each enrolled agent's heartbeat file into its stable monitor job. */
+/** File ownership is independent of enrollment; disabled agents retain their scratch too. */
 export async function maybeMigrateHeartbeatFilesToScratch(params: {
   cfg: OpenClawConfig;
   shouldRepair: boolean;
@@ -437,21 +448,20 @@ export async function maybeMigrateHeartbeatFilesToScratch(params: {
   const storePath = resolveCronJobsStorePathFromConfig(params.cfg, env);
   const changes: string[] = [];
   const warnings: string[] = [];
-  const migrationAgents = resolveLegacyHeartbeatAgents(params.cfg);
+  const notices: string[] = [];
+  const migrationAgents = resolveHeartbeatFileAgentIds(params.cfg);
   if (!params.shouldRepair) {
-    for (const agent of migrationAgents) {
+    for (const agentId of migrationAgents) {
       try {
-        const source = await readHeartbeatSource(params.cfg, agent.agentId, { env });
+        const source = await readHeartbeatSource(params.cfg, agentId, { env });
         if (source) {
           note(
-            `${shortenHomePath(source.path)} will migrate into automation scratch for ${agent.agentId}.`,
+            `${shortenHomePath(source.path)} will migrate into automation scratch for ${agentId}.`,
             "Heartbeat migration preview",
           );
         }
       } catch (error) {
-        warnings.push(
-          `Agent "${agent.agentId}" HEARTBEAT.md cannot be migrated: ${errorMessage(error)}`,
-        );
+        warnings.push(`Agent "${agentId}" HEARTBEAT.md cannot be migrated: ${errorMessage(error)}`);
       }
     }
     noteDoctorMigrationResult({ warnings });
@@ -504,7 +514,7 @@ export async function maybeMigrateHeartbeatFilesToScratch(params: {
     }
     if (receipt?.phase === "complete") {
       retainedSources.add(source.entryKey);
-      warnings.push(completedHeartbeatSourceWarning(agentId));
+      notices.push(completedHeartbeatSourceWarning(agentId));
       continue;
     }
     // Group by the directory entry being removed (canonical parent directory +
@@ -536,7 +546,7 @@ export async function maybeMigrateHeartbeatFilesToScratch(params: {
       plannedRevisionByJobId.set(monitor.id, state.currentRevision);
       const conflict = heartbeatScratchMigrationConflict(agentId, source.content, state);
       if (conflict) {
-        warnings.push(conflict);
+        notices.push(conflict);
       } else {
         importAgents.push([agentId, monitor]);
         if (current?.sourceSha256 !== source.sha256) {
@@ -714,6 +724,6 @@ export async function maybeMigrateHeartbeatFilesToScratch(params: {
     }
   }
 
-  noteDoctorMigrationResult({ changes, warnings });
-  return { changes, warnings };
+  noteDoctorMigrationResult({ changes, warnings, notices });
+  return { changes, warnings, ...(notices.length ? { notices } : {}) };
 }

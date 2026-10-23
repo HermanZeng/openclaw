@@ -424,13 +424,18 @@ export type PluginRegistry = {
   services: PluginServiceRegistration[];
   gatewayDiscoveryServices: PluginGatewayDiscoveryServiceRegistration[];
   commands: PluginCommandRegistration[];
+  subagentProfiles: import("./subagent-profile.types.js").RegisteredSubagentProfile[];
   interactiveHandlers: PluginInteractiveHandlerRegistryRegistration[];
   sessionExtensions: Array<
     PluginRegistrationOwner & { extension: PluginSessionExtensionRegistration }
   >;
   trustedToolPolicies: PluginTrustedToolPolicyRegistryRegistration[];
   toolMetadata: Array<PluginRegistrationOwner & { metadata: PluginToolMetadataRegistration }>;
-  controlUiDescriptors: Array<PluginRegistrationOwner & { descriptor: PluginControlUiDescriptor }>;
+  controlUiDescriptors: Array<
+    PluginRegistrationOwner & {
+      descriptor: PluginControlUiDescriptor;
+    }
+  >;
   runtimeLifecycles: Array<
     PluginRegistrationOwner & { lifecycle: PluginRuntimeLifecycleRegistration }
   >;

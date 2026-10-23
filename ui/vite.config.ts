@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { brotliCompress, constants as zlibConstants } from "node:zlib";
-import { gzip } from "pako";
+import { gzip } from "libdeflate";
 import {
   runnerImport,
   type Plugin,
@@ -97,14 +97,14 @@ export async function createControlUiPrecompressedAssetVariants(
     {
       fileName: `${fileName}.br`,
       source: await compressBrotli(body, {
-        params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 9 },
+        params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 10 },
       }),
     },
     {
       fileName: `${fileName}.gz`,
-      // Host zlib is byte-unstable across supported runtimes; pako's classic hash is canonical.
-      // Smaller deflate blocks reduce startup JavaScript size and encoder memory.
-      source: Buffer.from(gzip(body, { level: 9, legacyHash: true, memLevel: 6 })),
+      // Pinned WASM keeps gzip bytes independent of the host zlib and CPU.
+      // Level 11 retains nearly all of level 12's savings at lower build-time cost.
+      source: Buffer.from(gzip(body, 11)),
     },
   ];
 }
@@ -684,7 +684,7 @@ export default function controlUiViteConfig(
   const staticImports = new Map<string, readonly string[]>();
   const copiedInputs = new Set<string>();
   const resolveModulePreloadDependencies: ResolveModulePreloadDependenciesFn = (
-    _filename,
+    filename,
     deps,
     context,
   ) => {
@@ -701,7 +701,10 @@ export default function controlUiViteConfig(
         imports.push(...(staticImports.get(dependency) ?? []));
       }
     }
-    return deps.filter((dep) => !loaded.has(dep));
+    // Without stylesheet waits, import() immediately fetches its own target.
+    // Keep the target preload when CSS would otherwise delay that request.
+    const waitsForStyles = deps.some((dep) => dep.endsWith(".css"));
+    return deps.filter((dep) => !loaded.has(dep) && (waitsForStyles || dep !== filename));
   };
   return {
     base,
@@ -745,7 +748,8 @@ export default function controlUiViteConfig(
       // Source builds retain automatic debugger discovery.
       sourcemap: buildInfo.release ? "hidden" : true,
       modulePreload: {
-        polyfill: true,
+        // Every supported browser has native modulepreload (see docs/web/control-ui.md).
+        polyfill: false,
         resolveDependencies: resolveModulePreloadDependencies,
       },
       rolldownOptions: {

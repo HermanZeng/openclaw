@@ -87,6 +87,7 @@ type GatewayRequestContextRuntime = Pick<
   | "broadcastVoiceWakeChanged"
   | "broadcastVoiceWakeRoutingChanged"
   | "unavailableGatewayMethods"
+  | "inputRecovery"
 > &
   Pick<
     GatewayCoreRuntime,
@@ -99,6 +100,7 @@ type GatewayRequestContextRuntime = Pick<
     | "resolveSharedGatewaySessionGenerationForRuntimeSnapshot"
     | "workerPlacementControlAvailable"
     | "getAttachedGatewayMethodRegistry"
+    | "getReadiness"
   > & {
     sessionObserver: NonNullable<GatewayRequestContext["sessionObserver"]>;
     sessionActivitySummaries?: GatewayRequestContext["sessionActivitySummaries"];
@@ -341,6 +343,7 @@ export function createGatewayRequestContext(
       ? { readChatStartupProjection: params.chatMetadataLifecycle.readStartup }
       : {}),
     getHealthCache,
+    getReadiness: runtime.getReadiness,
     refreshHealthSnapshot: runtime.refreshGatewayHealthSnapshotWithRuntime,
     logHealth: params.logHealth,
     logGateway: params.log,
@@ -573,6 +576,7 @@ export function createGatewayRequestContext(
     broadcastVoiceWakeChanged: runtime.broadcastVoiceWakeChanged,
     broadcastVoiceWakeRoutingChanged: runtime.broadcastVoiceWakeRoutingChanged,
     unavailableGatewayMethods: runtime.unavailableGatewayMethods,
+    inputRecovery: runtime.inputRecovery,
   };
   return bindSessionRowProjection(context, runtime.getSessionRowProjection);
 }

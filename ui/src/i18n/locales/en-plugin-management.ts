@@ -232,6 +232,7 @@ const enPluginManagement = {
         description: "Adds information or controls alongside sessions.",
       },
       widget: { name: "Dashboard widgets", description: "Adds widgets to the dashboard." },
+      inline: { name: "Inline views", description: "Shows native plugin views in conversations." },
       replacement: {
         name: "Interface replacements",
         description: "Replaces supported parts of the interface.",
@@ -417,6 +418,7 @@ const enPluginManagement = {
       transport: "Transport",
       authentication: "Authentication",
       scope: "Requested permissions",
+      description: "What this server does",
       unavailable: "Connection details are not included in this plugin’s catalog metadata.",
       auth: { oauth: "OAuth", "api-key": "API key", none: "None" },
     },
