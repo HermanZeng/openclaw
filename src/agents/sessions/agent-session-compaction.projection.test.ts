@@ -26,7 +26,20 @@ it.each(["core", "safeguard", "provider", "deterministic"] as const)(
   "%s compaction expands only summary execution input, not canonical excerpts",
   async (mode) => {
     const sessionManager = SessionManager.inMemory();
-    const canonical = { role: "user" as const, content: "Analyze the attachment.", timestamp: 1 };
+    const caption = "Analyze the attachment.";
+    const image = { type: "image" as const, data: "aGVsbG8=", mimeType: "image/png" };
+    const canonical = {
+      role: "user" as const,
+      content:
+        mode === "provider"
+          ? [
+              { type: "text" as const, text: caption },
+              image,
+              { type: "text" as const, text: "Keep the attached diagram." },
+            ]
+          : caption,
+      timestamp: 1,
+    };
     const projected = prepareModelPromptProjection(
       canonical,
       "PRIVATE_PROMPT_Q7\nDOCUMENT_FACT_Q7",
@@ -89,12 +102,16 @@ it.each(["core", "safeguard", "provider", "deterministic"] as const)(
       }
       if (mode === "deterministic") {
         expect(inputs).toEqual([]);
-        expect(summary.result.summary).toContain(canonical.content);
+        expect(summary.result.summary).toContain(caption);
       } else if (mode === "provider") {
         expect(inputs).toEqual([]);
         expect(providerInputs).toHaveLength(1);
         const user = providerInputs[0]?.find(isUserMessage);
-        expect(user?.content).toBe("PRIVATE_PROMPT_Q7\nDOCUMENT_FACT_Q7");
+        expect(user?.content).toEqual([
+          { type: "text", text: "PRIVATE_PROMPT_Q7\nDOCUMENT_FACT_Q7" },
+          { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+          { type: "text", text: "Keep the attached diagram." },
+        ]);
         expect(user).not.toHaveProperty("__openclaw.modelPromptProjection");
       } else {
         expect(inputs).toHaveLength(1);
