@@ -471,6 +471,8 @@ export const ChatDetailsSession = defineSolidBridge<Props>(
                     showProcesses={false}
                   />
                   <ChatDetailsProcesses
+                    sessionKey={props.props?.sessionKey ?? ""}
+                    agentId={props.props?.currentAgentId ?? "main"}
                     processes={processes}
                     presented={active()}
                     expanded={sectionExpanded("processes")}

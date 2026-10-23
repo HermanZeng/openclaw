@@ -32,6 +32,17 @@ thread's synchronous fsync stacks, elapsed time, and timestamp. It requires a
 generated team-shape fixture. Separate startup records from the measured workload;
 the probe does not observe worker fsyncs or kernel-internal SQLite synchronization.
 
+For attachment attribution, set `OPENCLAW_PERF_MEDIA_IO=1` to emit `MEDIA_IO_PROBE`
+records for inbound media filesystem calls, including async open, write, sync,
+metadata reads, and close. Records contain relative paths, call stacks, and
+elapsed time, never file contents. Set `OPENCLAW_PERF_FSYNC_DELAY_MS=50` to add the
+same synthetic storage delay to inbound file and directory syncs: synchronous
+fsync blocks the main thread, while `FileHandle.sync` waits asynchronously.
+`FSYNC_PROBE` records mark blocking time; `MEDIA_IO_PROBE` records mark async
+elapsed time. Both include the injected delay. Use identical settings on both
+sides of a swapped pair; omit both variables for the original synchronous probe.
+The injection does not cover worker calls or synchronization inside native code.
+
 `fsync-scratch-measure.ts` exercises the real container environment-file and
 playback cache owners, verifying their output bytes. It injects a fixed delay into
 each main-thread `fsyncSync` call to model slow storage without a loop device or
@@ -2989,6 +3000,11 @@ For acknowledgement latency, `chat.send` also accepts `--diagnostics` without
 allocation or CPU profiling. `--runs 8 --rounds 125` records 1,000 measured ACKs
 after one unmeasured warmup cohort:
 
+Generate these fixtures with `--settled-runs` to retain the requested run inventory
+without replaying synthetic interrupted runs or pending deliveries at startup.
+The default recovery workload can exhaust worker capacity before the Gateway is
+ready; that is a failed setup, not an attachment-latency sample.
+
 ```sh
 node --import ./scripts/tsx.mjs scripts/perf/transcript-broadcast-measure.ts \
   --state-dir /path/to/team-shape --entry src/entry.ts --scenario chat.send \
@@ -3007,11 +3023,32 @@ post-ACK startup diagnostics. Per-round tails with eight samples are context onl
 use the pooled observations for p99. Run separate matching fixtures concurrently
 under the shared guard and one quiet-slot lock, then swap interleaved CPU sets.
 Apply the campaign's sample-count and paired absolute/relative-delta rules.
+For `--diagnostics` passes without heap or CPU profiling, `wholeChatDiagnostics`
+records one event-loop histogram across the measured cohorts; use its count and
+p99 rather than averaging per-cohort percentiles. Its `gc` field records pause
+durations. With `--trace-gc`, `wholeChatGc` also records the whole measured window's
+collection counts and promotion, including the intervals between cohorts.
+Profiled passes omit these acceptance metrics because stopping heap sampling
+forces GC and profile serialization adds main-thread stalls.
 Add `--chat-attachment-kib 4` or `--chat-attachment-kib 256` for separate small
 and larger text-attachment runs. Each turn sends a deterministic
 `synthetic-attachment.txt` with MIME type `text/plain` and origin `paste` through
 the real attachment path. The report records `chatAttachmentBytes`; zero means
 no attachment. Keep the attachment size identical within each comparison pair.
+
+Add `--chat-active-hold-ms 1500 --runs 8 --rounds 63` to measure 1,008 ACKs for
+input arriving during active turns. At the model-arrival barrier, each session
+receives an explicit `/followup` input. After its queued notice arrives, the
+driver sends two steering inputs on the same session and WebSocket connection.
+The provider releases its held responses after the configured interval,
+independently of ACK arrival, so a blocked baseline records the delay.
+`activeChatSendAck` pools only the two steering ACKs per session and reports
+count, p50/p95/p99/max, individual latencies, and `acknowledgedBeforeRelease`.
+The existing `chatSendAck` includes initial, predecessor, and steering sends.
+All extra inputs must settle successfully, leave pending custody, and appear
+exactly once in user history with the matching input identity and text;
+`consumedExactlyOnce` counts those three inputs per session. Keep the hold
+interval identical across paired runs.
 
 For entry-patch transfer measurements, prepare separate matching small fixtures
 sequentially, then run the existing driver against the source Gateway:
