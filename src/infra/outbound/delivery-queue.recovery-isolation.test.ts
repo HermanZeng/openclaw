@@ -23,8 +23,8 @@ import {
 vi.mock("./channel-resolution.js", () => ({
   resolveOutboundChannelMessageAdapter: async () => undefined,
 }));
-// mock-isolation: Pacing has separate clock coverage; this worker-backed test has no timer waits.
 const sleepMock = vi.hoisted(() => vi.fn<(ms: number) => Promise<void>>());
+// mock-isolation: Pacing has separate clock coverage; this worker-backed test has no timer waits.
 vi.mock("../../utils/sleep.js", () => ({ sleep: sleepMock }));
 
 describe("outbound recovery account isolation", () => {

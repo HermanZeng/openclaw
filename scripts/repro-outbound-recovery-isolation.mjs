@@ -2,7 +2,7 @@
 // Usage: node --import <repo>/scripts/tsx.mjs <script> --repo <checkout>
 //   --mode baseline|candidate --output-dir <owned-proof-parent>
 import assert from "node:assert/strict";
-import { spawn, execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import { once } from "node:events";
 import fs from "node:fs/promises";
@@ -11,7 +11,9 @@ import net from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { pathToFileURL } from "node:url";
+import { finalizeManagedChild, loadManagedChildSpawner } from "./lib/managed-child-process.mts";
 
+const spawnChild = await loadManagedChildSpawner();
 const args = process.argv.slice(2);
 const option = (name) => {
   const index = args.indexOf(name);
@@ -26,7 +28,6 @@ await fs.mkdir(outputDir, { recursive: true });
 const root = await fs.mkdtemp(path.join(outputDir, `cross-plugin-${mode}-`));
 const stateDir = path.join(root, "state");
 const configPath = path.join(root, "openclaw.json");
-const deadline = Date.now() + 240_000;
 const marker = `RECOVERYPROOF${crypto.randomUUID().replaceAll("-", "").toUpperCase()}`;
 const text = {
   t1: `${marker}T1`,
@@ -80,6 +81,7 @@ let telegramPort,
 const updates = [],
   children = [],
   ownedProcesses = new Set(),
+  processLifecycles = new WeakMap(),
   activeRequests = new Set();
 const stage = (name) => {
   evidence.stages.push({ name, at: Date.now() });
@@ -105,7 +107,8 @@ for (const name of Object.keys(env)) {
   }
 }
 async function until(label, predicate, timeoutMs = 45_000) {
-  const end = Math.min(deadline, Date.now() + timeoutMs);
+  // Teardown must still verify closure after the workload's deadline expires.
+  const end = cleaningUp ? Date.now() + timeoutMs : Math.min(deadline, Date.now() + timeoutMs);
   while (Date.now() < end) {
     if (fatalFixtureError && !cleaningUp) {
       throw fatalFixtureError;
@@ -136,7 +139,7 @@ async function unusedPort() {
 }
 function launch(cliArgs) {
   cancellation.signal.throwIfAborted();
-  const child = spawn(process.execPath, ["openclaw.mjs", ...cliArgs], {
+  const child = spawnChild(process.execPath, ["openclaw.mjs", ...cliArgs], {
     cwd: repo,
     env,
     detached: process.platform !== "win32",
@@ -145,23 +148,35 @@ function launch(cliArgs) {
   });
   ownedProcesses.add(child);
   children.push(child.pid);
-  child.once("exit", () => ownedProcesses.delete(child));
+  const lifecycle = { closed: false, finalization: undefined };
+  processLifecycles.set(child, lifecycle);
+  child.once("close", () => (lifecycle.closed = true));
   return child;
 }
-async function terminate(child) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) {
+async function terminate(child, { crash = false } = {}) {
+  if (!child) {
     return;
   }
-  const exited = once(child, "exit");
-  if (process.platform === "win32") {
-    execFileSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
-    });
-  } else {
-    process.kill(-child.pid, "SIGKILL");
-  }
-  await exited;
+  const lifecycle = processLifecycles.get(child);
+  assert.ok(lifecycle, "Only proof-owned child processes may be stopped");
+  // Join one teardown even when validation's timeout races its finally block.
+  // A leader exit alone does not retire ownership of its descendants or pipes.
+  lifecycle.finalization ??= finalizeManagedChild(
+    child,
+    crash
+      ? "SIGKILL"
+      : child.exitCode !== null || child.signalCode !== null
+        ? undefined
+        : "SIGTERM",
+    {
+      platform: process.platform,
+      runTaskkill: spawnSync,
+      forceKillDelayMs: 5000,
+      drainTimeoutMs: 5000,
+      isChildClosed: () => lifecycle.closed,
+    },
+  ).then(() => ownedProcesses.delete(child));
+  await lifecycle.finalization;
 }
 async function validateConfig() {
   const child = launch(["config", "validate", "--json"]);
@@ -169,15 +184,13 @@ async function validateConfig() {
   for (const stream of [child.stdout, child.stderr]) {
     stream.on("data", (b) => (output += b));
   }
-  const timeout = setTimeout(() => {
-    void terminate(child);
-  }, 45_000);
   try {
-    const [code, signal] = await once(child, "exit", { signal: cancellation.signal });
+    const [code, signal] = await once(child, "exit", {
+      signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(45_000)]),
+    });
     evidence.configValidation = { code, signal, output };
     assert.equal(code, 0, output);
   } finally {
-    clearTimeout(timeout);
     await terminate(child);
   }
 }
@@ -345,12 +358,12 @@ async function openQaProxy() {
   });
   qaPort = await bind(qaProxy, qaPort);
 }
-async function stopGateway() {
+async function stopGateway(options) {
   await client?.stopAndWait({ timeoutMs: 1000 });
   client = null;
   const stopped = gateway;
   gateway = null;
-  await terminate(stopped);
+  await terminate(stopped, options);
   if (gatewayPort !== undefined) {
     await until(
       "owned Gateway listener closed",
@@ -439,6 +452,8 @@ async function startGateway() {
   });
 }
 const busApi = await moduleAt("extensions/qa-lab/api.ts");
+// Module loading is preparation; retain the bounded budget for the actual workload.
+const deadline = Date.now() + 240_000;
 let gatewayPort;
 const stampPaths = ["dist/.buildstamp", "dist/.runtime-postbuildstamp"];
 const artifactPaths = [...stampPaths, "dist/entry.js"];
@@ -582,7 +597,9 @@ try {
     assert.equal(result.status, "queued", `Expected native pre-connect failure to retain ${id}`);
     evidence.initialSends.push({ id, result });
   }
-  await stopGateway();
+  // This one transition deliberately bypasses graceful shutdown to test durable crash recovery.
+  evidence.crashInjection = { pid: gateway.pid, signal: "SIGKILL" };
+  await stopGateway({ crash: true });
   const before = await offlineRows();
   evidence.before = before;
   assert.equal(before.length, 3);
@@ -661,10 +678,8 @@ try {
     "positive recovery logs for original queue IDs",
     () =>
       before.every((row) => {
-        // oxlint-disable-next-line unicorn/prefer-set-has -- Log substring matching needs a string; a Set would contain individual characters.
-        const log = capture.slice(recoveryLogStart);
         return [`drained delivery ${row.id}`, `Recovered delivery ${row.id}`].some((message) =>
-          log.includes(message),
+          capture.includes(message, recoveryLogStart),
         );
       }),
     8000,
