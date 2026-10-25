@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { controlNextRecoverySleep } from "../../../test/helpers/infra/delivery-recovery.js";
-import { awaitGateBeforeSettlement } from "../../../test/helpers/promise.js";
+import { awaitGateBeforeSettlement, withinTest } from "../../../test/helpers/promise.js";
 import type { ChannelPlugin } from "../../channels/plugins/types.plugin.js";
 import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
 import { createDeferredCore } from "../../shared/deferred.js";
@@ -101,7 +101,9 @@ describe("outbound recovery account isolation", () => {
     }
   });
 
-  it("shares the configured default account lane across startup and reconnect drains", async () => {
+  it("shares the configured default account lane across startup and reconnect drains", async ({
+    signal,
+  }) => {
     const plugin: ChannelPlugin = {
       ...createChannelTestPluginBase({
         id: "recovery-proof",
@@ -135,15 +137,21 @@ describe("outbound recovery account isolation", () => {
     const options = { cfg: {}, stateDir: tmpDir(), log: createRecoveryLog(), deliver };
     const startup = recoverPendingDeliveries(options);
     try {
-      await awaitGateBeforeSettlement(firstStarted.promise, startup, "first send did not start");
+      await withinTest(
+        awaitGateBeforeSettlement(firstStarted.promise, startup, "first send did not start"),
+        signal,
+      );
       const nextId = await enqueue("next", "a");
       await enqueue("independent", "b");
-      await drainPendingDeliveriesCore({
-        ...options,
-        drainKey: "plugin:reconnect",
-        logLabel: "reconnect",
-        selectEntry: () => ({ match: true }),
-      });
+      await withinTest(
+        drainPendingDeliveriesCore({
+          ...options,
+          drainKey: "plugin:reconnect",
+          logLabel: "reconnect",
+          selectEntry: () => ({ match: true }),
+        }),
+        signal,
+      );
       expect([...sent]).toEqual(["independent"]);
       const pending = await loadUnfinishedDeliveries(tmpDir());
       expect(pending.map((entry) => entry.id)).toEqual([firstId, nextId]);

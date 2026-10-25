@@ -96,7 +96,7 @@ import {
 } from "./outbound-audit.js";
 import { acceptedPreparedOutboundEntries, preparedOutboundPayloads } from "./prepared-batch.js";
 
-export { withActiveDeliveryClaim } from "./delivery-queue-recovery-coordinator.js";
+export const withActiveDeliveryClaim = recoveryCoordinator.withClaim;
 
 export type DeliverFn = (params: DeliverOutboundPayloadsParams) => Promise<unknown>;
 

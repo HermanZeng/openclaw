@@ -370,16 +370,17 @@ export function createDeliveryRecoveryCoordinator<T extends DeliveryRecoveryEntr
       const result = await runTasksWithConcurrency({
         limit: scheduling.maxConcurrentLanes,
         errorMode: "stop",
-        tasks: Array.from(lanes, ([key, entries]) => async () => {
-          try {
-            // Startup and reconnect share the cap and domain claim. A competing
-            // scan leaves busy domains untouched for the owner's next retry pass.
-            await withLaneClaim(key, () => scanEntries(entries));
-          } catch (error) {
-            stopped = true;
-            throw error;
-          }
-        }),
+        onTaskError: () => {
+          stopped = true;
+        },
+        // Startup and reconnect share the cap and domain claim. A competing
+        // scan leaves busy domains untouched for the owner's next retry pass.
+        tasks: Array.from(
+          lanes,
+          ([key, entries]) =>
+            () =>
+              withLaneClaim(key, () => scanEntries(entries)),
+        ),
       });
       // Join every admitted send before surfacing an error to lifecycle teardown.
       if (result.hasError) {

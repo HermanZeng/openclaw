@@ -1,7 +1,11 @@
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { controlNextRecoverySleep } from "../../../test/helpers/infra/delivery-recovery.js";
-import { awaitGateBeforeSettlement, createDeferred } from "../../../test/helpers/promise.js";
+import {
+  awaitGateBeforeSettlement,
+  createDeferred,
+  withinTest,
+} from "../../../test/helpers/promise.js";
 import { drainPendingDeliveries as drainPluginPendingDeliveries } from "../../plugin-sdk/delivery-queue-runtime.js";
 import {
   type DeliverFn,
@@ -246,7 +250,9 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
     expect(deliveryTimes).toEqual([startedAt, startedAt + RECOVERY_REPLAY_SPACING_MS]);
   });
 
-  it("does not re-deliver an independent account recovered while another account is blocked", async () => {
+  it("does not re-deliver an independent account recovered while another account is blocked", async ({
+    signal,
+  }) => {
     const startupLog = createRecoveryLog();
     const blocker = blockDelivery(({ to }) => to === "+1000");
     const blockedId = await enqueue(
@@ -266,10 +272,13 @@ describe("drainPendingDeliveriesCore for reconnect", () => {
     });
     const startupRecovery = recover(startupLog);
     try {
-      await awaitGateBeforeSettlement(
-        Promise.all([blocker.entered, healthyRecovered.promise]),
-        startupRecovery,
-        "Independent account must settle before blocked startup recovery",
+      await withinTest(
+        awaitGateBeforeSettlement(
+          Promise.all([blocker.entered, healthyRecovered.promise]),
+          startupRecovery,
+          "Independent account must settle before blocked startup recovery",
+        ),
+        signal,
       );
       expect((await pending()).map((entry) => entry.id)).toEqual([blockedId]);
       await drain();
