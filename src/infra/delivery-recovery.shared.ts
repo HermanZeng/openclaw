@@ -45,7 +45,7 @@ export type DeliveryRecoveryDrainDecision = {
   bypassBackoff?: boolean;
 };
 
-export type ActiveDeliveryRecoveryClaimResult<T> =
+type ActiveDeliveryRecoveryClaimResult<T> =
   | { status: "claimed"; value: T }
   | { status: "claimed-by-other-owner" };
 
