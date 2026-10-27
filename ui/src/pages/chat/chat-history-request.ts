@@ -4,7 +4,8 @@ import {
 } from "@openclaw/gateway-client/browser";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
 import { sleepWithAbort } from "@openclaw/retry";
-import { GatewayRequestError, type GatewayBrowserClient } from "../../api/gateway.ts";
+import { GatewayRequestError } from "../../api/gateway-connect-errors.ts";
+import type { GatewayBrowserClient } from "../../api/gateway.ts";
 import type { GatewaySessionRow } from "../../api/types.ts";
 import { t } from "../../i18n/index.ts";
 import { visibleChatHistoryMessages } from "../../lib/chat/message-visibility.ts";
@@ -17,6 +18,10 @@ import {
   resolveUiSelectedSessionAgentId,
 } from "../../lib/sessions/session-key.ts";
 import { subscribeToSharedRequest } from "../../lib/shared-request-subscription.ts";
+import {
+  chatHistoryRequestParams,
+  CHAT_HISTORY_TOOL_RESULT_MAX_CHARS,
+} from "./chat-history-request-params.ts";
 import { CHAT_HISTORY_RETRY_WINDOW_MS, isRetryableChatReadError } from "./chat-history-retry.ts";
 import {
   type ChatHistoryResult,
@@ -42,44 +47,10 @@ import {
   projectChatTranscriptMetadata,
   type ChatSessionSnapshot,
 } from "./session-message-cache.ts";
-
-export const CHAT_HISTORY_REQUEST_LIMIT = 80;
-const CHAT_HISTORY_REQUEST_MAX_BYTES = 256 * 1024;
-const CHAT_HISTORY_TOOL_RESULT_MAX_CHARS = 2_000;
-
-export function chatHistoryRequestParams(
-  method: "chat.history" | "chat.startup",
-  sessionKey: string,
-  requestAgentId: string | undefined,
-  cursor?: string,
-  inputRunIds: string[] = [],
-  historyState?: ChatHistoryState,
-) {
-  const knownState =
-    cursor !== undefined && historyState
-      ? {
-          ...(historyState.pendingInputs
-            ? { pendingInputs: historyState.stateRevision.pendingInputs }
-            : {}),
-          ...(historyState.sessionInfo
-            ? { sessionInfo: historyState.stateRevision.sessionInfo }
-            : {}),
-          ...(method === "chat.startup" && historyState.commands
-            ? { commands: historyState.stateRevision.commands }
-            : {}),
-        }
-      : {};
-  return {
-    sessionKey,
-    toolResultMaxChars: CHAT_HISTORY_TOOL_RESULT_MAX_CHARS,
-    knownState,
-    ...(requestAgentId ? { agentId: requestAgentId } : {}),
-    ...(cursor !== undefined ? { cursor } : {}),
-    limit: CHAT_HISTORY_REQUEST_LIMIT,
-    maxBytes: CHAT_HISTORY_REQUEST_MAX_BYTES,
-    ...(inputRunIds.length ? { inputRunIds } : {}),
-  };
-}
+export {
+  CHAT_HISTORY_REQUEST_LIMIT,
+  chatHistoryRequestParams,
+} from "./chat-history-request-params.ts";
 
 export function captureChatHistoryRun(
   state: ChatState,

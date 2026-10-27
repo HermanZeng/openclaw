@@ -22,6 +22,7 @@ import {
   createOpenClawStateLeaseError as leaseError,
   createOpenClawStateLeaseAbortError as abortError,
   createOpenClawStateLeaseLostError,
+  resolveOpenClawStateLeaseOperationError,
   OpenClawStateLeaseError,
 } from "./openclaw-state-lease-error.js";
 import { leaseHeartbeatState } from "./openclaw-state-lease-heartbeat-shared.js";
@@ -37,6 +38,7 @@ import {
 } from "./openclaw-state-lease-options.js";
 import { registerProcessExitLeaseCleanup } from "./openclaw-state-lease-process-exit.js";
 import {
+  createOpenClawStateLeaseLostErrorFromDatabase,
   prepareLeaseDatabase,
   resolveLeaseDatabasePath,
   renewOpenClawStateLease as renew,
@@ -106,11 +108,12 @@ async function runStateLeaseOwnerInScope<T>(
   maintenance: OpenClawDatabaseMaintenanceScope | undefined,
 ): Promise<T> {
   const validated = validateOpenClawStateLeaseOptions(invocation.options);
-  const owner = randomUUID();
+  const renewalTimer: { dueAt?: number; lateByMs: number } = { lateByMs: 0 };
   const identity: LeaseIdentity = {
     scope: validated.scope,
     key: validated.key,
-    owner,
+    owner: randomUUID(),
+    renewalTimer,
     leaseLabel: validated.leaseLabel,
   };
   let closed = false;
@@ -153,7 +156,9 @@ async function runStateLeaseOwnerInScope<T>(
       leaseLost.abort(
         cause instanceof OpenClawStateLeaseError
           ? cause
-          : createOpenClawStateLeaseLostError(validated, cause),
+          : invocation.kind === "native" && phase === "owned" && !closed
+            ? createOpenClawStateLeaseLostErrorFromDatabase(identity, validated.database, cause)
+            : createOpenClawStateLeaseLostError(validated, cause),
       );
     }
   };
@@ -188,9 +193,7 @@ async function runStateLeaseOwnerInScope<T>(
     void workerHeartbeat?.stop().catch(abortLost);
     void startingHeartbeat?.stop().catch(abortLost);
   }
-  function stopTimer() {
-    void timerHeartbeat?.stopRenewal();
-  }
+  const stopTimer = () => void timerHeartbeat?.stopRenewal();
   let unregisterProcessExitCleanup: (() => void) | undefined;
   if (workerStorage) {
     workerOperations = createOpenClawStateLeaseWorkerOwner({
@@ -427,6 +430,9 @@ async function runStateLeaseOwnerInScope<T>(
       }
     };
     const renewFromTimer = () => {
+      const now = Date.now();
+      renewalTimer.lateByMs = Math.max(0, now - (renewalTimer.dueAt ?? now));
+      renewalTimer.dueAt = now + heartbeatMs;
       if (!runTimerRenewal) {
         return;
       }
@@ -445,7 +451,6 @@ async function runStateLeaseOwnerInScope<T>(
 
     const assertOperationOwned = (transaction?: EngineConnection) => {
       assertActive();
-      const params = { ...identity, database: validated.database, transaction };
       if (workerHeartbeat) {
         try {
           workerHeartbeat.assertRunning();
@@ -455,7 +460,7 @@ async function runStateLeaseOwnerInScope<T>(
         }
       }
       // Durable ownership authorizes the effect; worker liveness adds no authority.
-      verifyLeaseOwnership(params);
+      verifyLeaseOwnership({ ...identity, database: validated.database, transaction });
     };
     const renewForHandoff = () => {
       const params = { ...identity, database: validated.database };
@@ -580,6 +585,7 @@ async function runStateLeaseOwnerInScope<T>(
       } else {
         scheduleExpiry();
         runTimerRenewal = AsyncLocalStorage.snapshot();
+        renewalTimer.dueAt = Date.now() + heartbeatMs;
         heartbeat = setInterval(renewFromTimer, heartbeatMs);
         heartbeat.unref?.();
       }
@@ -600,6 +606,7 @@ async function runStateLeaseOwnerInScope<T>(
         await verify();
         const lease: OpenClawStateAsyncLeaseContext = {
           signal: operationSignal,
+          assertCurrent: execution.assertCurrent,
           assertOwned: async () => execution.run(() => verify()),
           renew: async () => execution.run(() => verify(true)),
         };
@@ -695,15 +702,7 @@ async function runStateLeaseOwnerInScope<T>(
           ? abortError(validated.signal, "operation", validated.leaseLabel)
           : undefined;
       workerOperations?.rethrowIfUncertain(failure, authorityError);
-      if (authorityError instanceof Error) {
-        if (failure !== error && authorityError instanceof OpenClawStateLeaseError) {
-          // Nested owners may observe the same failed operation differently. Keep
-          // the caller's authority code and all operation/drainage causes.
-          throw leaseError(authorityError.code, authorityError.message, failure);
-        }
-        throw authorityError;
-      }
-      throw failure;
+      throw resolveOpenClawStateLeaseOperationError(error, failure, authorityError);
     }
     if (workerStorage) {
       assertActive();

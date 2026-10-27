@@ -15,7 +15,10 @@ import { projectSessionDeliveryFields } from "../utils/delivery-context.shared.j
 import { readSessionRowFacts } from "./server-methods/session-placement-read-projection.js";
 import { readPreparedGatewayModelMetadata } from "./server-model-catalog-view.js";
 import { materializeSessionRowIfChanged } from "./session-row-materialization.js";
-import { readSessionRowModelFacts } from "./session-row-model-facts.js";
+import {
+  mayMatchSessionRowModelSearch,
+  readSessionRowModelFacts,
+} from "./session-row-model-facts.js";
 import { SessionRowFactsPending } from "./session-row-prepared-read.js";
 import { isColdArchivedSessionRow } from "./session-row-projection-archive.js";
 import { createSessionRowCapabilityReader } from "./session-row-projection-identities.js";
@@ -33,6 +36,7 @@ import { parseGroupKey } from "./session-utils-store.js";
 
 /** Bind live projection state to the same prepared or resident source-read boundary. */
 export function createSessionRowModelFactsReader(params: {
+  rows: () => Iterable<records.Row>;
   lookup: (query: records.Lookup) => records.Row | undefined;
   dirty: ReadonlySet<string>;
   readSourceEntry: (row: records.Row, key: string, prepared: boolean) => records.Row["storedEntry"];
@@ -41,7 +45,7 @@ export function createSessionRowModelFactsReader(params: {
     "cfg" | "modelCatalog" | "rowContext"
   >;
 }) {
-  return (query: records.Lookup, metadataPrepared = false) => {
+  const read = (query: records.Lookup, metadataPrepared = false) => {
     const row = params.lookup(query);
     if (!row?.entry) {
       throw new Error("Session changed while preparing search facts; retry the request");
@@ -62,6 +66,11 @@ export function createSessionRowModelFactsReader(params: {
         readSourceEntry: (key) => params.readSourceEntry(row, key, metadataPrepared),
       },
     });
+  };
+  return {
+    modelFacts: read,
+    modelSearchMayMatch: (search: string) =>
+      mayMatchSessionRowModelSearch({ ...params.state(), rows: params.rows() }, search),
   };
 }
 
@@ -282,7 +291,9 @@ export function readResidentSessionRow(
     throw new Error("Session rows require prepared database facts");
   }
   const { inputs, presentation } = readSessionRowInputs({
-    ...row,
+    key: row.key,
+    agentId: row.agentId,
+    entry: row.entry,
     cfg,
     preparedAcpMeta: databaseFacts.acpMeta,
     preparedRuntimeOwnership: databaseFacts.runtimeOwnership,
@@ -516,15 +527,12 @@ export function createSessionRowLookup(owner: {
     },
     capture(query: records.Lookup) {
       const row = owner.lookup(query);
+      // Published entries need no acquisition state; pending categories keep their identity.
+      if (!row || row.entry || row.storedEntry === undefined || row.unresolvedDatabaseFacts) {
+        return row;
+      }
       const state = owner.state();
-      // Capture retains published identity while category facts wait for reconciliation.
-      return row &&
-        row.unresolvedDatabaseFacts !== "category" &&
-        !state.topologyDirty &&
-        !row.entry &&
-        row.storedEntry !== undefined &&
-        row.unresolvedDatabaseFacts !== true &&
-        state.registryPrepared
+      return !state.topologyDirty && state.registryPrepared
         ? (owner.acquireEntry(row, row.storedEntry) ?? row)
         : row;
     },
@@ -608,37 +616,33 @@ function findSessionRowById(
 
 export function lookupSessionRow(
   query: records.Lookup,
-  owner: {
-    assertCurrent: () => void;
-    cfg: records.Inputs["cfg"];
-    rows: ReadonlyMap<string, records.Row>;
-    byKey: ReadonlyMap<string, ReadonlySet<string>>;
-    scope: ReturnType<typeof prepareSessionRowScopes> | undefined;
-    stores: ReadonlyMap<string, records.SessionRowStore>;
-  },
+  cfg: records.Inputs["cfg"],
+  rows: ReadonlyMap<string, records.Row>,
+  byKey: ReadonlyMap<string, ReadonlySet<string>>,
+  scope: ReturnType<typeof prepareSessionRowScopes> | undefined,
+  stores: ReadonlyMap<string, records.SessionRowStore>,
+  assertCurrent: () => void,
 ) {
   const { agentId } = query;
   const paths = query.storePath
-    ? (owner.scope?.physicalPaths(query.storePath, agentId) ?? [query.storePath])
+    ? (scope?.physicalPaths(query.storePath, agentId) ?? [query.storePath])
     : undefined;
   let key = query.key;
   do {
-    const candidates = owner.byKey.get(records.logicalSessionRowIdentity(agentId, key));
+    const candidates = byKey.get(records.logicalSessionRowIdentity(agentId, key));
     if (candidates?.size === 1) {
-      const row = owner.rows.get(candidates.values().next().value!);
+      const row = rows.get(candidates.values().next().value!);
       if (
         row &&
-        (paths
-          ? paths.includes(row.storeTarget.storePath)
-          : owner.stores.has(row.storeTarget.storePath))
+        (paths ? paths.includes(row.storeTarget.storePath) : stores.has(row.storeTarget.storePath))
       ) {
         return row;
       }
     } else if (candidates) {
       // Physical duplicates (including sentinels) retain the topology's store precedence.
-      for (const storePath of paths ?? owner.stores.keys()) {
+      for (const storePath of paths ?? stores.keys()) {
         for (const id of candidates) {
-          const row = owner.rows.get(id);
+          const row = rows.get(id);
           if (row?.storeTarget.storePath === storePath) {
             return row;
           }
@@ -649,14 +653,14 @@ export function lookupSessionRow(
       break;
     }
     key = resolveStoredSessionKeyForAgentStore({
-      cfg: owner.cfg,
+      cfg,
       sessionKey: key,
       agentId,
     });
     if (isIncognitoSessionKey(key)) {
       return readIncognitoSessionRow({
-        assertCurrent: owner.assertCurrent,
-        cfg: owner.cfg,
+        assertCurrent,
+        cfg,
         key,
         agentId,
         storePath: query.storePath,

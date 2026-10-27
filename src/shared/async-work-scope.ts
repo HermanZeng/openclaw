@@ -56,15 +56,20 @@ export class AsyncWorkScope {
     }
     const ancestry = currentWorkScopeAncestry.getStore();
     const parent = owner ? (ancestry?.scope === owner ? ancestry : { scope: owner }) : undefined;
-    return currentWorkScopeAncestry.run({ scope: this, parent }, () =>
-      currentWorkScope.run(this, run),
-    );
+    return runWithAsyncStore(currentWorkScope, this, () => {
+      currentWorkScopeAncestry.enterWith({ scope: this, parent });
+      return run();
+    });
   }
 
   /** Enters synchronous work without inspecting or assimilating its return value. */
   run<T>(run: () => T): T {
     if (this.phase === "closed") {
       throw new AsyncWorkScopeClosedError();
+    }
+    // Existing work already makes reentrant drain yield until this synchronous call returns.
+    if (this.pending.size > 0) {
+      return this.enter(run);
     }
     // Synchronous work is removed in finally and needs no promise cleanup reactions.
     const operation = createDeferredCore();
