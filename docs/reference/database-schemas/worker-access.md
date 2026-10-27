@@ -597,7 +597,7 @@ that command; live policy and revocation checks still run at every admission.
 Plain transcript append and bookkeeping patch receipts use the same command-local
 reference when the entry is unchanged and initialization does not also expose it. Main restores the
 entry by reference to its deeply frozen replica preimage, without cloning it.
-Bookkeeping patches that change the entry send changed fields and removed keys
+Bookkeeping patches and plain appends that change the entry send changed fields and removed keys
 against that same token; the host rebuilds the outer entry while reusing unchanged
 frozen fields. Matching metadata publication postimages reuse that reconstructed
 entry instead of transferring a second copy. Settlement, publication, and commit
@@ -650,6 +650,12 @@ before storing custody. This removes a read round trip, not the command's hydrat
 or per-session ordering.
 Entry receipts follow physical database generations and scoped revisions; they do
 not require the publishing SQLite connection to match the actor worker's connection.
+
+Fresh pending input refreshes profile policy before source preparation, then reads
+session sharing facts once immediately before its message-approval callback.
+Replays still authorize before returning recorded input. The writer checks fresh
+transaction facts again before commit, and acknowledgment still waits for durable
+custody; removing the preliminary sharing read does not reorder the writer FIFO.
 
 Session memory indexing is background work. It batches transcript changes after
 30 seconds without transcript changes or running turns. Pending work keeps its
