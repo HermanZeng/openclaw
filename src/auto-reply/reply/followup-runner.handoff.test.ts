@@ -13,7 +13,6 @@ import {
   retireSessionControllerInput,
 } from "../../sessions/session-controller.mailbox.js";
 import { createReplyOperation } from "../../sessions/session-controller.operation.js";
-import { runAfterReplyOperationClear } from "../../sessions/session-controller.state.js";
 import { createDeferredCore } from "../../shared/deferred.js";
 import { createQueueTestRun } from "./queue.test-helpers.js";
 import { scheduleFollowupDrain } from "./queue/drain.js";
@@ -23,7 +22,7 @@ import type { FollowupRun } from "./queue/types.js";
 import {
   appendCompletedSourceReplyHandoffDirective,
   consumeQueuedReplyCompletionHandoff,
-  publishReplyOperationCompletionHandoff,
+  registerReplyOperationCompletionHandoff,
   recordReplyOperationCompletedSourceReply,
 } from "./reply-completion-handoff.js";
 
@@ -96,14 +95,11 @@ async function finish(
   if (options.delivered) {
     recordReplyOperationCompletedSourceReply(turn.operation, turn.source);
   }
-  runAfterReplyOperationClear(turn.operation, (admissionSessionId) =>
-    publishReplyOperationCompletionHandoff({
-      operation: turn.operation,
-      source: turn.source,
-      queueKey: turn.operation.key,
-      admissionSessionId,
-    }),
-  );
+  registerReplyOperationCompletionHandoff({
+    operation: turn.operation,
+    source: turn.source,
+    queueKey: turn.operation.key,
+  });
   if (!options.retry) {
     completeFollowupRunLifecycle(turn.source, "consumed");
   }
@@ -233,14 +229,11 @@ describe("completed-reply facts through real controller input custody", () => {
           const successor = f.queue("D");
           const successorClaim = claimSessionControllerInput(successor);
           recordReplyOperationCompletedSourceReply(turn.operation, source);
-          runAfterReplyOperationClear(turn.operation, (admissionSessionId) =>
-            publishReplyOperationCompletionHandoff({
-              operation: turn.operation,
-              source,
-              queueKey: f.key,
-              admissionSessionId,
-            }),
-          );
+          registerReplyOperationCompletionHandoff({
+            operation: turn.operation,
+            source,
+            queueKey: f.key,
+          });
           completeFollowupRunLifecycle(source, "consumed");
           turn.operation.complete();
           await turn.operation.ownerSettlement;

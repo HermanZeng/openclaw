@@ -5,6 +5,7 @@ import "./server-start.js";
 import { expect, it } from "vitest";
 import { withinTest } from "../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
+import { getReplyPayloadMetadata } from "../auto-reply/reply-payload.js";
 import { withFullRuntimeReplyConfig } from "../auto-reply/reply/get-reply-fast-path.js";
 import { dispatchReplyWithBufferedBlockDispatcherCore } from "../auto-reply/reply/provider-dispatcher.js";
 import { buildTestCtx } from "../auto-reply/reply/test-ctx.js";
@@ -40,26 +41,23 @@ it(
   "passes one completed-predecessor fragment through queued provider requests and never replays input",
   { timeout: 120_000 },
   async ({ signal }) => {
-    const scenarios = [true, false].map((sourceDelivered) => {
-      const nonce = randomUUID();
-      return {
-        sourceDelivered,
-        sessionKey: "",
-        executionOrder: [] as string[],
-        firstReached: createDeferredCore(),
-        releaseFirst: createDeferredCore(),
-        turns: ["A", "B", "C"].map((label, index) => ({
-          label,
-          id: randomUUID(),
-          prompt: `FRESH_${label}_${nonce}: Answer this current request only.`,
-          reply: `VISIBLE_${label}_${nonce}`,
-          quiet: index === 0 && !sourceDelivered,
-          directiveCount: index === 0 ? 0 : index === 1 ? Number(sourceDelivered) : 1,
-          deferred: createDeferredCore(),
-          providerRequests: [] as string[],
-        })),
-      };
-    });
+    const nonce = randomUUID();
+    const scenario = {
+      sessionKey: "",
+      executionOrder: [] as string[],
+      deliveryCallbackFacts: [] as unknown[],
+      firstReached: createDeferredCore(),
+      releaseFirst: createDeferredCore(),
+      turns: ["A", "B", "C"].map((label, index) => ({
+        label,
+        id: randomUUID(),
+        prompt: `FRESH_${label}_${nonce}: Answer this current request only.`,
+        reply: `VISIBLE_${label}_${nonce}`,
+        directiveCount: index === 0 ? 0 : 1,
+        deferred: createDeferredCore(),
+        providerRequests: [] as string[],
+      })),
+    };
     const failed = createDeferredCore<never>();
     void failed.promise.catch(() => {});
     const wait = <T>(work: Promise<T>) => withinTest(Promise.race([work, failed.promise]), signal);
@@ -75,7 +73,6 @@ it(
       },
       async (state) => {
         let config: OpenClawConfig | undefined;
-        const automaticPayloads: unknown[] = [];
         const fixture = createChatFixture("completed-reply-handoff", {
           configure: (base) => {
             config = withFullRuntimeReplyConfig({
@@ -96,22 +93,12 @@ it(
               const newest = (body.input ?? [])
                 .filter((message) => message.role === "user")
                 .map(messageText)
-                .findLast((text) =>
-                  scenarios.some((scenario) =>
-                    scenario.turns.some((turn) => text.includes(turn.prompt)),
-                  ),
-                );
-              const scenario = scenarios.find((candidate) =>
-                candidate.turns.some((turn) => newest?.includes(turn.prompt)),
-              );
-              const turn = scenario?.turns.find((candidate) => newest?.includes(candidate.prompt));
-              assert(
-                scenario && turn && newest,
-                "the provider must receive the actual current source request",
-              );
+                .findLast((text) => scenario.turns.some((turn) => text.includes(turn.prompt)));
+              const turn = scenario.turns.find((candidate) => newest?.includes(candidate.prompt));
+              assert(turn && newest, "the provider must receive the actual current source request");
               turn.providerRequests.push(serialized);
               scenario.executionOrder.push(turn.label);
-              expect(turn.providerRequests).toHaveLength(1);
+              expect(turn.providerRequests, `turn=${turn.label}`).toHaveLength(1);
               expect(newest).toContain(turn.prompt);
               // This custom Responses fixture uses transient carrier replay. Append-only
               // providers must retain their historical carriers and need separately scoped counts.
@@ -119,9 +106,6 @@ it(
               if (turn.label === "A") {
                 scenario.firstReached.resolve();
                 await scenario.releaseFirst.promise;
-              }
-              if (turn.quiet) {
-                return "NO_REPLY";
               }
               // The real message tool and host delivery owner must establish completion.
               // A synthetic completedSourceDelivery result would bypass the defect.
@@ -138,20 +122,18 @@ it(
           },
         });
         const queue = createTestIngressQueue(state.stateDir);
+        const drainShutdown = new AbortController();
         const createDrain = () =>
-          createChannelIngressDrain({
-            queue,
-            // Several accepted transport messages may wait in the one session mailbox.
-            deferredLaneOccupancy: "release",
-            dispatchClaimedEvent: async (event, lifecycle) => {
-              const scenario = scenarios.find((candidate) =>
-                candidate.turns.some((turn) => turn.id === event.id),
-              );
-              const turn = scenario?.turns.find((candidate) => candidate.id === event.id);
-              assert(config && scenario && turn);
-              const result = await dispatchReplyWithBufferedBlockDispatcherCore({
-                cfg: config,
-                ctx: buildTestCtx({
+          createChannelIngressDrain(
+            {
+              queue,
+              abortSignal: drainShutdown.signal,
+              // Several accepted transport messages may wait in the one session mailbox.
+              deferredLaneOccupancy: "release",
+              dispatchClaimedEvent: async (event, lifecycle) => {
+                const turn = scenario.turns.find((candidate) => candidate.id === event.id);
+                assert(config && turn);
+                const context = buildTestCtx({
                   AgentId: "main",
                   Provider: "webchat",
                   Surface: "webchat",
@@ -164,97 +146,130 @@ it(
                   Body: event.payload.text,
                   RawBody: event.payload.text,
                   CommandBody: event.payload.text,
+                  CommandSource: undefined,
                   CommandAuthorized: true,
                   ChatType: "direct",
-                  InboundEventKind: turn.quiet ? "room_event" : "user_request",
-                }),
-                dispatcherOptions: {
-                  deliver: async (payload) => {
-                    automaticPayloads.push(payload);
+                  InboundEventKind: "user_request",
+                });
+                expect(context.CommandTurn.kind).toBe("normal");
+                const result = await dispatchReplyWithBufferedBlockDispatcherCore({
+                  cfg: config,
+                  ctx: context,
+                  dispatcherOptions: {
+                    deliver: async (payload, info) => {
+                      const metadata = getReplyPayloadMetadata(payload);
+                      scenario.deliveryCallbackFacts.push({
+                        kind: info.kind,
+                        text: payload.text,
+                        replyToId: payload.replyToId,
+                        sourceReplyFinal: metadata?.sourceReplyFinal,
+                        deliverDespiteSourceReplySuppression:
+                          metadata?.deliverDespiteSourceReplySuppression,
+                        sourceReplyTranscriptMirror: metadata?.sourceReplyTranscriptMirror
+                          ? {
+                              sessionKey: metadata.sourceReplyTranscriptMirror.sessionKey,
+                              transcriptOwner: metadata.sourceReplyTranscriptMirror.transcriptOwner,
+                            }
+                          : undefined,
+                      });
+                    },
                   },
-                },
-                replyOptions: {
-                  ...bindIngressLifecycleToReplyOptions(lifecycle),
-                  sourceReplyDeliveryMode: "message_tool_only",
-                },
-              });
-              if (result.deferredToActiveRun) {
-                expect(result.deferredToActiveRun).toBe("followup");
-                turn.deferred.resolve();
-                return { kind: "deferred" };
-              }
-              return { kind: "completed" };
+                  replyOptions: {
+                    ...bindIngressLifecycleToReplyOptions({
+                      ...lifecycle,
+                      onDeferred: () => {
+                        lifecycle.onDeferred();
+                        turn.deferred.resolve();
+                      },
+                    }),
+                    sourceReplyDeliveryMode: "message_tool_only",
+                  },
+                }).catch((error: unknown) => {
+                  failed.reject(error);
+                  throw error;
+                });
+                if (result.deferredToActiveRun) {
+                  expect(result.deferredToActiveRun).toBe("followup");
+                  return { kind: "deferred" };
+                }
+                return { kind: "completed" };
+              },
             },
-          });
+            true,
+          );
         let drain: ReturnType<typeof createDrain> | undefined;
         await runQaGatewayFixture(
           async () => {
             await fixture.start();
             const activeDrain = createDrain();
             drain = activeDrain;
-            for (const scenario of scenarios) {
-              const created = await fixture.client.request<{ key: string }>("sessions.create", {
-                agentId: "main",
-                label: "Queued source handoff",
-              });
-              scenario.sessionKey = created.key;
-              const first = scenario.turns[0]!;
-              await queue.enqueue(
-                first.id,
-                { text: first.prompt },
-                { laneKey: scenario.sessionKey },
-              );
+            const created = await fixture.client.request<{ key: string }>("sessions.create", {
+              agentId: "main",
+              label: "Queued source handoff",
+            });
+            scenario.sessionKey = created.key;
+            const first = scenario.turns[0]!;
+            await queue.enqueue(first.id, { text: first.prompt }, { laneKey: scenario.sessionKey });
+            expect(await activeDrain.drainOnce()).toEqual({ started: 1 });
+            await wait(scenario.firstReached.promise);
+            for (const turn of scenario.turns.slice(1)) {
+              await queue.enqueue(turn.id, { text: turn.prompt }, { laneKey: scenario.sessionKey });
               expect(await activeDrain.drainOnce()).toEqual({ started: 1 });
-              await wait(scenario.firstReached.promise);
-              for (const turn of scenario.turns.slice(1)) {
-                await queue.enqueue(
-                  turn.id,
-                  { text: turn.prompt },
-                  { laneKey: scenario.sessionKey },
-                );
-                expect(await activeDrain.drainOnce()).toEqual({ started: 1 });
-                await wait(turn.deferred.promise);
-              }
-              expect(scenario.turns.map((turn) => turn.providerRequests.length)).toEqual([1, 0, 0]);
-              scenario.releaseFirst.resolve();
-              await wait(activeDrain.waitForIdle());
-              const drained = await wait(waitForGatewayActiveWork(30_000));
-              expect(drained.drained, JSON.stringify(drained.snapshot.blockers)).toBe(true);
-              expect(await queue.listClaims()).toEqual([]);
-              expect(scenario.turns.map((turn) => turn.providerRequests.length)).toEqual([1, 1, 1]);
-              expect(scenario.executionOrder).toEqual(["A", "B", "C"]);
-              const history = await fixture.client.request<{ messages: Message[] }>(
-                "chat.history",
-                { sessionKey: scenario.sessionKey, limit: 100 },
-              );
-              const visible = history.messages
-                .filter((message) => message.role === "assistant")
-                .map(messageText);
-              const user = history.messages
-                .filter((message) => message.role === "user")
-                .map(messageText);
-              for (const turn of scenario.turns) {
-                expect(visible.filter((text) => text.includes(turn.reply))).toHaveLength(
-                  Number(!turn.quiet),
-                );
-                expect(user.filter((text) => text.includes(turn.prompt))).toHaveLength(1);
-              }
-              expect(visible.filter((text) => text && text !== "NO_REPLY")).toEqual(
-                scenario.turns.filter((turn) => !turn.quiet).map((turn) => turn.reply),
-              );
-              expect(user.join("\n")).not.toContain(HANDOFF);
-              expect(automaticPayloads).toEqual([]);
-              expect(fixture.errors).toEqual([]);
+              await wait(turn.deferred.promise);
             }
+            expect(scenario.turns.map((turn) => turn.providerRequests.length)).toEqual([1, 0, 0]);
+            scenario.releaseFirst.resolve();
+            await wait(activeDrain.waitForIdle());
+            const drained = await wait(waitForGatewayActiveWork(30_000));
+            expect(drained.drained, JSON.stringify(drained.snapshot.blockers)).toBe(true);
+            expect(await queue.listClaims()).toEqual([]);
+            expect(scenario.turns.map((turn) => turn.providerRequests.length)).toEqual([1, 1, 1]);
+            expect(scenario.executionOrder).toEqual(["A", "B", "C"]);
+            const history = await fixture.client.request<{ messages: Message[] }>("chat.history", {
+              sessionKey: scenario.sessionKey,
+              limit: 100,
+            });
+            const visible = history.messages
+              .filter((message) => message.role === "assistant")
+              .map(messageText);
+            const user = history.messages
+              .filter((message) => message.role === "user")
+              .map(messageText);
+            for (const turn of scenario.turns) {
+              expect(visible.filter((text) => text.includes(turn.reply))).toHaveLength(1);
+              expect(user.filter((text) => text.includes(turn.prompt))).toHaveLength(1);
+            }
+            expect(visible.filter((text) => text)).toEqual(
+              scenario.turns.map((turn) => turn.reply),
+            );
+            expect(user.join("\n")).not.toContain(HANDOFF);
+            // The initial tool-authored source mirror uses this live dispatcher;
+            // queued replies have their own completion owner. Count every callback
+            // so automatic or extra non-mirror deliveries cannot be filtered away.
+            expect(scenario.deliveryCallbackFacts).toEqual([
+              {
+                kind: "final",
+                text: first.reply,
+                replyToId: first.id,
+                sourceReplyFinal: true,
+                deliverDespiteSourceReplySuppression: true,
+                sourceReplyTranscriptMirror: {
+                  sessionKey: scenario.sessionKey,
+                  transcriptOwner: true,
+                },
+              },
+            ]);
+            expect(fixture.errors).toEqual([]);
           },
           () => {
-            for (const scenario of scenarios) {
-              scenario.releaseFirst.resolve();
-            }
-            drain?.dispose();
+            scenario.releaseFirst.resolve();
+            drainShutdown.abort();
           },
           () => fixture.close(),
-          () => drain?.dispose({ waitForSettlements: true }),
+          async () => {
+            await drain?.waitForIdle();
+            await drain?.dispose({ waitForSettlements: true });
+          },
         );
       },
     );

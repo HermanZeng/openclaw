@@ -4,6 +4,7 @@ import type { CurrentInboundPromptContext } from "../../agents/internal-runtime-
 import { normalizeChatType } from "../../channels/chat-type.js";
 import { isAgentEventLifecycleGenerationCurrent } from "../../infra/agent-events.js";
 import { channelRouteDedupeKey } from "../../plugin-sdk/channel-route.js";
+import { registerReplyOperationSuccessorBarrier } from "../../sessions/session-controller.barriers.js";
 import type {
   ReplyOperation,
   SessionControllerInput,
@@ -107,8 +108,32 @@ function takeReplyOperationCompletionHandoff(params: {
   return { kind: "claimed", handoff };
 }
 
+/** Publish before the controller can select a successor out of the pending receipt set. */
+export function registerReplyOperationCompletionHandoff(params: {
+  operation: ReplyOperation;
+  source: FollowupRun;
+  queueKey: string;
+}): void {
+  if (params.operation.key !== params.queueKey) {
+    return;
+  }
+  registerReplyOperationSuccessorBarrier({
+    operation: params.operation,
+    sessionId: params.operation.sessionId,
+    sessionKeys: [params.queueKey],
+    deferUntilClear: true,
+    start: () => {
+      publishReplyOperationCompletionHandoff({
+        ...params,
+        admissionSessionId: params.operation.sessionId,
+      });
+      return Promise.resolve();
+    },
+  });
+}
+
 /** Publish only an adopted source's predecessor update to its exact physical mailbox. */
-export function publishReplyOperationCompletionHandoff(params: {
+function publishReplyOperationCompletionHandoff(params: {
   operation: ReplyOperation;
   source: FollowupRun;
   queueKey: string;

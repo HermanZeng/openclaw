@@ -54,7 +54,7 @@ import { resolveEffectiveReplyRoute } from "./effective-reply-route.js";
 import type { InternalGetReplyOptions } from "./get-reply.types.js";
 import { sanitizePendingFinalDeliveryText } from "./pending-final-delivery-state.js";
 import { type FollowupRun, type QueueSettings, scheduleFollowupDrain } from "./queue.js";
-import { publishReplyOperationCompletionHandoff } from "./reply-completion-handoff.js";
+import { registerReplyOperationCompletionHandoff } from "./reply-completion-handoff.js";
 import { normalizeReplyPayloadDirectives, type DirectBlockDelivery } from "./reply-delivery.js";
 import {
   buildRestartLifecycleReplyText,
@@ -73,15 +73,14 @@ export function scheduleFollowupDrainAfterReplyOperationClear(params: {
   runFollowup: (run: FollowupRun) => Promise<void>;
   followupRun?: FollowupRun;
 }): void {
+  if (params.followupRun) {
+    registerReplyOperationCompletionHandoff({
+      operation: params.operation,
+      source: params.followupRun,
+      queueKey: params.queueKey,
+    });
+  }
   runAfterReplyOperationClear(params.operation, (admissionSessionId) => {
-    if (params.followupRun) {
-      publishReplyOperationCompletionHandoff({
-        operation: params.operation,
-        source: params.followupRun,
-        queueKey: params.queueKey,
-        admissionSessionId,
-      });
-    }
     const completedSessionId = params.operation.sessionId;
     // Same-key sessions in other physical stores may retain their own dedupe mailbox.
     scheduleFollowupDrain(

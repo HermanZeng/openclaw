@@ -17,10 +17,7 @@ import {
 import { defaultRuntime } from "../../runtime.js";
 import type { ReplyOperation } from "../../sessions/session-controller.js";
 import { deferSessionControllerClaimBeforeExecution } from "../../sessions/session-controller.mailbox-claim.js";
-import {
-  getReplyOperationSessionReader,
-  runAfterReplyOperationClear,
-} from "../../sessions/session-controller.state.js";
+import { getReplyOperationSessionReader } from "../../sessions/session-controller.state.js";
 import { getReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
 import { withAgentTurnCompletion } from "./agent-runner-completion.js";
@@ -40,7 +37,7 @@ import {
   type AdmittedFollowupTurn,
   type FollowupRunnerParams,
 } from "./reply-agent-turn-preparation.js";
-import { publishReplyOperationCompletionHandoff } from "./reply-completion-handoff.js";
+import { registerReplyOperationCompletionHandoff } from "./reply-completion-handoff.js";
 import { runWithReplyOperationLifecycleAdmission } from "./reply-turn-admission-lifecycle.js";
 import { resolveReplyAdmissionRunId } from "./source-turn-id.js";
 import {
@@ -519,14 +516,11 @@ export function createFollowupRunner(
         if (operation) {
           const completedOperation = operation;
           const source = admittedTurn?.queued ?? queued;
-          runAfterReplyOperationClear(completedOperation, (admissionSessionId) =>
-            publishReplyOperationCompletionHandoff({
-              operation: completedOperation,
-              source,
-              queueKey: completedOperation.key,
-              admissionSessionId,
-            }),
-          );
+          registerReplyOperationCompletionHandoff({
+            operation: completedOperation,
+            source,
+            queueKey: completedOperation.key,
+          });
         }
         operation?.complete();
         defaults.typing.markRunComplete();
