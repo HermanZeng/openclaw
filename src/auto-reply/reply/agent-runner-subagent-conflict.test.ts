@@ -2,7 +2,7 @@
 // oxfmt-ignore
 import { useSubagentControlFixture } from "../../agents/subagents/registry/subagent-control.test-support.js";
 import path from "node:path";
-import { expect, it, vi } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import { SessionManager } from "../../agents/sessions/session-manager.js";
 import { subagentRuns } from "../../agents/subagents/registry/subagent-registry-memory.js";
 import * as persistence from "../../agents/subagents/registry/subagent-registry-persistence.js";
@@ -10,13 +10,14 @@ import { registerSubagentRun } from "../../agents/subagents/registry/subagent-re
 import { getRuntimeConfig } from "../../config/config.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { InternalSessionEntry } from "../../config/sessions/types.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
+import { captureSessionTarget } from "../../sessions/session-controller.target.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { getReplyPayloadMetadata } from "../reply-payload.js";
 import { executePreparedReplyAgentRun } from "./agent-runner-execute.js";
 import {
   createFollowupRun,
   createMinimalRunAgentTurnParams,
-  createMockReplyOperation,
   setupAgentRunnerExecutionTestState,
 } from "./agent-runner-execution.test-support.js";
 import { createReplyRestartRecoveryClaimController } from "./restart-recovery-claim.js";
@@ -100,10 +101,25 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
     }
     return mutate(ids, plan, options);
   });
-  const { replyOperation, failMock } = createMockReplyOperation({
-    key: sessionKey,
+  // The execution owner opens Goal return custody even before a Goal is created.
+  // Keep that real controller boundary while isolating only the cohort replacement race.
+  const replyOperation = createReplyOperation({
+    sessionKey,
     sessionId: target.sessionId,
+    agentId: target.agentId,
+    resetTriggered: false,
+    target: captureSessionTarget({
+      storeScope: target.storePath,
+      sessionKey,
+      agentId: target.agentId,
+      incarnation: target.sessionId,
+    }),
   });
+  onTestFinished(async () => {
+    replyOperation.complete();
+    await replyOperation.ownerSettlement;
+  });
+  const failMock = vi.spyOn(replyOperation, "fail");
   const followupRun = createFollowupRun({
     config: getRuntimeConfig(),
     sessionKey,
@@ -160,5 +176,7 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
   expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
   expect(subagentRuns.has("reply-followup")).toBe(false);
   expect(subagentRuns.get("completed-task")?.execution.status).toBe("terminal");
+  replyOperation.complete();
+  await replyOperation.ownerSettlement;
   await fixture.settle();
 });
