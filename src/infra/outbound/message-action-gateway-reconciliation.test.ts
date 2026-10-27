@@ -1,47 +1,66 @@
 // Covers plugin-dispatched message actions, target resolution, dry-run behavior,
 // and plugin tool-result extraction.
-import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { GatewayProtocolRequestTimeoutError } from "../../../packages/gateway-client/src/protocol-request.js";
 import { jsonResult } from "../../agents/tools/common.js";
-import type { OpenClawConfig } from "../../config/config.js";
-import { setActivePluginRegistry } from "../../plugins/runtime.js";
-import { createTestRegistry } from "../../test-utils/channel-plugins.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../../utils/message-channel.js";
 import {
-  createActionHubPluginFixture,
   createGatewayActionPlugin,
   messageActionRunnerMocks as mocks,
   resetMessageActionRunnerMocks,
   runMessageAction,
   setMessageActionTestPlugin as setTestPlugin,
+  useActionHubPluginFixture,
+  readMockCallArg,
+  readRecordField,
+  expectRecordFields,
+  createEnabledMessageActionConfig,
 } from "./message-action-runner.test-helpers.js";
+import type { OutboundMessageGatewayOptionsInput } from "./message-gateway-options.js";
 
-const requireLabeledRecord = createRequireRecord("record", "expected-label");
-
-function readMockCallArg(
-  mock: { mock: { calls: unknown[][] } },
-  label: string,
-  callIndex = 0,
-  argIndex = 0,
-): Record<string, unknown> {
-  const mockCall = mock.mock.calls[callIndex];
-  const value = mockCall?.[argIndex];
-  return requireLabeledRecord(value, label);
-}
-
-function readRecordField(record: Record<string, unknown>, key: string, label: string) {
-  const value = record[key];
-  return requireLabeledRecord(value, label);
-}
-
-function expectRecordFields(
-  record: Record<string, unknown>,
-  expected: Record<string, unknown>,
-  label: string,
+function setupGatewayPlugin(
+  blurb: string,
+  handleAction: Parameters<typeof createGatewayActionPlugin>[0]["handleAction"] = vi.fn(async () =>
+    jsonResult({ ok: true, local: true }),
+  ),
 ) {
-  for (const [key, value] of Object.entries(expected)) {
-    expect(record[key], `${label}.${key}`).toEqual(value);
-  }
+  setTestPlugin(
+    createGatewayActionPlugin({
+      pluginId: "gatewaychat",
+      label: "Gateway Chat",
+      blurb,
+      actions: ["send"],
+      messaging: { targetResolver: { looksLikeId: () => true } },
+      handleAction,
+    }),
+    "gatewaychat",
+  );
+}
+
+function createTerminalReceipt() {
+  return {
+    sessionId: "session-1",
+    sessionKey: "agent:main:gatewaychat:direct:user-123",
+    sourceTurnId: "source-turn-1",
+    storePath: "/tmp/sessions.json",
+    toolCallId: "message-call-1",
+  };
+}
+
+function createTerminalSendInput(toolCallId: string): Parameters<typeof runMessageAction>[0] {
+  return {
+    cfg: createEnabledMessageActionConfig("gatewaychat"),
+    action: "send",
+    params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
+    sourceReplyFinal: true,
+    sourceReplyToolCallId: toolCallId,
+    gateway: {
+      terminalSourceReplyReceiptOwner: "caller",
+      clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+      mode: GATEWAY_CLIENT_MODES.BACKEND,
+    },
+    dryRun: false,
+  };
 }
 
 describe("runMessageAction plugin dispatch", () => {
@@ -49,39 +68,10 @@ describe("runMessageAction plugin dispatch", () => {
     resetMessageActionRunnerMocks();
   });
   describe("alias-based plugin action dispatch", () => {
-    const { handleAction, plugin: actionHubPlugin } = createActionHubPluginFixture();
-
-    beforeEach(() => {
-      setTestPlugin(actionHubPlugin, "actionhub");
-      handleAction.mockClear();
-    });
-
-    afterEach(() => {
-      setActivePluginRegistry(createTestRegistry([]));
-      vi.clearAllMocks();
-      vi.unstubAllEnvs();
-    });
+    useActionHubPluginFixture();
     it("owns terminal source-reply receipts before dispatching to a remote gateway", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat remote source reply test plugin.",
-        actions: ["send"],
-        messaging: {
-          targetResolver: {
-            looksLikeId: () => true,
-          },
-        },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const receipt = {
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      };
+      setupGatewayPlugin("Gateway Chat remote source reply test plugin.");
+      const receipt = createTerminalReceipt();
       mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
       mocks.reconcileTerminalSourceReplyDelivery.mockResolvedValue("delivered");
       const deliveredPayload = { ok: true, messageId: "gw-send-1" };
@@ -90,13 +80,7 @@ describe("runMessageAction plugin dispatch", () => {
       const policySessionKey = "agent:main:gatewaychat:policy:user-123";
 
       await runMessageAction({
-        cfg: {
-          channels: {
-            gatewaychat: {
-              enabled: true,
-            },
-          },
-        } as OpenClawConfig,
+        cfg: createEnabledMessageActionConfig("gatewaychat"),
         action: "send",
         params: {
           channel: "gatewaychat",
@@ -156,53 +140,8 @@ describe("runMessageAction plugin dispatch", () => {
       });
     });
 
-    it("allows claimless remote terminal dispatch when no receipt applies", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat missing receipt test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(undefined);
-      mocks.reconcileTerminalSourceReplyDelivery.mockResolvedValue("not-applicable");
-      mocks.callGatewayLeastPrivilege.mockResolvedValue({
-        ok: true,
-        messageId: "gw-send-claimless",
-      });
-
-      await runMessageAction({
-        cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
-        action: "send",
-        params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-        sourceReplyFinal: true,
-        sourceReplyToolCallId: "message-call-1",
-        gateway: {
-          terminalSourceReplyReceiptOwner: "caller",
-          clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-          mode: GATEWAY_CLIENT_MODES.BACKEND,
-        },
-        dryRun: false,
-      });
-
-      expect(mocks.callGatewayLeastPrivilege).toHaveBeenCalledOnce();
-      expect(mocks.reconcileTerminalSourceReplyDelivery).toHaveBeenCalledWith(
-        expect.objectContaining({ receipt: undefined }),
-      );
-    });
-
     it("returns an ambiguous terminal outcome without remote provider I/O", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat ambiguous source reply test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
+      setupGatewayPlugin("Gateway Chat ambiguous source reply test plugin.");
       mocks.beginTerminalSourceReplyDelivery.mockResolvedValue({
         outcome: "delivery_ambiguous",
         result: {
@@ -212,19 +151,7 @@ describe("runMessageAction plugin dispatch", () => {
         },
       });
 
-      const result = await runMessageAction({
-        cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
-        action: "send",
-        params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-        sourceReplyFinal: true,
-        sourceReplyToolCallId: "message-call-1",
-        gateway: {
-          terminalSourceReplyReceiptOwner: "caller",
-          clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-          mode: GATEWAY_CLIENT_MODES.BACKEND,
-        },
-        dryRun: false,
-      });
+      const result = await runMessageAction(createTerminalSendInput("message-call-1"));
 
       expect(result).toMatchObject({
         payload: {
@@ -235,34 +162,18 @@ describe("runMessageAction plugin dispatch", () => {
       expect(mocks.callGatewayLeastPrivilege).not.toHaveBeenCalled();
     });
 
-    it("cancels caller receipts after confirmed gateway request rejection", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat rejected request test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
+    it("cancels caller receipts when the final local handoff rejects before Gateway dispatch", async () => {
+      setupGatewayPlugin("Gateway Chat rejected handoff test plugin.");
+      const receipt = createTerminalReceipt();
+      let actionCurrent = true;
+      mocks.beginTerminalSourceReplyDelivery.mockImplementation(async () => {
+        actionCurrent = false;
+        return receipt;
       });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const receipt = {
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      };
-      mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
-      const rejection = Object.assign(new Error("unsupported message action"), {
-        name: "GatewayClientRequestError",
-        gatewayCode: "FORBIDDEN",
-        retryable: false,
-      });
-      mocks.callGatewayLeastPrivilege.mockRejectedValue(rejection);
 
       await expect(
         runMessageAction({
-          cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
+          cfg: createEnabledMessageActionConfig("gatewaychat"),
           action: "send",
           params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
           sourceReplyFinal: true,
@@ -272,30 +183,40 @@ describe("runMessageAction plugin dispatch", () => {
             clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
             mode: GATEWAY_CLIENT_MODES.BACKEND,
           },
+          assertDirectAdapterHandoff: () => {
+            if (!actionCurrent) {
+              throw Object.assign(new Error("current action canceled"), { name: "AbortError" });
+            }
+          },
           dryRun: false,
         }),
-      ).rejects.toBe(rejection);
+      ).rejects.toMatchObject({ name: "PlatformMessageNotDispatchedError" });
+      expect(mocks.cancelTerminalSourceReplyDelivery).toHaveBeenCalledWith(receipt);
+      expect(mocks.callGatewayLeastPrivilege).not.toHaveBeenCalled();
+      expect(mocks.reconcileTerminalSourceReplyDelivery).not.toHaveBeenCalled();
+    });
+
+    it("cancels caller receipts after confirmed gateway request rejection", async () => {
+      setupGatewayPlugin("Gateway Chat rejected request test plugin.");
+      const receipt = createTerminalReceipt();
+      mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
+      const rejection = Object.assign(new Error("unsupported message action"), {
+        name: "GatewayClientRequestError",
+        gatewayCode: "FORBIDDEN",
+        retryable: false,
+      });
+      mocks.callGatewayLeastPrivilege.mockRejectedValue(rejection);
+
+      await expect(runMessageAction(createTerminalSendInput(receipt.toolCallId))).rejects.toBe(
+        rejection,
+      );
       expect(mocks.cancelTerminalSourceReplyDelivery).toHaveBeenCalledWith(receipt);
       expect(mocks.reconcileTerminalSourceReplyDelivery).not.toHaveBeenCalled();
     });
 
     it("cancels caller receipts after structured gateway startup rejection", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat startup rejection test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const receipt = {
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      };
+      setupGatewayPlugin("Gateway Chat startup rejection test plugin.");
+      const receipt = createTerminalReceipt();
       mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
       const rejection = Object.assign(new Error("gateway is still starting"), {
         name: "GatewayClientRequestError",
@@ -305,41 +226,15 @@ describe("runMessageAction plugin dispatch", () => {
       });
       mocks.callGatewayLeastPrivilege.mockRejectedValue(rejection);
 
-      await expect(
-        runMessageAction({
-          cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
-          action: "send",
-          params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-          sourceReplyFinal: true,
-          sourceReplyToolCallId: receipt.toolCallId,
-          gateway: {
-            terminalSourceReplyReceiptOwner: "caller",
-            clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-            mode: GATEWAY_CLIENT_MODES.BACKEND,
-          },
-          dryRun: false,
-        }),
-      ).rejects.toBe(rejection);
+      await expect(runMessageAction(createTerminalSendInput(receipt.toolCallId))).rejects.toBe(
+        rejection,
+      );
       expect(mocks.cancelTerminalSourceReplyDelivery).toHaveBeenCalledWith(receipt);
     });
 
     it("keeps caller receipts pending after unstructured provider unavailability", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat provider failure test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      mocks.beginTerminalSourceReplyDelivery.mockResolvedValue({
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      });
+      setupGatewayPlugin("Gateway Chat provider failure test plugin.");
+      mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(createTerminalReceipt());
       const rejection = Object.assign(new Error("provider failed"), {
         name: "GatewayClientRequestError",
         gatewayCode: "UNAVAILABLE",
@@ -347,41 +242,15 @@ describe("runMessageAction plugin dispatch", () => {
       });
       mocks.callGatewayLeastPrivilege.mockRejectedValue(rejection);
 
-      await expect(
-        runMessageAction({
-          cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
-          action: "send",
-          params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-          sourceReplyFinal: true,
-          sourceReplyToolCallId: "message-call-1",
-          gateway: {
-            terminalSourceReplyReceiptOwner: "caller",
-            clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-            mode: GATEWAY_CLIENT_MODES.BACKEND,
-          },
-          dryRun: false,
-        }),
-      ).rejects.toBe(rejection);
+      await expect(runMessageAction(createTerminalSendInput("message-call-1"))).rejects.toBe(
+        rejection,
+      );
       expect(mocks.cancelTerminalSourceReplyDelivery).not.toHaveBeenCalled();
     });
 
     it("keeps caller receipts pending when reattach ends in a confirmed rejection", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat ambiguous reattach rejection test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const receipt = {
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      };
+      setupGatewayPlugin("Gateway Chat ambiguous reattach rejection test plugin.");
+      const receipt = createTerminalReceipt();
       mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
       const timeout = Object.assign(new Error("gateway timeout"), {
         name: "GatewayTransportError",
@@ -397,21 +266,9 @@ describe("runMessageAction plugin dispatch", () => {
         .mockRejectedValueOnce(timeout)
         .mockRejectedValueOnce(rejection);
 
-      await expect(
-        runMessageAction({
-          cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
-          action: "send",
-          params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-          sourceReplyFinal: true,
-          sourceReplyToolCallId: receipt.toolCallId,
-          gateway: {
-            terminalSourceReplyReceiptOwner: "caller",
-            clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-            mode: GATEWAY_CLIENT_MODES.BACKEND,
-          },
-          dryRun: false,
-        }),
-      ).rejects.toBe(rejection);
+      await expect(runMessageAction(createTerminalSendInput(receipt.toolCallId))).rejects.toBe(
+        rejection,
+      );
 
       expect(mocks.callGatewayLeastPrivilege).toHaveBeenCalledTimes(2);
       expect(mocks.cancelTerminalSourceReplyDelivery).not.toHaveBeenCalled();
@@ -419,22 +276,8 @@ describe("runMessageAction plugin dispatch", () => {
     });
 
     it("preserves caller receipts when reattach returns an explicit failure", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat ambiguous reattach result test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const receipt = {
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      };
+      setupGatewayPlugin("Gateway Chat ambiguous reattach result test plugin.");
+      const receipt = createTerminalReceipt();
       mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
       const timeout = Object.assign(new Error("gateway timeout"), {
         name: "GatewayTransportError",
@@ -445,19 +288,7 @@ describe("runMessageAction plugin dispatch", () => {
         .mockRejectedValueOnce(timeout)
         .mockResolvedValueOnce(failedPayload);
 
-      await runMessageAction({
-        cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
-        action: "send",
-        params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-        sourceReplyFinal: true,
-        sourceReplyToolCallId: receipt.toolCallId,
-        gateway: {
-          terminalSourceReplyReceiptOwner: "caller",
-          clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-          mode: GATEWAY_CLIENT_MODES.BACKEND,
-        },
-        dryRun: false,
-      });
+      await runMessageAction(createTerminalSendInput(receipt.toolCallId));
 
       expect(mocks.callGatewayLeastPrivilege).toHaveBeenCalledTimes(2);
       expect(mocks.reconcileTerminalSourceReplyDelivery).toHaveBeenCalledWith({
@@ -470,15 +301,7 @@ describe("runMessageAction plugin dispatch", () => {
     });
 
     it("runs terminal gateway identity preflight before arming the caller receipt", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat identity preflight test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
+      setupGatewayPlugin("Gateway Chat identity preflight test plugin.");
       const rejection = new Error("terminal source reply requires an active turn capability");
       const resolveAgentRuntimeIdentityToken = vi.fn(async () => {
         throw rejection;
@@ -486,7 +309,7 @@ describe("runMessageAction plugin dispatch", () => {
 
       await expect(
         runMessageAction({
-          cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
+          cfg: createEnabledMessageActionConfig("gatewaychat"),
           action: "send",
           params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
           sourceReplyFinal: true,
@@ -504,171 +327,112 @@ describe("runMessageAction plugin dispatch", () => {
       expect(mocks.callGatewayLeastPrivilege).not.toHaveBeenCalled();
     });
 
-    it("keeps caller receipts pending after an ambiguous gateway timeout", async () => {
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat ambiguous timeout test plugin.",
-        actions: ["send"],
-        messaging: { targetResolver: { looksLikeId: () => true } },
-        handleAction: vi.fn(async () => jsonResult({ ok: true, local: true })),
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const receipt = {
-        sessionId: "session-1",
-        sessionKey: "agent:main:gatewaychat:direct:user-123",
-        sourceTurnId: "source-turn-1",
-        storePath: "/tmp/sessions.json",
-        toolCallId: "message-call-1",
-      };
-      mocks.beginTerminalSourceReplyDelivery.mockResolvedValue(receipt);
-      const timeout = Object.assign(new Error("gateway timeout"), { kind: "timeout" });
-      mocks.callGatewayLeastPrivilege.mockRejectedValue(timeout);
+    it.each(["hosted"] as const)(
+      "reattaches a timed-out %s send once with the original idempotency key",
+      async (route) => {
+        const request =
+          route === "hosted"
+            ? vi.fn<NonNullable<OutboundMessageGatewayOptionsInput["request"]>>()
+            : mocks.callGatewayLeastPrivilege;
+        const handleActionResult = vi.fn(async () => jsonResult({ ok: true, local: true }));
+        setupGatewayPlugin("Gateway Chat timeout reconciliation test plugin.", handleActionResult);
+        const timeout =
+          route === "hosted"
+            ? new GatewayProtocolRequestTimeoutError({
+                method: "message.action",
+                timeoutMs: 30_000,
+                requestSent: true,
+              })
+            : Object.assign(new Error("gateway timeout after 30000ms"), {
+                name: "GatewayTransportError",
+                kind: "timeout",
+              });
+        request
+          .mockRejectedValueOnce(timeout)
+          .mockResolvedValueOnce({ ok: true, messageId: "gw-send-late" });
+        const controller = new AbortController();
 
-      await expect(
-        runMessageAction({
-          cfg: { channels: { gatewaychat: { enabled: true } } } as OpenClawConfig,
+        const actionInput = {
+          cfg: createEnabledMessageActionConfig("gatewaychat"),
           action: "send",
-          params: { channel: "gatewaychat", target: "user-123", message: "terminal answer" },
-          sourceReplyFinal: true,
-          sourceReplyToolCallId: receipt.toolCallId,
+          params: {
+            channel: "gatewaychat",
+            target: "user-123",
+            message: "hello from agent",
+          },
           gateway: {
-            terminalSourceReplyReceiptOwner: "caller",
-            clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-            mode: GATEWAY_CLIENT_MODES.BACKEND,
+            clientName: "cli",
+            mode: "cli",
+            timeoutMs: 120_000,
+            ...(route === "hosted" ? { request } : {}),
           },
           dryRun: false,
-        }),
-      ).rejects.toBe(timeout);
-      expect(mocks.callGatewayLeastPrivilege).toHaveBeenCalledTimes(2);
-      expect(mocks.cancelTerminalSourceReplyDelivery).not.toHaveBeenCalled();
-    });
+        } satisfies Parameters<typeof runMessageAction>[0];
+        const result = await runMessageAction({ ...actionInput, abortSignal: controller.signal });
 
-    it("reattaches a timed-out gateway send once with the original idempotency key", async () => {
-      const handleActionResult = vi.fn(async () => jsonResult({ ok: true, local: true }));
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat timeout reconciliation test plugin.",
-        actions: ["send"],
-        messaging: {
-          targetResolver: {
-            looksLikeId: () => true,
+        expect(request).toHaveBeenCalledTimes(2);
+        if (route === "hosted") {
+          expect(mocks.callGatewayLeastPrivilege).not.toHaveBeenCalled();
+        }
+        const firstCall = readMockCallArg(request, "first gateway least privilege call");
+        const secondCall = readMockCallArg(request, "second gateway least privilege call", 1);
+        expect(firstCall.timeoutMs).toBe(30_000);
+        expect(secondCall).toMatchObject({
+          ...firstCall,
+          timeoutMs: null,
+          signal: expect.any(AbortSignal),
+        });
+        expect(secondCall.signal).toBeInstanceOf(AbortSignal);
+        expect(secondCall.signal).not.toBe(firstCall.signal);
+        const gatewayParams = readRecordField(firstCall, "params", "gateway call params");
+        expectRecordFields(
+          gatewayParams,
+          {
+            channel: "gatewaychat",
+            action: "send",
+            idempotencyKey: "idem-gateway-action",
           },
-        },
-        handleAction: handleActionResult,
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
-      const timeout = Object.assign(new Error("gateway timeout after 30000ms"), {
-        name: "GatewayTransportError",
-        kind: "timeout",
-      });
-      mocks.callGatewayLeastPrivilege
-        .mockRejectedValueOnce(timeout)
-        .mockResolvedValueOnce({ ok: true, messageId: "gw-send-late" });
-      const controller = new AbortController();
-
-      const actionInput = {
-        cfg: {
-          channels: {
-            gatewaychat: {
-              enabled: true,
-            },
-          },
-        } as OpenClawConfig,
-        action: "send",
-        params: {
-          channel: "gatewaychat",
-          target: "user-123",
-          message: "hello from agent",
-        },
-        gateway: {
-          clientName: "cli",
-          mode: "cli",
-          timeoutMs: 120_000,
-        },
-        dryRun: false,
-      } satisfies Parameters<typeof runMessageAction>[0];
-      const result = await runMessageAction({ ...actionInput, abortSignal: controller.signal });
-
-      expect(mocks.callGatewayLeastPrivilege).toHaveBeenCalledTimes(2);
-      const firstCall = readMockCallArg(
-        mocks.callGatewayLeastPrivilege,
-        "first gateway least privilege call",
-      );
-      const secondCall = readMockCallArg(
-        mocks.callGatewayLeastPrivilege,
-        "second gateway least privilege call",
-        1,
-      );
-      expect(firstCall.timeoutMs).toBe(30_000);
-      expect(secondCall).toMatchObject({
-        ...firstCall,
-        timeoutMs: null,
-        signal: expect.any(AbortSignal),
-      });
-      expect(secondCall.signal).toBeInstanceOf(AbortSignal);
-      expect(secondCall.signal).not.toBe(firstCall.signal);
-      const gatewayParams = readRecordField(firstCall, "params", "gateway call params");
-      expectRecordFields(
-        gatewayParams,
-        {
+          "gateway call params",
+        );
+        expect(handleActionResult).not.toHaveBeenCalled();
+        expect(result).toMatchObject({
+          kind: "send",
           channel: "gatewaychat",
           action: "send",
-          idempotencyKey: "idem-gateway-action",
-        },
-        "gateway call params",
-      );
-      expect(handleActionResult).not.toHaveBeenCalled();
-      expect(result).toMatchObject({
-        kind: "send",
-        channel: "gatewaychat",
-        action: "send",
-        handledBy: "plugin",
-        payload: { ok: true, messageId: "gw-send-late" },
-      });
+          handledBy: "plugin",
+          payload: { ok: true, messageId: "gw-send-late" },
+        });
 
-      mocks.callGatewayLeastPrivilege.mockReset();
-      mocks.callGatewayLeastPrivilege
-        .mockRejectedValueOnce(timeout)
-        .mockResolvedValueOnce({ ok: true, messageId: "gw-send-bounded" });
+        request.mockReset();
+        request
+          .mockRejectedValueOnce(timeout)
+          .mockResolvedValueOnce({ ok: true, messageId: "gw-send-bounded" });
 
-      const boundedResult = await runMessageAction(actionInput);
+        const boundedResult = await runMessageAction(actionInput);
 
-      expect(mocks.callGatewayLeastPrivilege).toHaveBeenCalledTimes(2);
-      const boundedReconciliationCall = readMockCallArg(
-        mocks.callGatewayLeastPrivilege,
-        "bounded gateway reconciliation call",
-        1,
-      );
-      expect(boundedReconciliationCall).toMatchObject({ timeoutMs: 60_000, signal: undefined });
-      const boundedParams = readRecordField(
-        boundedReconciliationCall,
-        "params",
-        "bounded gateway reconciliation params",
-      );
-      expect(boundedParams.idempotencyKey).toBe("idem-gateway-action");
-      expect(boundedResult).toMatchObject({
-        kind: "send",
-        payload: { ok: true, messageId: "gw-send-bounded" },
-      });
-    });
+        expect(request).toHaveBeenCalledTimes(2);
+        const boundedReconciliationCall = readMockCallArg(
+          request,
+          "bounded gateway reconciliation call",
+          1,
+        );
+        expect(boundedReconciliationCall).toMatchObject({ timeoutMs: 60_000, signal: undefined });
+        const boundedParams = readRecordField(
+          boundedReconciliationCall,
+          "params",
+          "bounded gateway reconciliation params",
+        );
+        expect(boundedParams.idempotencyKey).toBe("idem-gateway-action");
+        expect(boundedResult).toMatchObject({
+          kind: "send",
+          payload: { ok: true, messageId: "gw-send-bounded" },
+        });
+      },
+    );
 
     it("does not reconnect a timed-out gateway send after cancellation", async () => {
       const handleActionResult = vi.fn(async () => jsonResult({ ok: true, local: true }));
-      const gatewayPlugin = createGatewayActionPlugin({
-        pluginId: "gatewaychat",
-        label: "Gateway Chat",
-        blurb: "Gateway Chat cancellation test plugin.",
-        actions: ["send"],
-        messaging: {
-          targetResolver: {
-            looksLikeId: () => true,
-          },
-        },
-        handleAction: handleActionResult,
-      });
-      setTestPlugin(gatewayPlugin, "gatewaychat");
+      setupGatewayPlugin("Gateway Chat cancellation test plugin.", handleActionResult);
       const controller = new AbortController();
       const timeout = Object.assign(new Error("gateway timeout after 30000ms"), {
         name: "GatewayTransportError",
@@ -684,13 +448,7 @@ describe("runMessageAction plugin dispatch", () => {
 
       await expect(
         runMessageAction({
-          cfg: {
-            channels: {
-              gatewaychat: {
-                enabled: true,
-              },
-            },
-          } as OpenClawConfig,
+          cfg: createEnabledMessageActionConfig("gatewaychat"),
           action: "send",
           params: {
             channel: "gatewaychat",

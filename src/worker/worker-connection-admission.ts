@@ -1,23 +1,24 @@
 import { randomUUID } from "node:crypto";
 import { rawDataToString } from "@openclaw/gateway-client/websocket-data";
-import { Value } from "typebox/value";
-import { WebSocket, type RawData } from "ws";
+import { toStructuredErrorObject } from "@openclaw/normalization-core/error-coercion";
+import type { RawData } from "ws";
 import { GatewayWebSocketTlsPinError } from "../../packages/gateway-client/src/websocket-transport.js";
-import {
-  type WorkerAdmissionResponseFrame,
-  WorkerAdmissionResponseFrameSchema,
-  type WorkerConnectParams,
-  type WorkerConnectRequestFrame,
-  type WorkerHelloOk,
-  type WorkerProtocolCloseReason,
-  WorkerProtocolCloseReasonSchema,
+import { WebSocket } from "../../packages/gateway-client/src/websocket.js";
+import type {
+  WorkerConnectParams,
+  WorkerConnectRequestFrame,
+  WorkerHelloOk,
+  WorkerProtocolCloseReason,
 } from "../../packages/gateway-protocol/src/schema/worker-admission.js";
 import { WORKER_PROTOCOL_MAX_INFERENCE_PAYLOAD_BYTES } from "../../packages/gateway-protocol/src/schema/worker-inference.js";
 import { PROTOCOL_VERSION } from "../../packages/gateway-protocol/src/version.js";
 import {
+  validateWorkerAdmissionResponseFrame as validateAdmissionResponse,
+  validateWorkerProtocolCloseReason as validateCloseReason,
+} from "../../packages/gateway-protocol/src/worker-response-validators.js";
+import {
   WorkerAdmissionError,
   WorkerConnectionInterruptedError,
-  toWorkerConnectionError,
   type WorkerConnectionOptions,
 } from "./worker-connection-contract.js";
 import {
@@ -25,11 +26,6 @@ import {
   WorkerConnectionEndpointError,
 } from "./worker-connection-endpoint.js";
 import { closeInvalidWorkerFrame } from "./worker-connection-frames.js";
-
-const RETRYABLE_CLOSE_REASONS = new Set<WorkerProtocolCloseReason>([
-  "gateway-shutdown",
-  "gateway-unavailable",
-]);
 
 type WorkerConnectionAttemptOptions = {
   attemptTimeoutMs: number;
@@ -54,7 +50,7 @@ function parseFrame(data: RawData): { ok: true; frame: unknown } | { ok: false }
 
 function parseCloseReason(data: Buffer): WorkerProtocolCloseReason | undefined {
   const reason = rawDataToString(data);
-  return Value.Check(WorkerProtocolCloseReasonSchema, reason) ? reason : undefined;
+  return validateCloseReason(reason) ? reason : undefined;
 }
 
 function matchesAdmission(connectParams: WorkerConnectParams, hello: WorkerHelloOk): boolean {
@@ -70,7 +66,7 @@ function matchesAdmission(connectParams: WorkerConnectParams, hello: WorkerHello
 }
 
 export function isRetryableWorkerCloseReason(reason: WorkerProtocolCloseReason): boolean {
-  return RETRYABLE_CLOSE_REASONS.has(reason);
+  return reason === "gateway-shutdown" || reason === "gateway-unavailable";
 }
 
 export function connectWorkerConnectionAttempt(
@@ -87,17 +83,21 @@ export function connectWorkerConnectionAttempt(
     : new WebSocket(target.url, socketOptions);
   options.onSocket(socket);
   const admissionId = randomUUID();
-  let admitted = false;
+  let admission: "pending" | "accepted" | "rejected" = "pending";
   let opened = false;
-  let attemptSettled = false;
+  const isActive = () =>
+    options.isCurrentGeneration() &&
+    !options.isTerminal() &&
+    admission !== "rejected" &&
+    socket.readyState === WebSocket.OPEN;
 
   return new Promise<WorkerHelloOk>((resolve, reject) => {
     let attemptTimeout: ReturnType<typeof setTimeout> | undefined;
     const rejectAttempt = (error: Error) => {
-      if (attemptSettled) {
+      if (admission !== "pending") {
         return;
       }
-      attemptSettled = true;
+      admission = "rejected";
       if (attemptTimeout) {
         clearTimeout(attemptTimeout);
         attemptTimeout = undefined;
@@ -115,19 +115,19 @@ export function connectWorkerConnectionAttempt(
     attemptTimeout.unref?.();
 
     socket.on("error", (error) => {
-      if (!admitted) {
+      if (admission === "pending") {
         const kind = opened ? "admission interrupted" : "connect failed";
         rejectAttempt(
           error instanceof GatewayWebSocketTlsPinError
             ? new WorkerConnectionEndpointError(error.message)
             : new WorkerConnectionInterruptedError(
-                `${kind}: ${toWorkerConnectionError(error).message}`,
+                `${kind}: ${toStructuredErrorObject(error).message}`,
               ),
         );
       }
     });
     socket.on("open", () => {
-      if (!options.isCurrentGeneration() || options.isTerminal()) {
+      if (!isActive()) {
         socket.close();
         return;
       }
@@ -153,7 +153,8 @@ export function connectWorkerConnectionAttempt(
       });
     });
     socket.on("message", (data: RawData) => {
-      if (!options.isCurrentGeneration()) {
+      // Closing sockets can still deliver buffered frames after local stop or invalid input.
+      if (!isActive()) {
         return;
       }
       const parsed = parseFrame(data);
@@ -162,40 +163,35 @@ export function connectWorkerConnectionAttempt(
         return;
       }
       const frame = parsed.frame;
-      if (!admitted) {
-        if (
-          !Value.Check(WorkerAdmissionResponseFrameSchema, frame) ||
-          (frame as WorkerAdmissionResponseFrame).id !== admissionId
-        ) {
+      if (admission === "pending") {
+        if (!validateAdmissionResponse(frame) || frame.id !== admissionId) {
           closeInvalidWorkerFrame(socket);
           rejectAttempt(new WorkerAdmissionError("invalid-handshake", false));
           return;
         }
-        const response = frame as WorkerAdmissionResponseFrame;
-        if (!response.ok) {
-          const reason = response.error.details.reason;
+        if (!frame.ok) {
+          const reason = frame.error.details.reason;
           rejectAttempt(
             new WorkerAdmissionError(
               reason,
-              response.error.retryable === true && isRetryableWorkerCloseReason(reason),
+              frame.error.retryable === true && isRetryableWorkerCloseReason(reason),
             ),
           );
           socket.terminate();
           return;
         }
-        if (!matchesAdmission(connectionOptions.connectParams, response.payload)) {
+        if (!matchesAdmission(connectionOptions.connectParams, frame.payload)) {
           closeInvalidWorkerFrame(socket);
           rejectAttempt(new WorkerAdmissionError("invalid-handshake", false));
           return;
         }
-        admitted = true;
-        attemptSettled = true;
+        admission = "accepted";
         if (attemptTimeout) {
           clearTimeout(attemptTimeout);
           attemptTimeout = undefined;
         }
-        options.onReady(response.payload);
-        resolve(response.payload);
+        options.onReady(frame.payload);
+        resolve(frame.payload);
         return;
       }
       options.onReadyFrame(frame, socket);
@@ -206,7 +202,7 @@ export function connectWorkerConnectionAttempt(
       }
       options.onSocketClosed();
       const closeReason = parseCloseReason(reason);
-      if (!admitted) {
+      if (admission !== "accepted") {
         rejectAttempt(
           closeReason
             ? new WorkerAdmissionError(closeReason, isRetryableWorkerCloseReason(closeReason))

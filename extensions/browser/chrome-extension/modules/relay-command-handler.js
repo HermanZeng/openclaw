@@ -7,13 +7,16 @@ export function createRelayCommandHandler({
   createTab,
   focusWindowForTab,
   scheduleTabsSync,
+  captureDebugger,
   captureAccess,
   requireAccessibleTab,
   requireNavigatedTab,
   navigateTab,
 }) {
+  const inputDispatches = new Map();
   return async (message) => {
     const { seq } = message;
+    let releaseInput;
     const assertCurrent = () => {
       if (!isCurrent()) {
         throw new Error("relay connection was replaced or closed");
@@ -35,25 +38,50 @@ export function createRelayCommandHandler({
         case "ping":
           reply({ type: "pong" });
           return;
-        case "attach":
-          reply({
-            type: "result",
-            seq,
-            result: await attachDebugger(message.tabId, assertCurrent),
-          });
+        case "attach": {
+          const attached = await attachDebugger(message.tabId, assertCurrent);
+          attached.assertCurrent();
+          reply({ type: "result", seq, result: { targetId: attached.targetId } });
           return;
+        }
         case "detach":
           await detachDebugger(message.tabId);
           reply({ type: "result", seq, result: {} });
           return;
         case "cdp": {
+          const assertAttachment = captureDebugger(message.tabId);
           const epoch = captureAccess(message.tabId, message.method);
+          if (typeof message.method === "string" && message.method.startsWith("Input.")) {
+            // Clients pipeline press/release. Keep each tab's native dispatch order
+            // across policy awaits without serializing unrelated commands or replies.
+            const previous = inputDispatches.get(message.tabId);
+            const dispatched = new Promise((resolve) => {
+              releaseInput = () => {
+                resolve();
+                if (inputDispatches.get(message.tabId) === dispatched) {
+                  inputDispatches.delete(message.tabId);
+                }
+              };
+            });
+            inputDispatches.set(message.tabId, dispatched);
+            await previous;
+          }
           await requireTab(message.tabId, epoch);
+          assertAttachment();
           const target = message.sessionId
             ? { tabId: message.tabId, sessionId: message.sessionId }
             : { tabId: message.tabId };
-          const sendCommand = (method, params) =>
-            chrome.debugger.sendCommand(target, method, params);
+          // Provenance preflight and navigation share the command's original
+          // native generation, including policy awaits before either dispatch.
+          const sendCommand = async (method, params) => {
+            assertAttachment();
+            const pending = chrome.debugger.sendCommand(target, method, params);
+            releaseInput?.();
+            releaseInput = undefined;
+            const result = await pending;
+            assertAttachment();
+            return result;
+          };
           const controlledBlank =
             !message.sessionId &&
             message.method === "Page.navigate" &&
@@ -61,11 +89,13 @@ export function createRelayCommandHandler({
           const result = controlledBlank
             ? await navigateTab(message.tabId, epoch, message.params, isCurrent, sendCommand)
             : await sendCommand(message.method, message.params ?? {});
+          assertAttachment();
           await requireTab(
             message.tabId,
             epoch,
             controlledBlank ? requireNavigatedTab : requireAccessibleTab,
           );
+          assertAttachment();
           reply({ type: "result", seq, result: result ?? {} });
           return;
         }
@@ -110,6 +140,8 @@ export function createRelayCommandHandler({
           message: error instanceof Error ? error.message : String(error),
         });
       }
+    } finally {
+      releaseInput?.();
     }
   };
 }

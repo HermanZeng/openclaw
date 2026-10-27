@@ -11,8 +11,14 @@ import ai.openclaw.app.closeNodeRuntimeTestFixture
 import ai.openclaw.app.gateway.GatewayEndpoint
 import ai.openclaw.app.gateway.GatewaySession
 import ai.openclaw.app.ui.design.ClawDesignTheme
+import ai.openclaw.app.ui.design.ClawTheme
+import ai.openclaw.wear.shared.WearMessage
+import ai.openclaw.wear.shared.WearReplyText
+import ai.openclaw.wear.shared.WearReplyTextStatus
+import ai.openclaw.wear.shared.WearRpcMethod
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Point
 import android.graphics.Rect
 import android.graphics.RectF
@@ -23,15 +29,19 @@ import android.view.ViewGroup
 import android.view.inspector.WindowInspector
 import android.widget.TextView
 import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.size
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasContentDescription
@@ -39,9 +49,12 @@ import androidx.compose.ui.test.hasScrollToNodeAction
 import androidx.compose.ui.test.hasSetTextAction
 import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.isDialog
+import androidx.compose.ui.test.isPopup
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performMouseInput
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performSemanticsAction
@@ -92,6 +105,7 @@ import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.config.ConfigurationRegistry
+import java.io.File
 import java.net.InetAddress
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -158,14 +172,13 @@ class ChatFullMessageOwnershipLayoutTest {
     model.setForeground(true)
     composeRule.setContent {
       ClawDesignTheme {
-        Box(Modifier.size(width = 360.dp, height = 800.dp).clipToBounds()) {
+        Box(Modifier.size(width = 360.dp, height = 800.dp).background(ClawTheme.colors.canvas).clipToBounds()) {
           ChatScreen(
             viewModel = model,
             talkActive = false,
             showSidebarButton = true,
             onOpenSidebar = {},
             onToggleTalk = {},
-            onOpenSessions = {},
             onOpenDashboard = {},
             onOpenGatewaySettings = {},
           )
@@ -179,6 +192,108 @@ class ChatFullMessageOwnershipLayoutTest {
     }
     selectChat(FULL_MESSAGE_FIRST_CHAT)
   }
+
+  @Test
+  @GraphicsMode(GraphicsMode.Mode.NATIVE)
+  fun messageTimestampOpensOnlyItsRecordedMetadataAndPreservesActions() {
+    gateway.historyMessagesOverride =
+      Json.parseToJsonElement(
+        """[
+        {"role":"user","content":"Summarize the garden plan.","timestamp":1789776000000,"__openclaw":{"id":"metadata-user"}},
+        {"role":"assistant","content":"Plant herbs in the sunny bed and keep the shaded corner for leafy greens.","timestamp":1789776060000,"model":"example/garden-model","usage":{"input":1200,"output":240,"cacheRead":800,"cacheWrite":120,"cost":{"total":0.012}},"__openclaw":{"id":"metadata-answer"}}
+      ]""",
+      ) as JsonArray
+    composeRule.runOnIdle { model.refreshChat() }
+    try {
+      composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
+        shadowOf(Looper.getMainLooper()).idle()
+        model.chatMessages.value
+          .lastOrNull()
+          ?.entryId == "metadata-answer" && !model.chatHistoryLoading.value
+      }
+    } catch (failure: Exception) {
+      throw AssertionError("Metadata readiness: ids=" + model.chatMessages.value.map { it.entryId } + "; loading=" + model.chatHistoryLoading.value + "; error=" + model.chatError.value + "; history=" + gateway.historyReads.value.takeLast(5), failure)
+    }
+    composeRule.waitForIdle()
+    composeRule.onNodeWithText("Input tokens: 1.2k").assertDoesNotExist()
+    captureMessageMetadata("closed")
+    val timestamp = composeRule.onNode(hasContentDescription("Message information for", substring = true) and hasClickAction())
+    timestamp.assertIsDisplayed().performClick()
+    listOf("Input tokens: 1.2k", "Output tokens: 240", "Cache read: 800", "Cache write: 120", "Est. cost: $0.012", "Model: garden-model").forEach {
+      composeRule.onNodeWithText(it).assertIsDisplayed()
+    }
+    captureMessageMetadata("opened")
+    composeRule.runOnIdle {
+      checkNotNull(WindowInspector.getGlobalWindowViews().firstOrNull()?.findViewTreeOnBackPressedDispatcherOwner()).onBackPressedDispatcher.onBackPressed()
+    }
+    composeRule.waitForIdle()
+    // The metadata action must not replace the bubble's existing long-press actions.
+    composeRule
+      .onNode(hasContentDescription("OpenClaw") and hasText("Plant herbs", substring = true))
+      .performSemanticsAction(SemanticsActions.OnLongClick) { it() }
+    composeRule.onNode(hasText("Reply") and hasClickAction()).assertExists()
+    composeRule.onNode(hasText("Listen") and hasClickAction()).assertExists()
+  }
+
+  private fun captureMessageMetadata(state: String) {
+    val directory = System.getenv("OPENCLAW_MESSAGE_METADATA_CAPTURE_DIR") ?: return
+    val node = if (state == "opened") composeRule.onNode(isPopup()) else composeRule.onRoot()
+    val image = node.captureToImage().asAndroidBitmap()
+    assertTrue(image.width > 0 && image.height > 0)
+    val output = File(directory).apply { mkdirs() }.resolve("message-metadata-$state.png")
+    output.outputStream().use { assertTrue(image.compress(Bitmap.CompressFormat.PNG, 100, it)) }
+  }
+
+  @Test
+  fun wearFullReadUsesItsOwnSelectionThroughThePhysicalGatewayLease() =
+    runBlocking {
+      val session = "agent:main:watch-independent"
+      var offset = 0
+      var revision: String? = null
+      val text = StringBuilder()
+      do {
+        val response = runtime.handleWearProxyRequest("fixture-watch", wearReplyRequest(session, offset, revision))
+        assertTrue(response.ok)
+        val page = WearReplyText.decode(checkNotNull(response.result))
+        assertEquals(WearReplyTextStatus.Ready, page.status)
+        text.append(page.text)
+        revision = page.revision
+        offset = page.nextOffset ?: break
+      } while (true)
+      assertEquals(gateway.fullText(session), text.toString())
+      assertTrue(gateway.fullReads.all { it.sessionKey == session })
+      assertEquals(FULL_MESSAGE_FIRST_CHAT, runtime.chat.sessionKey.value)
+    }
+
+  @Test
+  fun wearFullReadDiscardsAReplyAfterPhysicalGatewayRetirement() =
+    runBlocking {
+      gateway.holdFullResponses = true
+      val pending = async(Dispatchers.IO) { runtime.handleWearProxyRequest("fixture-watch", wearReplyRequest(FULL_MESSAGE_FIRST_CHAT, 0, null)) }
+      withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) { gateway.heldResponses.first { it.isNotEmpty() } }
+      runtime.disconnect()
+      gateway.releaseFullResponses()
+      val response = pending.await()
+      assertTrue(!response.ok || WearReplyText.decode(checkNotNull(response.result)).status != WearReplyTextStatus.Ready)
+    }
+
+  private fun wearReplyRequest(
+    session: String,
+    offset: Int,
+    revision: String?,
+  ) = WearMessage.Request(
+    requestId = "wear-page-$offset",
+    method = WearRpcMethod.ReplyText,
+    params =
+      buildJsonObject {
+        put("source", JsonPrimitive("chat"))
+        put("sessionKey", JsonPrimitive(session))
+        put("agentId", JsonPrimitive("main"))
+        put("entryId", JsonPrimitive(FULL_MESSAGE_ENTRY))
+        put("offset", JsonPrimitive(offset))
+        revision?.let { put("revision", JsonPrimitive(it)) }
+      },
+  )
 
   fun tearDown() {
     try {
@@ -222,6 +337,21 @@ class ChatFullMessageOwnershipLayoutTest {
   }
 
   @Test
+  fun mixedToolMessageCanLoadFullTextWithoutDuplicatingTools() {
+    gateway.includeToolCall = true
+    refreshSelectedChat()
+    viewAll().assertIsDisplayed().assertIsEnabled().performClick()
+    awaitInlineExpanded()
+    assertEquals(listOf(expectedRequest()), gateway.fullReads.toList())
+    val timeline = prepareChatHistory(runtime.chat.messages.value, "agent:main:main", mainSessionKey = "agent:main:main").buildTimeline(0, emptyList(), null)
+    assertEquals(1, timeline.items.filterIsInstance<ChatTimelineItem.ToolActivity>().size)
+    composeRule.onNodeWithText("Show less").performScrollTo().performClick()
+    viewAll().performClick()
+    awaitInlineExpanded()
+    assertEquals(1, gateway.fullReads.size)
+  }
+
+  @Test
   fun stableMarkerlessPreviewCanRecoverTheCanonicalAnswer() {
     gateway.emitTruncationMarker = false
     listOf(false, true).forEachIndexed { index, blocks ->
@@ -246,7 +376,7 @@ class ChatFullMessageOwnershipLayoutTest {
       refreshSelectedChat()
       viewAll().assertDoesNotExist()
       assertFalse(
-        runtime.chatMessages.value
+        runtime.chat.messages.value
           .single()
           .truncated,
       )
@@ -284,12 +414,20 @@ class ChatFullMessageOwnershipLayoutTest {
       refreshSelectedChat()
       assertEquals(
         FULL_MESSAGE_ENTRY,
-        runtime.chatMessages.value
+        runtime.chat.messages.value
           .single()
           .entryId,
       )
       viewAll().assertDoesNotExist()
-      assertNull(runtime.prepareFullMessageRead(currentOwner(), runtime.chatSelectionGeneration.value, runtime.gatewayCatalogRevision.value, runtime.chatMessages.value.single()))
+      assertNull(
+        runtime.chat.prepareFullMessageRead(
+          currentOwner(),
+          runtime.chat.selectionGeneration.value,
+          runtime.gatewayCatalogRevision.value,
+          runtime.chat.messages.value
+            .single(),
+        ),
+      )
       assertTrue(gateway.fullReads.isEmpty())
     }
   }
@@ -335,7 +473,7 @@ class ChatFullMessageOwnershipLayoutTest {
   @Test
   fun inFlightResponseCannotPublishAfterItsPreviewBecomesAMessageToolMirror() =
     runBlocking {
-      val selection = runtime.chatSelectionGeneration.value
+      val selection = runtime.chat.selectionGeneration.value
       val catalog = runtime.gatewayCatalogRevision.value
       val connection = gateway.operatorConnection.get()
       gateway.holdFullResponses = true
@@ -345,12 +483,12 @@ class ChatFullMessageOwnershipLayoutTest {
         withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) { gateway.heldResponses.first { it.isNotEmpty() } }
         gateway.historyMessageToolMirror = true
         refreshSelectedChat()
-        assertEquals(selection, runtime.chatSelectionGeneration.value)
+        assertEquals(selection, runtime.chat.selectionGeneration.value)
         assertEquals(catalog, runtime.gatewayCatalogRevision.value)
         assertEquals(connection, gateway.operatorConnection.get())
         assertEquals(
           FULL_MESSAGE_ENTRY,
-          runtime.chatMessages.value
+          runtime.chat.messages.value
             .single()
             .entryId,
         )
@@ -390,7 +528,7 @@ class ChatFullMessageOwnershipLayoutTest {
           .config[SemanticsActions.OnClick]
           .action,
       )
-    val selection = runtime.chatSelectionGeneration.value
+    val selection = runtime.chat.selectionGeneration.value
     val catalog = runtime.gatewayCatalogRevision.value
     val connection = gateway.operatorConnection.get()
     val previousHistoryCount = gateway.historyReads.value.size
@@ -405,12 +543,12 @@ class ChatFullMessageOwnershipLayoutTest {
           .drop(previousHistoryCount)
           .contains(connection to FULL_MESSAGE_FIRST_CHAT),
       )
-      assertEquals(selection, runtime.chatSelectionGeneration.value)
+      assertEquals(selection, runtime.chat.selectionGeneration.value)
       assertEquals(catalog, runtime.gatewayCatalogRevision.value)
       assertEquals(connection, gateway.operatorConnection.get())
       assertEquals(
         FULL_MESSAGE_ENTRY,
-        runtime.chatMessages.value
+        runtime.chat.messages.value
           .single()
           .entryId,
       )
@@ -551,7 +689,7 @@ class ChatFullMessageOwnershipLayoutTest {
       viewAll().assertIsDisplayed()
       assertEquals(
         gateway.preview(FULL_MESSAGE_SECOND_CHAT),
-        runtime.chatMessages.value
+        runtime.chat.messages.value
           .single()
           .content
           .single()
@@ -655,9 +793,11 @@ class ChatFullMessageOwnershipLayoutTest {
   fun pendingFullReadSurvivesItsPreviewRowLeavingTheViewport() {
     val request = expectedRequest()
     val owner = currentOwner()
-    val selection = runtime.chatSelectionGeneration.value
+    val selection = runtime.chat.selectionGeneration.value
     val catalog = runtime.gatewayCatalogRevision.value
-    val preview = runtime.chatMessages.value.single()
+    val preview =
+      runtime.chat.messages.value
+        .single()
     gateway.holdFullResponses = true
     try {
       viewAll().assertIsDisplayed().assertIsEnabled().performClick()
@@ -665,9 +805,13 @@ class ChatFullMessageOwnershipLayoutTest {
       runBlocking { withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) { gateway.heldResponses.first { it.isNotEmpty() } } }
       appendBackgroundHistoryAndShowLatest()
       assertEquals(owner, currentOwner())
-      assertEquals(selection, runtime.chatSelectionGeneration.value)
+      assertEquals(selection, runtime.chat.selectionGeneration.value)
       assertEquals(catalog, runtime.gatewayCatalogRevision.value)
-      assertEquals(preview, runtime.chatMessages.value.first())
+      assertEquals(
+        preview,
+        runtime.chat.messages.value
+          .first(),
+      )
       composeRule.onNode(hasText("...(truncated)...", substring = true)).assertDoesNotExist()
       assertExpandedTextAbsent()
 
@@ -689,6 +833,32 @@ class ChatFullMessageOwnershipLayoutTest {
 
   @Test
   fun readingInsideExpandedCodePausesFollowingUntilJumpToLatest() {
+    assertInnerCodeInputPausesFollowing { viewport ->
+      viewport.performTouchInput { swipeUp(durationMillis = 500) }
+    }
+  }
+
+  @Test
+  fun mouseWheelInsideExpandedCodePausesFollowingUntilJumpToLatest() {
+    assertInnerCodeInputPausesFollowing { viewport ->
+      viewport.performMouseInput {
+        moveTo(center)
+        scroll(1f)
+      }
+    }
+  }
+
+  @Test
+  fun accessibilityScrollInsideExpandedCodePausesFollowingUntilJumpToLatest() {
+    assertInnerCodeInputPausesFollowing { viewport ->
+      val distance = viewport.fetchSemanticsNode().boundsInRoot.height / 2f
+      viewport.performSemanticsAction(SemanticsActions.ScrollBy) { scroll ->
+        assertTrue(scroll(0f, distance))
+      }
+    }
+  }
+
+  private fun assertInnerCodeInputPausesFollowing(scrollInsideCode: (SemanticsNodeInteraction) -> Unit) {
     val code = (0 until 700).joinToString("\n") { "Code line $it: keep this reading position." }
     val full = "```\n$code\n```"
     val response = gateway.fullResponse(FULL_MESSAGE_FIRST_CHAT)
@@ -697,8 +867,10 @@ class ChatFullMessageOwnershipLayoutTest {
     gateway.historyTextOverride = full.take(8_000) + "\n...(truncated)..."
     gateway.historyAppendRole = "assistant"
     refreshSelectedChat()
-    val preview = runtime.chatMessages.value.single()
-    val selection = runtime.chatSelectionGeneration.value
+    val preview =
+      runtime.chat.messages.value
+        .single()
+    val selection = runtime.chat.selectionGeneration.value
     val catalog = runtime.gatewayCatalogRevision.value
     viewAll().assertIsDisplayed().assertIsEnabled().performClick()
     composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
@@ -710,7 +882,7 @@ class ChatFullMessageOwnershipLayoutTest {
     composeRule.onNodeWithText("Copy").performClick()
     val clipboard = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
     assertEquals(
-      "The gesture must read the full answer, not its capped history",
+      "The input must read the full answer, not its capped history",
       full,
       clipboard.primaryClip
         ?.getItemAt(0)
@@ -731,11 +903,23 @@ class ChatFullMessageOwnershipLayoutTest {
         gateway.historyReads.value.size > before && !model.chatHistoryLoading.value && model.chatHealthOk.value && model.chatMessages.value.size == count + 1
       }
       composeRule.waitForIdle()
-      assertEquals(preview, runtime.chatMessages.value.first())
-      assertEquals(selection, runtime.chatSelectionGeneration.value)
+      assertEquals(
+        preview,
+        runtime.chat.messages.value
+          .first(),
+      )
+      assertEquals(selection, runtime.chat.selectionGeneration.value)
       assertEquals(catalog, runtime.gatewayCatalogRevision.value)
       assertNull(model.chatError.value)
     }
+
+    // View all pauses following. Return to latest through the outer list before testing the inner input.
+    val latestViewport = transcript.fetchSemanticsNode().boundsInRoot
+    transcript.performSemanticsAction(SemanticsActions.ScrollBy) { scroll ->
+      assertTrue(scroll(0f, -latestViewport.height))
+    }
+    composeRule.waitForIdle()
+    assertEquals("Explicit outer scrolling must settle at latest", 0f, transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value(), 0f)
 
     // Prove live-follow through consecutive updates, not an assumed Jump affordance after layout settles.
     appendAssistant(1)
@@ -746,16 +930,16 @@ class ChatFullMessageOwnershipLayoutTest {
     assertEquals("Following must bring the next update to latest without interaction", 0f, transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value(), 0f)
     codeViewport.assertIsDisplayed()
     val initialCode = codeViewport.fetchSemanticsNode()
-    assertEquals("The touch must stay inside the fully visible code viewport", initialCode.size.height.toFloat(), initialCode.boundsInRoot.height, 0.01f)
+    assertEquals("The input target must stay inside the fully visible code viewport", initialCode.size.height.toFloat(), initialCode.boundsInRoot.height, 0.01f)
     val outerBefore = transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value()
     assertEquals("Start in live-follow at the latest message", 0f, outerBefore, 0f)
     jump.assertDoesNotExist()
     val innerBefore = initialCode.config[SemanticsProperties.VerticalScrollAxisRange].value()
-    codeViewport.performTouchInput { swipeUp(durationMillis = 500) }
+    scrollInsideCode(codeViewport)
     composeRule.waitForIdle()
     val reading = codeViewport.fetchSemanticsNode()
     val readingOffset = reading.config[SemanticsProperties.VerticalScrollAxisRange].value()
-    assertTrue("The real touch must move within the code, not its outer transcript", readingOffset > innerBefore)
+    assertTrue("The selected input must move within the code, not its outer transcript", readingOffset > innerBefore)
     assertEquals("The child must consume this gesture without moving the transcript", outerBefore, transcript.fetchSemanticsNode().config[SemanticsProperties.VerticalScrollAxisRange].value(), 0f)
 
     appendAssistant(3)
@@ -826,17 +1010,79 @@ class ChatFullMessageOwnershipLayoutTest {
   }
 
   @Test
+  fun replacementOperatorLeaseSurvivesTheRestOfGatewayRefresh() =
+    runBlocking {
+      val nodeSession =
+        NodeRuntime::class.java
+          .getDeclaredField("nodeSession")
+          .apply { isAccessible = true }
+          .get(runtime) as GatewaySession
+      val nodeLifecycleLock =
+        checkNotNull(
+          GatewaySession::class.java
+            .getDeclaredField("lifecycleLock")
+            .apply { isAccessible = true }
+            .get(nodeSession),
+        )
+      val acquired = CountDownLatch(1)
+      val release = CountDownLatch(1)
+      val previousConnection = gateway.operatorConnection.get()
+      val heldNode =
+        async(Dispatchers.IO) {
+          synchronized(nodeLifecycleLock) {
+            acquired.countDown()
+            check(release.await(FULL_MESSAGE_READY_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+          }
+        }
+      val refresh =
+        async(Dispatchers.IO) {
+          check(acquired.await(FULL_MESSAGE_READY_TIMEOUT_MS, TimeUnit.MILLISECONDS))
+          runtime.refreshGatewayConnection()
+        }
+      try {
+        // Hold the second role's connect while the replacement operator finishes its
+        // real hello. Finishing one refresh must not close that new connection again.
+        val replacement =
+          withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) {
+            combine(gateway.historyReads, runtime.serverName) { reads, _ ->
+              val lease = operatorSession().captureRequestLease(gateway.endpoint.stableId)
+              val connection = gateway.operatorConnection.get()
+              lease?.takeIf {
+                connection > previousConnection &&
+                  runtime.serverName.value == "full-message-$connection" &&
+                  reads.any { it.first == connection && it.second == FULL_MESSAGE_FIRST_CHAT } &&
+                  it.isCurrent()
+              }
+            }.first { it != null }
+          }
+        val current = prepareCurrentRead()
+        release.countDown()
+        heldNode.await()
+        refresh.await()
+        assertTrue("The refreshed operator must survive the later node-role connect", checkNotNull(replacement).isCurrent())
+        current.execute()
+        assertEquals(gateway.fullText(FULL_MESSAGE_FIRST_CHAT), loadedText(current.state.value))
+      } finally {
+        release.countDown()
+        refresh.cancelAndJoin()
+        heldNode.cancelAndJoin()
+      }
+    }
+
+  @Test
   fun preparedReadSurvivesAnUnchangedRefreshButNotAChangedPreview() {
     val unchanged = prepareCurrentRead()
     refreshSelectedChat()
     runBlocking { unchanged.execute() }
     assertEquals(gateway.fullText(FULL_MESSAGE_FIRST_CHAT), loadedText(unchanged.state.value))
 
-    val oldPreview = runtime.chatMessages.value.single()
+    val oldPreview =
+      runtime.chat.messages.value
+        .single()
     val changed = prepareCurrentRead()
     gateway.previewPrefix = "An edited answer. "
     refreshSelectedChat()
-    assertNull(runtime.prepareFullMessageRead(currentOwner(), runtime.chatSelectionGeneration.value, runtime.gatewayCatalogRevision.value, oldPreview))
+    assertNull(runtime.chat.prepareFullMessageRead(currentOwner(), runtime.chat.selectionGeneration.value, runtime.gatewayCatalogRevision.value, oldPreview))
     runBlocking { changed.execute() }
     val current = prepareCurrentRead()
     runBlocking { current.execute() }
@@ -886,16 +1132,11 @@ class ChatFullMessageOwnershipLayoutTest {
       .assertIsEnabled()
       .performClick()
     selectChat(FULL_MESSAGE_SECOND_CHAT)
-    val operatorSession =
-      NodeRuntime::class.java
-        .getDeclaredField("operatorSession")
-        .apply { isAccessible = true }
-        .get(runtime) as GatewaySession
     val writeLock =
       GatewaySession::class.java
         .getDeclaredField("writeLock")
         .apply { isAccessible = true }
-        .get(operatorSession) as Mutex
+        .get(operatorSession()) as Mutex
     val lockOwner = Any()
     val autoAdvance = composeRule.mainClock.autoAdvance
     try {
@@ -969,7 +1210,7 @@ class ChatFullMessageOwnershipLayoutTest {
       if (index > 0) selectChat(if (index % 2 == 0) FULL_MESSAGE_FIRST_CHAT else FULL_MESSAGE_SECOND_CHAT)
       gateway.fullResponseOverride =
         if (reason == "still-capped") {
-          gateway.fullResponse(runtime.chatSessionKey.value, truncated = true)
+          gateway.fullResponse(runtime.chat.sessionKey.value, truncated = true)
         } else {
           buildJsonObject {
             put("ok", JsonPrimitive(false))
@@ -1124,7 +1365,9 @@ class ChatFullMessageOwnershipLayoutTest {
   fun closingFullReaderPreservesPreviewActionsAndCachedReopening() {
     gateway.includeMedia = true
     refreshSelectedChat()
-    val history = runtime.chatMessages.value.single()
+    val history =
+      runtime.chat.messages.value
+        .single()
     assertEquals(listOf("image", "text", "file", "text", "audio"), history.content.map { it.type })
     val full = gateway.fullText(FULL_MESSAGE_FIRST_CHAT) + "\n\n" + FULL_MESSAGE_MEDIA_TEXT
     val preview = gateway.preview(FULL_MESSAGE_FIRST_CHAT) + "\n\n" + FULL_MESSAGE_MEDIA_TEXT
@@ -1203,7 +1446,11 @@ class ChatFullMessageOwnershipLayoutTest {
     assertEquals("Full and preview actions plus cached reopening must not fetch again", 1, gateway.fullReads.size)
     composeRule.onNodeWithText("Show less").performScrollTo().performClick()
     assertInlineCollapsed()
-    assertEquals(history, runtime.chatMessages.value.single())
+    assertEquals(
+      history,
+      runtime.chat.messages.value
+        .single(),
+    )
   }
 
   @Test
@@ -1246,7 +1493,9 @@ class ChatFullMessageOwnershipLayoutTest {
   }
 
   private fun assertDisconnectedReaderSurvivesFailedReconnect() {
-    val preview = runtime.chatMessages.value.single()
+    val preview =
+      runtime.chat.messages.value
+        .single()
     val catalog = runtime.gatewayCatalogRevision.value
     gateway.disconnectOperatorAndRejectReconnects()
     composeRule.waitUntil(FULL_MESSAGE_READY_TIMEOUT_MS) {
@@ -1255,9 +1504,13 @@ class ChatFullMessageOwnershipLayoutTest {
         !model.gatewayConnectionDisplay.value.isConnected &&
         runtime.gatewayCatalogRevision.value > catalog &&
         model.gatewayCatalogRevision.value == runtime.gatewayCatalogRevision.value &&
-        model.chatSelectionGeneration.value == runtime.chatSelectionGeneration.value
+        model.chatSelectionGeneration.value == runtime.chat.selectionGeneration.value
     }
-    assertEquals(preview, runtime.chatMessages.value.single())
+    assertEquals(
+      preview,
+      runtime.chat.messages.value
+        .single(),
+    )
     viewAll().assertIsDisplayed().assertIsEnabled()
     viewAll().performClick()
     composeRule.onNodeWithText("Reconnect to load the full message.").assertIsDisplayed()
@@ -1290,11 +1543,23 @@ class ChatFullMessageOwnershipLayoutTest {
       .performSemanticsAction(SemanticsActions.OnLongClick) { it() }
   }
 
-  private fun currentOwner() = ChatComposerOwner(gateway.endpoint.stableId, "main", runtime.chatSessionKey.value)
+  private fun currentOwner() = ChatComposerOwner(gateway.endpoint.stableId, "main", runtime.chat.sessionKey.value)
+
+  private fun operatorSession(): GatewaySession =
+    NodeRuntime::class.java
+      .getDeclaredField("operatorSession")
+      .apply { isAccessible = true }
+      .get(runtime) as GatewaySession
 
   private fun prepareCurrentRead() =
     checkNotNull(
-      runtime.prepareFullMessageRead(currentOwner(), runtime.chatSelectionGeneration.value, runtime.gatewayCatalogRevision.value, runtime.chatMessages.value.single()),
+      runtime.chat.prepareFullMessageRead(
+        currentOwner(),
+        runtime.chat.selectionGeneration.value,
+        runtime.gatewayCatalogRevision.value,
+        runtime.chat.messages.value
+          .single(),
+      ),
     )
 
   private fun loadedText(value: ChatFullMessageState) = chatMessagePlainText((value as ChatFullMessageState.Loaded).content)
@@ -1305,14 +1570,14 @@ class ChatFullMessageOwnershipLayoutTest {
     runBlocking { old.execute() }
     val current = prepareCurrentRead()
     runBlocking { current.execute() }
-    assertEquals(gateway.fullText(runtime.chatSessionKey.value), loadedText(current.state.value))
+    assertEquals(gateway.fullText(runtime.chat.sessionKey.value), loadedText(current.state.value))
     assertEquals("Only the fresh operation may dispatch after retirement", listOf(expectedRequest()), gateway.fullReads.toList())
     assertEquals(ChatFullMessageState.Loading, old.state.value)
   }
 
   private fun refreshSelectedChat() {
     val before = gateway.historyReads.value.size
-    val key = runtime.chatSessionKey.value
+    val key = runtime.chat.sessionKey.value
     val connection = gateway.operatorConnection.get()
     composeRule.runOnIdle { model.refreshChat() }
     runBlocking {
@@ -1353,16 +1618,26 @@ class ChatFullMessageOwnershipLayoutTest {
 
   private fun replaceConnectionBeforeRecomposition() {
     val oldConnection = gateway.operatorConnection.get()
-    val key = runtime.chatSessionKey.value
+    val key = runtime.chat.sessionKey.value
+    val session = operatorSession()
     runtime.refreshGatewayConnection()
     runBlocking {
       withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) {
-        gateway.historyReads.first { reads -> reads.any { it.first > oldConnection && it.second == key } }
+        // A server-side read is not proof that the replacement is still current.
+        // Capturing its lease waits for hello publication without advancing Compose.
+        combine(gateway.historyReads, runtime.serverName) { reads, _ ->
+          val lease = session.captureRequestLease(gateway.endpoint.stableId)
+          val connection = gateway.operatorConnection.get()
+          connection > oldConnection &&
+            runtime.serverName.value == "full-message-$connection" &&
+            reads.any { it.first == connection && it.second == key } &&
+            lease?.isCurrent() == true
+        }.first { it }
       }
     }
     assertTrue(gateway.operatorConnection.get() > oldConnection)
-    assertEquals("full-message-${gateway.operatorConnection.get()}", runtime.serverName.value)
     awaitRuntimeReady(key)
+    assertEquals("full-message-${gateway.operatorConnection.get()}", runtime.serverName.value)
   }
 
   private fun assertRetiredDisclosureCannotLoad(
@@ -1388,16 +1663,16 @@ class ChatFullMessageOwnershipLayoutTest {
       // Runtime IO consumes the real replacement history while Main is occupied. Replay the
       // retained rendered callback before Compose can apply the changed owner (including ABA).
       retire()
-      assertFalse(runtime.chatHistoryLoading.value)
-      assertTrue(runtime.chatHealthOk.value)
-      assertNull(runtime.chatError.value)
+      assertFalse(runtime.chat.historyLoading.value)
+      assertTrue(runtime.chat.healthOk.value)
+      assertNull(runtime.chat.errorText.value)
       oldAction()
     }
     composeRule.waitForIdle()
     assertExpandedTextAbsent()
     val previousHistoryCount = gateway.historyReads.value.size
     val currentConnection = gateway.operatorConnection.get()
-    val currentSession = runtime.chatSessionKey.value
+    val currentSession = runtime.chat.sessionKey.value
     composeRule.runOnIdle { model.refreshChat() }
     runBlocking {
       withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) {
@@ -1431,10 +1706,10 @@ class ChatFullMessageOwnershipLayoutTest {
       }
     } catch (failure: Exception) {
       throw AssertionError(
-        "Chat readiness for $key: runtime=${runtime.chatSessionKey.value}/${runtime.chatHistoryLoading.value}/${runtime.chatHealthOk.value}; " +
+        "Chat readiness for $key: runtime=${runtime.chat.sessionKey.value}/${runtime.chat.historyLoading.value}/${runtime.chat.healthOk.value}; " +
           "model=${model.chatSessionKey.value}/${model.chatHistoryLoading.value}/${model.chatHealthOk.value}; " +
-          "rows=${runtime.chatMessages.value.size}/${model.chatMessages.value.size}; " +
-          "textMatches=${runtime.chatMessages.value
+          "rows=${runtime.chat.messages.value.size}/${model.chatMessages.value.size}; " +
+          "textMatches=${runtime.chat.messages.value
             .singleOrNull()
             ?.content
             ?.firstOrNull { it.type == "text" }
@@ -1444,7 +1719,7 @@ class ChatFullMessageOwnershipLayoutTest {
             ?.content
             ?.firstOrNull { it.type == "text" }
             ?.text == gateway.historyText(key)}; " +
-          "error=${runtime.chatError.value}/${model.chatError.value}; " +
+          "error=${runtime.chat.errorText.value}/${model.chatError.value}; " +
           "connected=${runtime.gatewayConnectionDisplay.value.isConnected}; " +
           "history=${gateway.historyReads.value.takeLast(8)}",
         failure,
@@ -1458,13 +1733,13 @@ class ChatFullMessageOwnershipLayoutTest {
   private fun selectBeforeRecomposition(key: String) {
     model.switchChatSession(key, ownerAgentId = "main")
     awaitRuntimeReady(key)
-    assertEquals(key, runtime.chatSessionKey.value)
+    assertEquals(key, runtime.chat.sessionKey.value)
   }
 
   private fun awaitRuntimeReady(key: String) {
     runBlocking {
       withTimeout(FULL_MESSAGE_READY_TIMEOUT_MS) {
-        combine(runtime.chatMessages, runtime.chatHistoryLoading, runtime.chatHealthOk) { messages, loading, healthy ->
+        combine(runtime.chat.messages, runtime.chat.historyLoading, runtime.chat.healthOk) { messages, loading, healthy ->
           !loading &&
             healthy &&
             messages
@@ -1475,12 +1750,12 @@ class ChatFullMessageOwnershipLayoutTest {
         }.first { it }
       }
     }
-    assertNull(runtime.chatError.value)
+    assertNull(runtime.chat.errorText.value)
   }
 
   private fun awaitInlineExpanded(
     tail: String = FULL_MESSAGE_TAIL,
-    expected: String = gateway.fullText(runtime.chatSessionKey.value),
+    expected: String = gateway.fullText(runtime.chat.sessionKey.value),
   ) {
     assertTrue("View all must expand the transcript bubble without opening a dialog", composeRule.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty())
     val assistant = hasAnyAncestor(hasContentDescription("OpenClaw"))
@@ -1503,7 +1778,7 @@ class ChatFullMessageOwnershipLayoutTest {
     composeRule.onNode(isDialog()).assertDoesNotExist()
   }
 
-  private fun awaitExpanded(expected: String = gateway.fullText(runtime.chatSessionKey.value)) {
+  private fun awaitExpanded(expected: String = gateway.fullText(runtime.chat.sessionKey.value)) {
     awaitInlineExpanded(tail = expected.lineSequence().last { it.isNotBlank() }.takeLast(128), expected = expected)
   }
 
@@ -1699,6 +1974,8 @@ internal class FullMessageGateway : AutoCloseable {
   val operatorConnection = AtomicInteger()
   val fullReads = CopyOnWriteArrayList<FullMessageRead>()
   val historyReads = MutableStateFlow<List<Pair<Int, String>>>(emptyList())
+  val historyAgentReads = MutableStateFlow<List<Pair<String, String>>>(emptyList())
+  val historyRetryableRefusals = AtomicInteger()
   val speechReads = MutableStateFlow<List<String>>(emptyList())
   val heldResponses = MutableStateFlow<List<() -> Unit>>(emptyList())
 
@@ -1706,7 +1983,11 @@ internal class FullMessageGateway : AutoCloseable {
 
   @Volatile var fullResponseOverride: JsonObject? = null
 
+  @Volatile var includeToolCall = false
+
   @Volatile var previewPrefix = ""
+
+  @Volatile var historyMessagesOverride: JsonArray? = null
 
   @Volatile var historyRole = "assistant"
 
@@ -1809,6 +2090,7 @@ internal class FullMessageGateway : AutoCloseable {
         fun reject(
           code: String,
           message: String,
+          retryable: Boolean = false,
         ) {
           webSocket.send(
             buildJsonObject {
@@ -1820,6 +2102,10 @@ internal class FullMessageGateway : AutoCloseable {
                 buildJsonObject {
                   put("code", JsonPrimitive(code))
                   put("message", JsonPrimitive(message))
+                  if (retryable) {
+                    put("retryable", JsonPrimitive(true))
+                    put("details", buildJsonObject { put("method", JsonPrimitive("chat.history")) })
+                  }
                 },
               )
             }.toString(),
@@ -1837,19 +2123,25 @@ internal class FullMessageGateway : AutoCloseable {
                 if (omitMethodCatalog) {
                   ""
                 } else {
-                  "\"methods\":[\"chat.history\",${if (advertiseFullRead) "\"chat.message.get\"," else ""}\"chat.metadata\",\"health\",\"sessions.list\"],"
+                  "\"methods\":[\"agents.list\",\"chat.history\",${if (advertiseFullRead) "\"chat.message.get\"," else ""}\"chat.metadata\",\"models.list\",\"health\",\"sessions.list\"],"
                 }
               json.parseToJsonElement(
-                """{"type":"hello-ok","protocol":3,"server":{"host":"full-message-$connection","version":"proof"},"features":{$methods"events":[]},"auth":{"role":"$role","scopes":${if (role == "operator") "[\"operator.read\",\"operator.write\"]" else "[]"}},"snapshot":{"sessionDefaults":{"mainSessionKey":"agent:main:main"}}}""",
+                """{"type":"hello-ok","protocol":3,"server":{"host":"full-message-$connection","version":"proof"},"features":{$methods"events":[],"capabilities":["session-scoped-model-catalog"]},"auth":{"role":"$role","scopes":${if (role == "operator") "[\"operator.read\",\"operator.write\"]" else "[]"}},"snapshot":{"sessionDefaults":{"mainSessionKey":"agent:main:main"}}}""",
               )
             }
+
             "chat.history" -> {
               historyReads.update { it + (connection to session) }
+              historyAgentReads.update { it + (session to params["agentId"]?.jsonPrimitive?.content.orEmpty()) }
+              if (historyRetryableRefusals.getAndUpdate { (it - 1).coerceAtLeast(0) } > 0) {
+                reject("UNAVAILABLE", "Synthetic history worker refusal", retryable = true)
+                return
+              }
               buildJsonObject {
                 put("sessionId", JsonPrimitive("transcript-$session"))
                 put(
                   "messages",
-                  JsonArray(
+                  historyMessagesOverride ?: JsonArray(
                     buildList {
                       add(message(session, truncated = historyTruncated, role = historyRole, text = historyText(session), mirror = historyMessageToolMirror, history = true))
                       repeat(historyAppendCount) { index ->
@@ -1866,6 +2158,7 @@ internal class FullMessageGateway : AutoCloseable {
                 )
               }
             }
+
             "chat.message.get" -> {
               fullReads += FullMessageRead(connection, session, params["agentId"]?.jsonPrimitive?.content.orEmpty(), params["messageId"]?.jsonPrimitive?.content.orEmpty(), params["maxChars"]?.jsonPrimitive?.content?.toIntOrNull())
               if (fullReadRpcError) {
@@ -1874,14 +2167,33 @@ internal class FullMessageGateway : AutoCloseable {
               }
               fullResponseOverride ?: fullResponse(session)
             }
+
             "tts.speak" -> {
               // Observe the production Listen request without starting unrelated platform audio.
               speechReads.update { it + params.getValue("text").jsonPrimitive.content }
               return
             }
-            "chat.metadata" -> json.parseToJsonElement("""{"commands":[],"models":[]}""")
-            "sessions.list" -> json.parseToJsonElement("""{"sessions":[]}""")
-            "health", "sessions.subscribe", "sessions.messages.subscribe" -> JsonObject(emptyMap())
+
+            "chat.metadata" -> {
+              json.parseToJsonElement("""{"commands":[]}""")
+            }
+
+            "models.list" -> {
+              json.parseToJsonElement("""{"models":[]}""")
+            }
+
+            "agents.list" -> {
+              json.parseToJsonElement("""{"defaultId":"main","mainKey":"main","agents":[{"id":"main"}]}""")
+            }
+
+            "sessions.list" -> {
+              json.parseToJsonElement("""{"sessions":[]}""")
+            }
+
+            "health", "sessions.subscribe", "sessions.messages.subscribe" -> {
+              JsonObject(emptyMap())
+            }
+
             else -> {
               reject("INVALID_REQUEST", "Proof Gateway does not implement $method")
               return
@@ -1979,6 +2291,21 @@ internal class FullMessageGateway : AutoCloseable {
               )
             }
           },
+        )
+      } else if (includeToolCall) {
+        JsonArray(
+          listOf(
+            buildJsonObject {
+              put("type", JsonPrimitive("text"))
+              put("text", JsonPrimitive(text))
+            },
+            buildJsonObject {
+              put("type", JsonPrimitive("toolCall"))
+              put("id", JsonPrimitive("mixed-tool"))
+              put("name", JsonPrimitive("exec"))
+              put("arguments", buildJsonObject { put("command", JsonPrimitive("pwd")) })
+            },
+          ),
         )
       } else if (contentAsBlocks) {
         JsonArray(

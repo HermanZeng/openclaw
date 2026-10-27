@@ -12,6 +12,14 @@ sidebarTitle: "Web Fetch"
 markdown or text). It does **not** execute JavaScript. For JS-heavy sites or
 login-protected pages, use the [Web Browser](/tools/browser) instead.
 
+Basic HTML extraction preserves boundaries around block content such as quotes,
+figure captions, and collapsible sections.
+
+HTML cleanup excludes text hidden by recognized inline styles, including scale
+transforms that collapse the X or Y axis, such as `scale(0, 0)` and
+`scale3d(0, 0, 0)`. Nonzero scales and a zero Z axis alone remain visible.
+Basic HTML extraction keeps definition-list terms and values on separate lines.
+
 ## Quick start
 
 Enabled by default, no configuration needed:
@@ -27,7 +35,11 @@ URL to fetch. `http(s)` only.
 </ParamField>
 
 <ParamField path="extractMode" type="'markdown' | 'text'" default="markdown">
-Output format after main-content extraction.
+Output format after main-content extraction. For Markdown responses, text mode
+normalizes prose whitespace but preserves indentation, repeated spaces, tabs,
+and blank lines inside code blocks fenced with backticks or tildes.
+Text mode removes complete link destinations, including nested parentheses.
+Readability text output keeps headings, paragraphs, and list items on separate lines.
 </ParamField>
 
 <ParamField path="maxChars" type="number">
@@ -87,6 +99,12 @@ Set `tools.web.fetch.cacheTtlMinutes: 0` to bypass OpenClaw's fetch cache for bo
 reads and writes. A positive value limits reuse by the current request's TTL;
 cached entries still expire at their original deadline. Provider-side caching,
 such as Firecrawl's `maxAgeMs`, is configured separately.
+
+Response decoding honors a byte-order mark first, then the HTTP `Content-Type`
+charset, then an XML declaration or HTML charset metadata. Without a supported
+charset, it falls back to UTF-8. ASCII-compatible documents that declare UTF-16
+in their XML or HTML metadata are decoded as UTF-8 instead; correctly declared
+legacy encodings such as Windows-1252 remain supported.
 
 ## Progress updates
 
@@ -202,7 +220,7 @@ Current runtime behavior:
   whose official npm or ClawHub provenance is verified. Today that permits the
   official Firecrawl plugin; third-party external fetch plugins stay excluded.
 - If Readability is disabled, `web_fetch` skips straight to the selected
-  provider fallback. If no provider is available, it fails closed.
+  provider fallback. If no provider is available, the request fails.
 
 ## Custom request headers
 
@@ -239,7 +257,7 @@ Behavior worth knowing:
   [Firecrawl](/tools/firecrawl) call their own API and never receive these headers.
 - Entries are validated when the request is built, not at config load, so one bad
   entry is dropped while the rest still apply. Config load stays permissive on
-  purpose: a fail-closed validation error over a single header-name typo would
+  purpose: rejecting the config over a single header-name typo would
   disable the whole surface. Every dropped entry is logged by name.
 - Dropped names:
   - `Accept`, `Accept-Language`, and `User-Agent` belong to the fetch and
@@ -274,8 +292,28 @@ outbound policy after DNS resolution.
 <Note>
   If no HTTP(S) proxy env var is configured, or the target host is excluded by
   `NO_PROXY`, `web_fetch` falls back to the normal strict path with local DNS
-  pinning.
+  pinning. Hostname matching ignores case and a single trailing DNS dot in
+  either the URL or the `NO_PROXY` entry.
 </Note>
+
+## Saved output
+
+When fetched content exceeds the inline limit, `web_fetch` includes a `spill.path`
+and a **Full output** location. Use `read` with that path and bounded `offset`/`limit`
+arguments to retrieve the omitted content. Saved output retains the untrusted-content
+warning and is capped at 2,000,000 characters; `spill.truncated` indicates an
+incomplete saved response.
+
+Local Docker and Podman sandboxes save this output in their existing private
+input-staging area, accessible through the sandbox reader. Cached saved paths remain
+scoped to the requesting session and sandbox workspace. Recovery also works when
+guest workspace access is read-only: the trusted input-staging owner prepares the
+file without granting guest write access.
+
+Other backends, including remote-shell sandboxes, need a prepared input-staging
+capability before saved output is available. Without it, the inline result reports
+that full output is unavailable, makes no staging write, and advertises no host-only
+path. An unsuccessful save is not cached.
 
 ## Limits and safety
 
@@ -284,6 +322,7 @@ outbound policy after DNS resolution.
   32000-10000000) before parsing; oversized responses are truncated with a warning
 - Private/internal hostnames are blocked
 - `tools.web.fetch.ssrfPolicy.allowedHostnames` allows exact trusted hosts while leaving other private/internal targets blocked
+- `tools.web.fetch.ssrfPolicy.blockedHostnames` denies exact hosts and wildcard subdomains before DNS and allow rules, including on redirects and with private-network access enabled. For example, `["tracker.example.com", "*.ads.example.com"]` blocks those hosts without requiring a full allowlist. Wildcards do not match the apex; add `ads.example.com` separately to block it. Matching ignores case and trailing dots; use ASCII/Punycode for internationalized domains. Empty or unset adds no denials
 - `tools.web.fetch.ssrfPolicy.dangerouslyAllowPrivateNetwork` broadly permits private-network targets; enable it only when model-selected URLs are trusted in this deployment
 - `tools.web.fetch.ssrfPolicy.allowRfc2544BenchmarkRange` and
   `tools.web.fetch.ssrfPolicy.allowIpv6UniqueLocalRange` are narrow opt-ins

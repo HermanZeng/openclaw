@@ -14,7 +14,6 @@ export function recordSourceReplyEvidence(
     toolDelivered &&
     outcome.kind === "settled" &&
     outcome.status === "ok" &&
-    !outcome.abortReason &&
     params.replyOperation
   ) {
     // This runs before execution returns: owner-clear callbacks must never

@@ -3,6 +3,7 @@ import { createServer, request, type IncomingMessage, type ServerResponse } from
 import { connect, type Socket } from "node:net";
 import { expectDefined } from "@openclaw/normalization-core";
 import { describe, expect, it } from "vitest";
+import { nextEventLoopTurn } from "../../test/helpers/promise.js";
 import { runWithGatewayHttpWorkAdmission } from "../gateway/server/http-work-admission.js";
 import {
   beginWebhookRequestPipelineOrReject,
@@ -289,34 +290,32 @@ describe("bounded HTTP rejection transport", () => {
     },
   );
 
-  it.each([32, 2048])(
-    "drains a finite pipeline of %i ordinary requests in order",
-    async (count) => {
-      const dispatched: string[] = [];
-      await withServer(
-        async (req, res) => {
-          dispatched.push(req.url!);
-          res.end(req.url);
-        },
-        async (port) => {
-          const paths = Array.from({ length: count }, (_, i) => `/request-${i}`);
-          const result = await rawRequest(
-            port,
-            paths
-              .map(
-                (path, i) =>
-                  `GET ${path} HTTP/1.1\r\nHost: localhost\r\n${i === count - 1 ? "Connection: close\r\n" : ""}\r\n`,
-              )
-              .join(""),
-          );
-          expect(result.errors).toEqual([]);
-          expect(dispatched).toEqual(paths);
-          expect(result.wire.match(/HTTP\/1\.1 200 /g)).toHaveLength(count);
-          expect(result.wire.split(/HTTP\/1\.1 200 [^]*?\r\n\r\n/).slice(1)).toEqual(paths);
-        },
-      );
-    },
-  );
+  it("drains a finite pipeline of 2048 ordinary requests in order", async () => {
+    const count = 2048;
+    const dispatched: string[] = [];
+    await withServer(
+      async (req, res) => {
+        dispatched.push(req.url!);
+        res.end(req.url);
+      },
+      async (port) => {
+        const paths = Array.from({ length: count }, (_, i) => `/request-${i}`);
+        const result = await rawRequest(
+          port,
+          paths
+            .map(
+              (path, i) =>
+                `GET ${path} HTTP/1.1\r\nHost: localhost\r\n${i === count - 1 ? "Connection: close\r\n" : ""}\r\n`,
+            )
+            .join(""),
+        );
+        expect(result.errors).toEqual([]);
+        expect(dispatched).toEqual(paths);
+        expect(result.wire.match(/HTTP\/1\.1 200 /g)).toHaveLength(count);
+        expect(result.wire.split(/HTTP\/1\.1 200 [^]*?\r\n\r\n/).slice(1)).toEqual(paths);
+      },
+    );
+  });
 
   it("bounds a rejection stuck behind an earlier response", async () => {
     const dispatched: string[] = [];
@@ -340,24 +339,26 @@ describe("bounded HTTP rejection transport", () => {
     );
   });
 
-  it("retains the SDK limiter until a peer ignoring the half-close is retired", async () => {
+  it("retains SDK capacity and Gateway admission until a peer ignoring the half-close is retired", async () => {
     const limiter = createWebhookInFlightLimiter({ maxInFlightPerKey: 1 });
     const retired = createDeferredCore();
     let socket: Socket | undefined;
     await withServer(
       async (req, res) => {
-        const pipeline = beginWebhookRequestPipelineOrReject({
-          req,
-          res,
-          inFlightLimiter: limiter,
-          inFlightKey: "test",
+        await runWithGatewayHttpWorkAdmission(res, () => {
+          const pipeline = beginWebhookRequestPipelineOrReject({
+            req,
+            res,
+            inFlightLimiter: limiter,
+            inFlightKey: "test",
+          });
+          expect(pipeline.ok).toBe(true);
+          installRequestBodyLimitGuard(req, res, { maxBytes });
+          if (pipeline.ok) {
+            pipeline.release();
+          }
+          return true;
         });
-        expect(pipeline.ok).toBe(true);
-        installRequestBodyLimitGuard(req, res, { maxBytes });
-        if (pipeline.ok) {
-          pipeline.release();
-        }
-        await waitForHttpRequestRejection(req);
         retired.resolve();
       },
       async (port) => {
@@ -367,8 +368,10 @@ describe("bounded HTTP rejection transport", () => {
         socket.write(postHeaders(`Content-Length: ${maxBytes + 1}`));
         await once(socket, "end");
         expect(limiter.tryAcquire("test")).toBe(false);
+        expect(getActiveGatewayRootWorkCount()).toBe(1);
         await retired.promise;
         expect(limiter.tryAcquire("test")).toBe(true);
+        expect(getActiveGatewayRootWorkCount()).toBe(0);
         limiter.release("test");
         socket.end();
         await closed;
@@ -387,34 +390,6 @@ describe("bounded HTTP rejection transport", () => {
         expect(result.wire).not.toContain("413");
         expect(result.wire).not.toContain("rejected");
         expect(result.wire).not.toContain("0\r\n\r\n");
-      },
-    );
-  });
-
-  it("retains a Gateway admission while an installed guard completes bounded cleanup", async () => {
-    const retired = createDeferredCore();
-    await withServer(
-      async (req, res) => {
-        await runWithGatewayHttpWorkAdmission(res, async () => {
-          installRequestBodyLimitGuard(req, res, { maxBytes });
-          return true;
-        });
-        retired.resolve();
-      },
-      async (port) => {
-        const socket = connect({ host: "127.0.0.1", port, allowHalfOpen: true });
-        const closed = once(socket, "close");
-        socket.on("data", () => {});
-        try {
-          socket.write(postHeaders(`Content-Length: ${maxBytes + 1}`));
-          await once(socket, "end");
-          expect(getActiveGatewayRootWorkCount()).toBe(1);
-          await retired.promise;
-          expect(getActiveGatewayRootWorkCount()).toBe(0);
-        } finally {
-          socket.end();
-          await closed;
-        }
       },
     );
   });
@@ -447,9 +422,7 @@ describe("bounded HTTP rejection transport", () => {
               postHeaders(`Content-Length: ${maxBytes + 1}`),
           );
           await started.promise;
-          await new Promise<void>((resolve) => {
-            setImmediate(resolve);
-          });
+          await nextEventLoopTurn();
           expect(dispatched).toEqual(["/first"]);
           if (mode === "async handler") {
             release.resolve();

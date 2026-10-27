@@ -1,5 +1,10 @@
 import type { CreatedTabOperation, TabAccessEpoch, TabAccessPolicy } from "./tab-access.js";
-import type { AccessibleBrowserTabSnapshot, BrowserTabSnapshot } from "./tab-eligibility.js";
+import type { BrowserTabSnapshot } from "./tab-eligibility.js";
+
+type RequireRelayTab = (
+  tabId: number,
+  epoch: TabAccessEpoch,
+) => ReturnType<TabAccessPolicy["requireTab"]>;
 
 export function createRelayCommandHandler(params: {
   isCurrent: () => boolean;
@@ -9,6 +14,7 @@ export function createRelayCommandHandler(params: {
   createTab: (message: Record<string, unknown>, operation: CreatedTabOperation) => Promise<void>;
   focusWindowForTab: (tab: BrowserTabSnapshot) => Promise<void>;
   scheduleTabsSync: () => void;
+  captureDebugger: (tabId: number) => () => void;
   captureAccess: (tabId: number, method?: string) => TabAccessEpoch;
   navigateTab: (
     tabId: number,
@@ -17,9 +23,6 @@ export function createRelayCommandHandler(params: {
     isCurrent: () => boolean,
     sendCommand: (method: string, params: Record<string, unknown>) => Promise<unknown>,
   ) => Promise<unknown>;
-  requireNavigatedTab: TabAccessPolicy["requireTabAfterNavigation"];
-  requireAccessibleTab: (
-    tabId: number,
-    epoch: TabAccessEpoch,
-  ) => Promise<AccessibleBrowserTabSnapshot>;
+  requireNavigatedTab: RequireRelayTab;
+  requireAccessibleTab: RequireRelayTab;
 }): (message: Record<string, unknown>) => Promise<void>;

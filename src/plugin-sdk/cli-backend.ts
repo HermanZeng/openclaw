@@ -1,6 +1,3 @@
-/**
- * Public SDK type surface for CLI backend plugins and watchdog defaults.
- */
 export type {
   CliBackendAuthEpochMode,
   CliBackendConfig,
@@ -11,11 +8,14 @@ export type {
   CliBackendLiveSessionCapability,
   CliBackendLiveSessionCloseReason,
   CliBackendLiveSessionHandle,
+  CliBackendMessageInjection,
   CliBackendNormalizeConfigContext,
   CliBackendNativeToolMode,
   CliBackendParseJsonlEvent,
   CliBackendParseJsonlEventContext,
+  CliBackendParseJsonlLifecycleEvent,
   CliBackendParsedJsonlEvent,
+  CliBackendParsedJsonlLifecycleEvent,
   CliBackendPlugin,
   CliBackendPreparedExecution,
   CliBackendPromptContext,
@@ -27,6 +27,7 @@ export type {
   CliBackendToolAvailabilityEnforcement,
   CliBackendToolPermissionRequest,
   CliBackendToolPermissionResult,
+  CliBackendTurnInterrupt,
   CliBackendThinkingLevel,
   CliBackendUserInputOption,
   CliBackendUserInputQuestion,

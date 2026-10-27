@@ -1,199 +1,339 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDeferred } from "../../../test/helpers/promise.js";
-import type { AdmittedFollowupTurn } from "./followup-turn-admission.js";
-import type { FollowupExecutionResult } from "./followup-turn-execution.js";
-import type { FollowupRun, QueueSettings } from "./queue.js";
+import { randomUUID } from "node:crypto";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, assert, describe, expect, it } from "vitest";
+import type {
+  ReplyOperation,
+  SessionControllerMailboxClaim,
+} from "../../sessions/session-controller.contracts.js";
+import { deferSessionControllerClaimBeforeExecution } from "../../sessions/session-controller.mailbox-claim.js";
+import {
+  claimSessionControllerInput,
+  releaseSessionControllerClaim,
+  retireSessionControllerInput,
+} from "../../sessions/session-controller.mailbox.js";
+import { createReplyOperation } from "../../sessions/session-controller.operation.js";
+import { runAfterReplyOperationClear } from "../../sessions/session-controller.state.js";
+import { createDeferredCore } from "../../shared/deferred.js";
+import { createQueueTestRun } from "./queue.test-helpers.js";
+import { scheduleFollowupDrain } from "./queue/drain.js";
+import { enqueueFollowupRun } from "./queue/enqueue.js";
+import { admitFollowupRunLifecycle, completeFollowupRunLifecycle } from "./queue/lifecycle.js";
+import type { FollowupRun } from "./queue/types.js";
+import {
+  appendCompletedSourceReplyHandoffDirective,
+  consumeQueuedReplyCompletionHandoff,
+  publishReplyOperationCompletionHandoff,
+  recordReplyOperationCompletedSourceReply,
+} from "./reply-completion-handoff.js";
 
-const state = vi.hoisted(() => ({
-  account: vi.fn(),
-  admit: vi.fn(),
-  deliver: vi.fn(),
-  execute: vi.fn(),
-  resolveDecision: vi.fn(),
-}));
+const MARKER = "immediately preceding turn already delivered";
+const operations: ReplyOperation[] = [];
+const claims: SessionControllerMailboxClaim[] = [];
+const runs: FollowupRun[] = [];
 
-vi.mock("../../infra/agent-run-registry.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../../infra/agent-run-registry.js")>()),
-  clearAgentRunContext: vi.fn(),
-}));
-vi.mock("../../agents/embedded-agent-runner/delivery-evidence.js", async (importOriginal) => ({
-  ...(await importOriginal<
-    typeof import("../../agents/embedded-agent-runner/delivery-evidence.js")
-  >()),
-  hasCompletedSourceReplyDeliveryEvidence: () => true,
-}));
-vi.mock("./agent-runner-result-accounting.js", () => ({
-  accountFollowupTurn: (...args: unknown[]) => state.account(...args),
-}));
-vi.mock("./followup-turn-admission.js", () => ({
-  admitFollowupTurn: (...args: unknown[]) => state.admit(...args),
-  settleQueuedFollowupPresentation: vi.fn(async () => {}),
-}));
-vi.mock("./followup-turn-execution.js", () => ({
-  executeFollowupTurn: (...args: unknown[]) => state.execute(...args),
-}));
-vi.mock("./followup-delivery.js", () => ({
-  deliverFollowupDecision: (...args: unknown[]) => state.deliver(...args),
-  resolveFollowupDeliveryDecision: (...args: unknown[]) => state.resolveDecision(...args),
-}));
-vi.mock("../../runtime.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../../runtime.js")>();
-  return { ...actual, defaultRuntime: { ...actual.defaultRuntime, error: vi.fn() } };
-});
-
-const { scheduleFollowupDrainAfterReplyOperationClear } = await import("./agent-runner-core.js");
-const { createFollowupRunner } = await import("./followup-runner.js");
-const { clearSessionQueues, enqueueFollowupRun } = await import("./queue.js");
-const { createQueueTestRun } = await import("./queue.test-helpers.js");
-const { consumeQueuedReplyCompletionHandoff, recordReplyOperationCompletedSourceReply } =
-  await import("./reply-completion-handoff.js");
-const { createReplyOperation } = await import("./reply-run-registry.js");
-
-function createQueuedRun(key: string, prompt: string): FollowupRun {
-  const queued = createQueueTestRun({
-    prompt,
-    currentInboundEventKind: "user_request",
-    originatingChannel: "telegram",
-    originatingTo: "chat-1",
-    originatingAccountId: "primary",
-    originatingThreadId: 7,
-  });
-  queued.run.sessionKey = key;
-  queued.run.sessionId = "session-1";
-  queued.run.messageProvider = "telegram";
-  queued.run.agentAccountId = "primary";
-  queued.run.sourceReplyDeliveryMode = "message_tool_only";
-  return queued;
-}
-
-function createTypingController() {
-  return {
-    onReplyStart: vi.fn(async () => {}),
-    startTypingLoop: vi.fn(async () => {}),
-    startTypingOnText: vi.fn(async () => {}),
-    refreshTypingTtl: vi.fn(),
-    isActive: vi.fn(() => false),
-    markRunComplete: vi.fn(),
-    markDispatchIdle: vi.fn(),
-    cleanup: vi.fn(),
-  };
-}
-
-function createExecution(turn: AdmittedFollowupTurn): FollowupExecutionResult {
-  return {
-    commentaryPayloadsEnabled: false,
-    execution: {
-      runId: turn.runId,
-      outcome: {
-        kind: "settled",
-        status: "ok",
-        result: { payloads: [], meta: { durationMs: 0 } },
-        resolved: { provider: "anthropic", model: "claude" },
-        fallback: { exhausted: false, attempts: [] },
-        autoCompactionCount: 0,
-        didLogHeartbeatStrip: false,
+function fixture(
+  key = `agent:main:handoff-${randomUUID()}`,
+  mode: "followup" | "collect" = "followup",
+) {
+  const storePath = path.join(os.tmpdir(), "openclaw-handoff", randomUUID(), "sessions.json");
+  const queue = (prompt: string, overrides: Partial<FollowupRun> = {}) => {
+    const source = createQueueTestRun(
+      {
+        prompt,
+        transcriptPrompt: prompt,
+        messageId: randomUUID(),
+        currentInboundEventKind: "user_request",
+        currentInboundContext: { text: `Context for ${prompt}` },
+        originatingChannel: "telegram",
+        originatingTo: "chat-1",
+        originatingAccountId: "primary",
+        originatingThreadId: 7,
+        ...overrides,
       },
-    },
-    runStartedAt: 1,
-    sessionCtx: {},
-    pendingToolTasks: new Set(),
-    progress: { drain: vi.fn(async () => {}) },
-  } as FollowupExecutionResult;
-}
-
-describe("queued completion handoff through FollowupRunner", () => {
-  const queueKeys = new Set<string>();
-
-  beforeEach(() => {
-    vi.clearAllMocks();
-    state.resolveDecision.mockReturnValue({ kind: "suppress", reason: "silent" });
-    state.account.mockResolvedValue({});
-  });
-
-  afterEach(() => {
-    clearSessionQueues([...queueKeys]);
-    queueKeys.clear();
-  });
-
-  it("replaces A with B before the active drain admits prequeued C", async () => {
-    const key = `test-followup-runner-completion-chain-${Date.now()}`;
-    queueKeys.add(key);
-    const settings: QueueSettings = { mode: "followup", debounceMs: 0, cap: 50 };
-    const source = createQueuedRun(key, "A");
-    const queuedB = createQueuedRun(key, "B");
-    const queuedC = createQueuedRun(key, "C");
-    const ownerA = createReplyOperation({
-      sessionKey: key,
-      sessionId: "session-1",
-      resetTriggered: false,
-    });
-    const operations = [ownerA];
-    const observed = new Map<string, ReturnType<typeof consumeQueuedReplyCompletionHandoff>>();
-    const done = createDeferred();
-
-    state.admit.mockImplementation(async ({ queued }: { queued: FollowupRun }) => {
-      const operation = createReplyOperation({
+      {
+        agentId: "main",
         sessionKey: key,
         sessionId: "session-1",
-        resetTriggered: false,
-      });
-      operations.push(operation);
-      observed.set(queued.prompt, consumeQueuedReplyCompletionHandoff(queued, operation));
-      return {
-        kind: "admitted",
-        turn: {
-          runId: `run-${queued.prompt}`,
-          queued,
-          operation,
-          config: {},
-          session: {
-            kind: "detached",
-            current: () => undefined,
-            publish: vi.fn(),
-            adopt: vi.fn(),
-          },
-          sendPolicy: "allow",
-          preflightCompactionApplied: false,
-        } as AdmittedFollowupTurn,
-      };
-    });
-    state.execute.mockImplementation(async ({ turn }: { turn: AdmittedFollowupTurn }) => {
-      if (turn.queued.prompt === "B") {
-        recordReplyOperationCompletedSourceReply(turn.operation, turn.queued);
-      }
-      return createExecution(turn);
-    });
-    state.deliver.mockImplementation(async ({ turn }: { turn: AdmittedFollowupTurn }) => {
-      if (turn.queued.prompt === "C") {
-        done.resolve();
-      }
-    });
+        messageProvider: "telegram",
+        agentAccountId: "primary",
+        sourceReplyDeliveryMode: "message_tool_only",
+      },
+    );
+    runs.push(source);
+    // The real enqueue owner records source identity and redelivery custody.
+    // No dispatch callback is installed: tests select through the controller below.
+    expect(
+      enqueueFollowupRun(key, source, { mode, debounceMs: 0 }, "message-id", undefined, false, {
+        storePath,
+      }),
+    ).toBe(true);
+    return source;
+  };
+  return { key, queue };
+}
 
-    const runFollowup = createFollowupRunner({
-      typing: createTypingController(),
-      typingMode: "instant",
-      defaultModel: "claude",
-    });
-    enqueueFollowupRun(key, queuedB, settings);
-    enqueueFollowupRun(key, queuedC, settings);
-    recordReplyOperationCompletedSourceReply(ownerA, source);
-    scheduleFollowupDrainAfterReplyOperationClear({
-      operation: ownerA,
-      queueKey: key,
-      runFollowup,
-    });
-    ownerA.complete();
+async function own(source: FollowupRun, pending = claimSessionControllerInput(source)) {
+  const claim = await pending;
+  claims.push(claim);
+  const sessionKey = source.run.sessionKey;
+  assert(sessionKey);
+  const operation = createReplyOperation({
+    sessionKey,
+    sessionId: source.run.sessionId,
+    agentId: source.run.agentId,
+    resetTriggered: false,
+    mailboxClaim: claim,
+  });
+  operations.push(operation);
+  return { source, claim, operation };
+}
 
-    try {
-      await done.promise;
-      expect([...observed.keys()]).toEqual(["B", "C"]);
-      expect(observed.get("B")).toBeDefined();
-      expect(observed.get("C")).toBeDefined();
-      expect(observed.get("C")).not.toBe(observed.get("B"));
-    } finally {
-      for (const operation of operations) {
-        operation.complete();
-      }
+async function finish(
+  turn: Awaited<ReturnType<typeof own>>,
+  options: { delivered?: boolean; retry?: boolean } = {},
+) {
+  if (options.delivered) {
+    recordReplyOperationCompletedSourceReply(turn.operation, turn.source);
+  }
+  runAfterReplyOperationClear(turn.operation, (admissionSessionId) =>
+    publishReplyOperationCompletionHandoff({
+      operation: turn.operation,
+      source: turn.source,
+      queueKey: turn.operation.key,
+      admissionSessionId,
+    }),
+  );
+  if (!options.retry) {
+    completeFollowupRunLifecycle(turn.source, "consumed");
+  }
+  turn.operation.complete();
+  await turn.operation.ownerSettlement;
+  releaseSessionControllerClaim(turn.claim);
+  await turn.claim.settlement.promise;
+}
+
+afterEach(async () => {
+  const ownedOperations = operations.splice(0);
+  const ownedClaims = claims.splice(0);
+  for (const operation of ownedOperations) {
+    operation.complete();
+  }
+  for (const claim of ownedClaims) {
+    releaseSessionControllerClaim(claim);
+  }
+  for (const run of runs) {
+    if (run.controllerInput) {
+      retireSessionControllerInput(run.controllerInput);
     }
+  }
+  await Promise.all([
+    ...ownedOperations.map((operation) => operation.ownerSettlement),
+    ...ownedClaims.map((claim) => claim.settlement.promise),
+    ...runs.splice(0).map((run) => run.controllerInput?.settlement.promise),
+  ]);
+});
+
+describe("completed-reply facts through real controller input custody", () => {
+  it("preserves inline and resumable context without mutating the source projection", () => {
+    const original = {
+      text: "Authenticated current request",
+      resumableText: "Resumable current request",
+      promptJoiner: " " as const,
+    };
+    const appended = appendCompletedSourceReplyHandoffDirective(original);
+    expect(original).toEqual({
+      text: "Authenticated current request",
+      resumableText: "Resumable current request",
+      promptJoiner: " ",
+    });
+    expect(appended).not.toBe(original);
+    expect(appended.promptJoiner).toBe(" ");
+    expect(appended.text.endsWith(original.text)).toBe(true);
+    expect(appended.resumableText?.endsWith(original.resumableText)).toBe(true);
+    expect(appended.text.split(MARKER)).toHaveLength(2);
+    expect(appended.resumableText?.split(MARKER)).toHaveLength(2);
+    expect(appended.fragments?.at(-1)).toMatchObject({ kind: "runtime-instruction" });
+  });
+
+  it("hands A to adopted B and B to prequeued C exactly once without rewriting requests", async () => {
+    const f = fixture();
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const bSource = f.queue("B");
+    const cSource = f.queue("C");
+    const bPending = claimSessionControllerInput(bSource);
+    const cPending = claimSessionControllerInput(cSource);
+    await finish(a, { delivered: true });
+    const b = await own(bSource, bPending);
+    await admitFollowupRunLifecycle(b.source);
+    const predecessorA = consumeQueuedReplyCompletionHandoff(b.source, b.operation);
+    assert(predecessorA);
+    const contextB = appendCompletedSourceReplyHandoffDirective(b.source.currentInboundContext);
+    expect(contextB.text.split(MARKER)).toHaveLength(2);
+    expect(b.source.prompt).toBe("B");
+    expect(b.source.transcriptPrompt).toBe("B");
+    expect(b.source.currentInboundContext?.text).toBe("Context for B");
+    expect(consumeQueuedReplyCompletionHandoff(b.source, b.operation)).toBeUndefined();
+    await finish(b, { delivered: true });
+    const c = await own(cSource, cPending);
+    await admitFollowupRunLifecycle(c.source);
+    const predecessorB = consumeQueuedReplyCompletionHandoff(c.source, c.operation);
+    assert(predecessorB);
+    expect(predecessorB).not.toBe(predecessorA);
+    expect(
+      appendCompletedSourceReplyHandoffDirective(c.source.currentInboundContext).text.split(MARKER),
+    ).toHaveLength(2);
+    expect(c.source.transcriptPrompt).toBe("C");
+    await finish(c);
+  });
+
+  it("preserves A across a real pre-execution refusal and failed operation clear before B retries", async () => {
+    const f = fixture();
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const source = f.queue("B");
+    const pending = claimSessionControllerInput(source);
+    await finish(a, { delivered: true });
+    const refused = await own(source, pending);
+    expect(consumeQueuedReplyCompletionHandoff(source, refused.operation)).toBeUndefined();
+    expect(deferSessionControllerClaimBeforeExecution(refused.claim)).toBe(true);
+    refused.operation.fail("run_failed", new Error("preparation refused before source adoption"));
+    await finish(refused, { retry: true });
+    const retried = await own(source);
+    expect(retried.claim).not.toBe(refused.claim);
+    await admitFollowupRunLifecycle(source);
+    expect(consumeQueuedReplyCompletionHandoff(source, retried.operation)).toBeDefined();
+    await finish(retried);
+  });
+
+  it("uses the real collected claim's custody and publishes to its pending successor", async () => {
+    const f = fixture(undefined, "collect");
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const b = f.queue("B");
+    const c = f.queue("C");
+    const collected = createDeferredCore<{
+      turn: Awaited<ReturnType<typeof own>>;
+      successor: FollowupRun;
+      successorClaim: ReturnType<typeof claimSessionControllerInput>;
+    }>();
+    scheduleFollowupDrain(
+      f.key,
+      async (source) => {
+        try {
+          const claim = source.controllerClaim;
+          assert(claim);
+          expect(claim.sources).toEqual([b, c]);
+          expect(claim.inputs).toHaveLength(2);
+          const turn = await own(source, Promise.resolve(claim));
+          await admitFollowupRunLifecycle(source);
+          expect(claim.custody.adopted).toBe(true);
+          expect(consumeQueuedReplyCompletionHandoff(source, turn.operation)).toBeDefined();
+          const successor = f.queue("D");
+          const successorClaim = claimSessionControllerInput(successor);
+          recordReplyOperationCompletedSourceReply(turn.operation, source);
+          runAfterReplyOperationClear(turn.operation, (admissionSessionId) =>
+            publishReplyOperationCompletionHandoff({
+              operation: turn.operation,
+              source,
+              queueKey: f.key,
+              admissionSessionId,
+            }),
+          );
+          completeFollowupRunLifecycle(source, "consumed");
+          turn.operation.complete();
+          await turn.operation.ownerSettlement;
+          // The real drain releases its selected claim after this callback returns.
+          // Waiting for claim settlement here would await this callback's own cleanup.
+          collected.resolve({ turn, successor, successorClaim });
+        } catch (error) {
+          collected.reject(error);
+          throw error;
+        }
+      },
+      a.claim.mailbox.owner,
+    );
+    await finish(a, { delivered: true });
+    const { turn, successor, successorClaim } = await collected.promise;
+    await turn.claim.settlement.promise;
+    const d = await own(successor, successorClaim);
+    await admitFollowupRunLifecycle(successor);
+    expect(consumeQueuedReplyCompletionHandoff(successor, d.operation)).toBeDefined();
+    await finish(d);
+  });
+
+  it("does not replace A when main consumes an unadopted preparation failure", async () => {
+    const f = fixture();
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const bSource = f.queue("B");
+    const cSource = f.queue("C");
+    const bPending = claimSessionControllerInput(bSource);
+    const cPending = claimSessionControllerInput(cSource);
+    await finish(a, { delivered: true });
+    const b = await own(bSource, bPending);
+    b.operation.fail("run_failed", new Error("unformatted preflight failure"));
+    await finish(b);
+    const c = await own(cSource, cPending);
+    await admitFollowupRunLifecycle(c.source);
+    expect(consumeQueuedReplyCompletionHandoff(c.source, c.operation)).toBeDefined();
+    await finish(c);
+  });
+
+  it("does replace A after an adopted source genuinely fails without delivery", async () => {
+    const f = fixture();
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const bSource = f.queue("B");
+    const cSource = f.queue("C");
+    const bPending = claimSessionControllerInput(bSource);
+    const cPending = claimSessionControllerInput(cSource);
+    await finish(a, { delivered: true });
+    const b = await own(bSource, bPending);
+    await admitFollowupRunLifecycle(b.source);
+    b.operation.fail("run_failed", new Error("terminal failure after source adoption"));
+    await finish(b);
+    const c = await own(cSource, cPending);
+    await admitFollowupRunLifecycle(c.source);
+    expect(consumeQueuedReplyCompletionHandoff(c.source, c.operation)).toBeUndefined();
+    await finish(c);
+  });
+
+  it("does not give an ordinary later input A's fact when redelivery dedupe retains the same mailbox", async () => {
+    const f = fixture();
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const abandoned = f.queue("queued then canceled");
+    const mailbox = a.claim.mailbox;
+    await finish(a, { delivered: true });
+    assert(abandoned.controllerInput);
+    retireSessionControllerInput(abandoned.controllerInput);
+    await abandoned.controllerInput.settlement.promise;
+    expect(mailbox.recentSources.size).toBeGreaterThan(0);
+    const ordinary = f.queue("later ordinary request");
+    expect(ordinary.controllerInput?.mailbox).toBe(mailbox);
+    const next = await own(ordinary);
+    await admitFollowupRunLifecycle(ordinary);
+    expect(consumeQueuedReplyCompletionHandoff(ordinary, next.operation)).toBeUndefined();
+    await finish(next);
+  });
+
+  it.each([
+    { originatingAccountId: "other" },
+    { originatingTo: "chat-2" },
+    { originatingThreadId: 8 },
+    { currentInboundEventKind: "room_event" as const },
+  ])("does not hand a source reply to a different recipient: %j", async (mismatch) => {
+    const f = fixture();
+    const a = await own(f.queue("A"));
+    await admitFollowupRunLifecycle(a.source);
+    const source = f.queue("B", mismatch);
+    const pending = claimSessionControllerInput(source);
+    await finish(a, { delivered: true });
+    const b = await own(source, pending);
+    await admitFollowupRunLifecycle(source);
+    expect(consumeQueuedReplyCompletionHandoff(source, b.operation)).toBeUndefined();
+    await finish(b);
   });
 });

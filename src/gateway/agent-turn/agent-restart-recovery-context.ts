@@ -3,16 +3,98 @@ import { createExecutionIdentityRecoveryAdmission } from "../../agents/admitted-
 import { parseExecutionIdentityAdmissionToken } from "../../audit/execution-identity-admission.js";
 import type { InternalSessionEntry, SessionEntry } from "../../config/sessions.js";
 import { resolveRestartRecoveryChannelAuthority } from "../../config/sessions/restart-recovery-state.js";
+import { parseSessionDeliveryRoute } from "../../routing/session-key.js";
+import {
+  INTERNAL_MESSAGE_CHANNEL,
+  isDeliverableMessageChannel,
+  normalizeMessageChannel,
+} from "../../utils/message-channel.js";
 
-type AgentRestartRecoveryChannelContext = {
-  channel: string;
-  currentChannelId: string;
-  currentThreadTs?: string;
-  requesterAccountId?: string;
-  requesterSenderId?: string;
-  sameChannelThreadRequired: boolean;
-  sourceTurnId: string;
-};
+/** Reconstructs source policy, presentation, and delivery facts from one exact recovery claim. */
+export function resolveAgentRestartRecoveryContext(params: {
+  isRestartRecoveryResumeRun: boolean;
+  canUseInternalRuntimeHandoff: boolean;
+  expectedExistingSessionId?: string;
+  resolvedSessionId?: string;
+  resolvedSessionKey: string | undefined;
+  runId: string;
+  sessionEntry?: SessionEntry;
+}):
+  | {
+      messageChannel: string;
+      channel?: {
+        channel: string;
+        currentChannelId: string;
+        currentThreadTs?: string;
+        requesterAccountId?: string;
+        requesterSenderId?: string;
+        sameChannelThreadRequired: boolean;
+        sourceTurnId: string;
+      };
+      pinnedWidgetAuthoring?: true;
+    }
+  | undefined {
+  const expectedSessionId = normalizeOptionalString(params.expectedExistingSessionId);
+  const entry = params.sessionEntry;
+  if (
+    !params.canUseInternalRuntimeHandoff ||
+    !expectedSessionId ||
+    !entry ||
+    expectedSessionId !== normalizeOptionalString(params.resolvedSessionId) ||
+    expectedSessionId !== normalizeOptionalString(entry.sessionId) ||
+    !normalizeOptionalString(entry.restartRecoveryDeliverySourceRunId) ||
+    normalizeOptionalString(entry.restartRecoveryDeliveryRunId) !== params.runId
+  ) {
+    return undefined;
+  }
+  // A channel-less agent RPC turn resumes channel-less; recorded channels keep the
+  // ingress-specific restoration below, including channel delivery authority.
+  if (params.isRestartRecoveryResumeRun && entry.restartRecoverySourceMessageChannel === null) {
+    return undefined;
+  }
+  if (params.isRestartRecoveryResumeRun && entry.restartRecoverySourceIngress === "control-ui") {
+    return { messageChannel: INTERNAL_MESSAGE_CHANNEL, pinnedWidgetAuthoring: true };
+  }
+  if (
+    params.isRestartRecoveryResumeRun &&
+    entry.restartRecoverySourceIngress === "internal" &&
+    !entry.restartRecoveryDeliveryContext
+  ) {
+    // Older in-flight claims omitted the channel; retain their WebChat fallback.
+    // WebChat context can infer recipients, so external session routes stay excluded.
+    const route = parseSessionDeliveryRoute(params.resolvedSessionKey);
+    return !route || route.channel === INTERNAL_MESSAGE_CHANNEL
+      ? { messageChannel: INTERNAL_MESSAGE_CHANNEL }
+      : undefined;
+  }
+  const messageChannel = normalizeMessageChannel(entry.restartRecoveryDeliveryContext?.channel);
+  if (
+    entry.restartRecoverySourceIngress !== "channel" ||
+    !messageChannel ||
+    !isDeliverableMessageChannel(messageChannel)
+  ) {
+    return undefined;
+  }
+  // A missing target removes delivery authority, not the source provider's policy boundary.
+  const authority = resolveRestartRecoveryChannelAuthority(entry);
+  return authority
+    ? {
+        messageChannel,
+        channel: {
+          channel: authority.deliveryContext.channel,
+          currentChannelId: authority.deliveryContext.to,
+          currentThreadTs:
+            authority.deliveryContext.threadId != null
+              ? String(authority.deliveryContext.threadId)
+              : undefined,
+          sourceTurnId: authority.sourceTurnId,
+          requesterAccountId: normalizeOptionalString(entry.restartRecoveryRequesterAccountId),
+          requesterSenderId: normalizeOptionalString(entry.restartRecoveryRequesterSenderId),
+          sameChannelThreadRequired: entry.restartRecoverySameChannelThreadRequired === true,
+        },
+      }
+    : { messageChannel };
+}
 
 /** Resolve only the private token durably owned by the admitted recovery cycle. */
 export function resolveAgentRestartRecoveryExecutionIdentityAdmission(params: {
@@ -30,57 +112,9 @@ export function resolveAgentRestartRecoveryExecutionIdentityAdmission(params: {
   }
   const stored = (params.sessionEntry as InternalSessionEntry | undefined)?.mainRestartRecovery
     ?.executionIdentity;
-  if (!stored) {
-    return createExecutionIdentityRecoveryAdmission({
-      retryOnly: params.retryOnly,
-      expectedOperationalRunId: params.runId,
-    });
-  }
-  const token = parseExecutionIdentityAdmissionToken(stored);
   return createExecutionIdentityRecoveryAdmission({
-    token,
+    ...(stored ? { token: parseExecutionIdentityAdmissionToken(stored) } : {}),
     retryOnly: params.retryOnly,
     expectedOperationalRunId: params.runId,
   });
-}
-
-/** Rehydrates durable channel authority only for the exact host-owned recovery run. */
-export function resolveAgentRestartRecoveryChannelContext(params: {
-  canUseInternalRuntimeHandoff: boolean;
-  expectedExistingSessionId?: string;
-  resolvedSessionId?: string;
-  runId: string;
-  sessionEntry?: SessionEntry;
-}): AgentRestartRecoveryChannelContext | undefined {
-  const expectedSessionId = normalizeOptionalString(params.expectedExistingSessionId);
-  const authority = params.sessionEntry
-    ? resolveRestartRecoveryChannelAuthority(params.sessionEntry)
-    : undefined;
-  if (
-    !params.canUseInternalRuntimeHandoff ||
-    !expectedSessionId ||
-    expectedSessionId !== normalizeOptionalString(params.resolvedSessionId) ||
-    expectedSessionId !== normalizeOptionalString(params.sessionEntry?.sessionId) ||
-    !authority ||
-    normalizeOptionalString(params.sessionEntry?.restartRecoveryDeliveryRunId) !== params.runId
-  ) {
-    return undefined;
-  }
-  return {
-    channel: authority.deliveryContext.channel,
-    currentChannelId: authority.deliveryContext.to,
-    currentThreadTs:
-      authority.deliveryContext.threadId != null
-        ? String(authority.deliveryContext.threadId)
-        : undefined,
-    sourceTurnId: authority.sourceTurnId,
-    requesterAccountId: normalizeOptionalString(
-      params.sessionEntry?.restartRecoveryRequesterAccountId,
-    ),
-    requesterSenderId: normalizeOptionalString(
-      params.sessionEntry?.restartRecoveryRequesterSenderId,
-    ),
-    sameChannelThreadRequired:
-      params.sessionEntry?.restartRecoverySameChannelThreadRequired === true,
-  };
 }

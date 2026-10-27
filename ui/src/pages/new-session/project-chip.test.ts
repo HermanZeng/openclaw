@@ -19,13 +19,12 @@ const projects = [
 describe("What chip state", () => {
   it.each([
     {
-      name: "filters registered and workspace projects locally",
+      name: "hides recent places and an unmatched workspace during a project query",
       query: "site",
-      expectedProjects: ["website"],
       expectedRecents: 0,
       showWorkspace: false,
     },
-  ])("$name", ({ query, expectedProjects, expectedRecents, showWorkspace }) => {
+  ])("$name", ({ query, expectedRecents, showWorkspace }) => {
     const state = resolveProjectChip({
       folder: "",
       workspace: "/workspace",
@@ -35,7 +34,6 @@ describe("What chip state", () => {
       recents: [],
       projectQuery: query,
     });
-    expect(state.localProjects.map((project) => project.id)).toEqual(expectedProjects);
     expect(state.recents).toHaveLength(expectedRecents);
     expect(state.showWorkspace).toBe(showWorkspace);
   });
@@ -46,17 +44,26 @@ describe("What chip state", () => {
       folder: "/workspace/scratch",
       displayName: "scratch",
     };
+    const repositoryRecent = {
+      kind: "repository" as const,
+      url: "https://github.com/octocat/hello-world.git",
+      displayName: "hello-world",
+    };
     const state = resolveProjectChip({
       folder: "",
       workspace: "/workspace",
       projectId: "",
       selectedRemoteProject: null,
       projects,
-      recents: [{ kind: "project", projectId: "openclaw", displayName: "OpenClaw" }, folderRecent],
+      recents: [
+        { kind: "project", projectId: "openclaw", displayName: "OpenClaw" },
+        folderRecent,
+        repositoryRecent,
+      ],
       projectQuery: "",
     });
 
-    expect(state.recents).toEqual([folderRecent]);
+    expect(state.recents).toEqual([folderRecent, repositoryRecent]);
   });
 
   it.each([

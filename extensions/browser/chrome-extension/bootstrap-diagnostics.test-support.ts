@@ -1,4 +1,3 @@
-import type { Page } from "playwright-core";
 import { z } from "zod";
 import type { ExtensionRelayBridge } from "../src/browser/extension-relay/relay-bridge.js";
 
@@ -6,6 +5,18 @@ const METHODS = [
   "Target.attachedToTarget",
   "Target.detachedFromTarget",
   "Target.attachToTarget",
+  "Target.setAutoAttach",
+  "Page.enable",
+  "Page.getFrameTree",
+  "Page.setLifecycleEventsEnabled",
+  "Page.addScriptToEvaluateOnNewDocument",
+  "Page.createIsolatedWorld",
+  "Runtime.enable",
+  "Runtime.addBinding",
+  "Runtime.runIfWaitingForDebugger",
+  "Runtime.executionContextCreated",
+  "Network.enable",
+  "Log.enable",
   "Page.navigate",
   "Page.frameNavigated",
   "Page.frameDetached",
@@ -25,6 +36,7 @@ const METHODS = [
   "Network.loadingFailed",
 ] as const;
 const id = z.string().max(200).optional();
+const frameFields = z.object({ id, loaderId: id, url: z.string().optional() });
 const fields = z.object({
   sessionId: id,
   targetId: id,
@@ -33,8 +45,10 @@ const fields = z.object({
   frameId: id,
   loaderId: id,
   name: z.string().optional(),
-  frame: z.object({ id, loaderId: id }).optional(),
-  targetInfo: z.object({ targetId: id }).optional(),
+  frame: frameFields.optional(),
+  frameTree: z.object({ frame: frameFields }).optional(),
+  targetInfo: z.object({ targetId: id, url: z.string().optional() }).optional(),
+  context: z.object({ auxData: z.object({ frameId: id }).optional() }).optional(),
 });
 const envelope = z.object({
   id: z.number().int().optional(),
@@ -46,23 +60,14 @@ const envelope = z.object({
 });
 type Method = (typeof METHODS)[number];
 type Phase =
-  | "injection.used"
-  | "injection.calls"
+  | `injection.${"used" | "calls"}`
   | "adapter.fresh"
   | "navigate.status"
-  | "owner.selected"
-  | "owner.unrelated"
+  | `owner.${"selected" | "unrelated"}`
   | "direct.url"
   | "unrelated.url"
-  | "direct.commit"
-  | "direct.domcontentloaded"
-  | "direct.load"
-  | "direct.closed"
-  | "http.request"
-  | "http.finish"
-  | "http.closed"
-  | "relay.clients"
-  | "relay.closed"
+  | `http.${"request" | "finish" | "closed"}`
+  | `relay.${"clients" | "closed"}`
   | "mcp.closed";
 type RecordEntry = { phase: string; [key: string]: string | number | boolean };
 
@@ -93,16 +98,10 @@ export function createBootstrapDiagnostic() {
       return 0;
     }
     const key = `${kind}:${value}`;
-    const found = ordinals.get(key);
-    if (found) {
-      return found;
+    if (!ordinals.has(key) && ordinals.size < 128) {
+      ordinals.set(key, ordinals.size + 1);
     }
-    if (ordinals.size === 128) {
-      return 0;
-    }
-    const next = ordinals.size + 1;
-    ordinals.set(key, next);
-    return next;
+    return ordinals.get(key) ?? 0;
   };
   const observe = (client: number, outgoing: boolean, raw: string) => {
     if (!active) {
@@ -114,11 +113,7 @@ export function createBootstrapDiagnostic() {
       return;
     }
     try {
-      const parsed = envelope.safeParse(JSON.parse(raw));
-      if (!parsed.success) {
-        return;
-      }
-      const msg = parsed.data;
+      const msg = envelope.parse(JSON.parse(raw));
       const key = `${client}:${msg.id}`;
       const command = outgoing ? pending.get(key) : undefined;
       if (outgoing) {
@@ -143,8 +138,17 @@ export function createBootstrapDiagnostic() {
         target: ordinal("target", data?.targetId ?? data?.targetInfo?.targetId),
         request: ordinal(method.startsWith("Fetch.") ? "fetch" : "network", data?.requestId),
         network: ordinal("network", data?.networkId),
-        frame: ordinal("frame", data?.frameId ?? data?.frame?.id),
-        loader: ordinal("loader", data?.loaderId ?? data?.frame?.loaderId),
+        frame: ordinal(
+          "frame",
+          data?.frameId ??
+            data?.frame?.id ??
+            data?.frameTree?.frame.id ??
+            data?.context?.auxData?.frameId,
+        ),
+        loader: ordinal(
+          "loader",
+          data?.loaderId ?? data?.frame?.loaderId ?? data?.frameTree?.frame.loaderId,
+        ),
         load: data?.name === "load",
         domContentLoaded: data?.name === "DOMContentLoaded",
         error: msg.error !== undefined || Boolean(msg.result?.errorText),
@@ -156,7 +160,7 @@ export function createBootstrapDiagnostic() {
   const mark = (phase: Phase, value: boolean | number) => append({ phase, value });
   return {
     mark,
-    arm(selected: string, unrelated: string) {
+    arm(selected: string, unrelated?: string) {
       active = true;
       append({
         phase: "armed",
@@ -181,9 +185,9 @@ export function createBootstrapDiagnostic() {
             observe(client, false, raw);
             callbacks.onMessage(raw);
           },
-          onClose: () => {
+          onClose: async () => {
             try {
-              callbacks.onClose();
+              await callbacks.onClose();
             } finally {
               append({ phase: "client.close", client, count: bridge.cdpClientCount });
             }
@@ -192,42 +196,6 @@ export function createBootstrapDiagnostic() {
       };
       restores.push(() => {
         bridge.attachCdpClientSocket = original;
-      });
-    },
-    watchPage(page: Page, expectedUrl: string) {
-      const commit = (frame: ReturnType<Page["mainFrame"]>) => {
-        if (frame === page.mainFrame()) {
-          mark("direct.commit", page.url() === expectedUrl);
-        }
-      };
-      const ready = () => mark("direct.domcontentloaded", page.url() === expectedUrl);
-      const loaded = () => mark("direct.load", page.url() === expectedUrl);
-      const closed = () => mark("direct.closed", true);
-      page
-        .on("framenavigated", commit)
-        .on("domcontentloaded", ready)
-        .on("load", loaded)
-        .on("close", closed);
-      const stop = () => {
-        page
-          .off("framenavigated", commit)
-          .off("domcontentloaded", ready)
-          .off("load", loaded)
-          .off("close", closed);
-      };
-      restores.push(stop);
-      return stop;
-    },
-    peer(info: { name: string; version: string } | undefined) {
-      // Actual cached MCP peer's handshake metadata, not an npx/latest version guess.
-      const version =
-        info?.name === "chrome_devtools" && /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})$/.exec(info.version);
-      append({
-        phase: "mcp.peer",
-        known: Boolean(version),
-        major: version ? Number(version[1]) : 0,
-        minor: version ? Number(version[2]) : 0,
-        patch: version ? Number(version[3]) : 0,
       });
     },
     flush() {

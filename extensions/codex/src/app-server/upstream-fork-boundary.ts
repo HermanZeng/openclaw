@@ -1,9 +1,12 @@
+import type { AgentHarnessSessionForkFailureCode } from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   readVisibleSessionTranscriptMessageEntries,
   type SessionTranscriptMessageEntry,
 } from "openclaw/plugin-sdk/session-transcript-runtime";
+import { isRecord } from "openclaw/plugin-sdk/string-coerce-runtime";
 import type { CodexSessionCatalogControl } from "../session-catalog-types.js";
-import type { CodexThreadItem, CodexTurn } from "./protocol.js";
+import { assertCodexThreadAcceptsDirectInput } from "./protocol-validators.js";
+import type { CodexThread, CodexTurn } from "./protocol.js";
 import { projectCodexUserItemText } from "./transcript-history-projection.js";
 import {
   fingerprintCodexMirrorSourceMessage,
@@ -11,30 +14,33 @@ import {
 } from "./transcript-mirror-attestation.js";
 import { readMirrorIdentity, readUpstreamUserText } from "./upstream-prompt-provenance.js";
 
-type CodexUpstreamForkBoundaryFailureCode =
-  | "steer-message"
-  | "in-progress-turn"
-  | "drift-mismatch"
-  | "upstream-unavailable";
+type CodexUpstreamForkBoundaryFailureCode = AgentHarnessSessionForkFailureCode;
 
 type CodexUpstreamForkBoundary = {
   beforeTurnId: string;
-  targetTurnId: string;
   /** Baseline for the forked thread: the last retained turn (null when the cut is
    * before the first turn), so the upstream monitor does not replay retained
    * history as fresh external activity. */
-  retainedMarker: { turnId: string | null; userMessageCount: number };
+  lastRetainedTurnId: string | null;
 };
 
-type CodexUpstreamForkBoundaryResult =
-  | { ok: true; boundary: CodexUpstreamForkBoundary; editorText?: string }
+export type CodexUpstreamForkBoundaryResult =
+  | {
+      ok: true;
+      boundary: CodexUpstreamForkBoundary;
+      editorText?: string;
+      canonical?: {
+        thread: CodexThread;
+        turns: CodexTurn[];
+        prefix: SessionTranscriptMessageEntry[];
+      };
+    }
   | { ok: false; code: CodexUpstreamForkBoundaryFailureCode; message: string };
 
-const TURN_PAGE_LIMIT = 100;
+const IN_PROGRESS_TURN_MESSAGE =
+  "This Codex turn is still in progress. Wait for it to finish, then try forking again.";
 
-type UserInput = {
-  type?: unknown;
-};
+const TURN_PAGE_LIMIT = 100;
 
 function failure(
   code: CodexUpstreamForkBoundaryFailureCode,
@@ -43,11 +49,7 @@ function failure(
   return { ok: false, code, message };
 }
 
-function asInputs(item: CodexThreadItem): UserInput[] {
-  return Array.isArray(item.content) ? (item.content as UserInput[]) : [];
-}
-
-function localMessageText(content: unknown): string | undefined {
+function textOnlyMessage(content: unknown): string | undefined {
   if (typeof content === "string") {
     return content;
   }
@@ -58,14 +60,10 @@ function localMessageText(content: unknown): string | undefined {
   // undefined marks the message unverifiable so boundary resolution fails closed.
   const texts: string[] = [];
   for (const block of content) {
-    if (!block || typeof block !== "object" || Array.isArray(block)) {
+    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") {
       return undefined;
     }
-    const typed = block as { type?: unknown; text?: unknown };
-    if (typed.type !== "text" || typeof typed.text !== "string") {
-      return undefined;
-    }
-    texts.push(typed.text);
+    texts.push(block.text);
   }
   return texts.join("\n");
 }
@@ -84,31 +82,34 @@ function resolveCodexUpstreamForkBoundaryFromTurns(params: {
       }
       const isSteer = userMessagesInTurn > 0;
       userMessagesInTurn += 1;
-      // Display placeholders are not evidence of attachment identity.
-      if (asInputs(item).some((input) => input.type !== "text")) {
-        return failure(
-          "drift-mismatch",
-          "A message before the fork point contains images or attachments that cannot be verified across OpenClaw and Codex. Fork from a text-only span instead.",
-        );
-      }
-      const text = projectCodexUserItemText(item);
-      if (!text) {
-        continue;
-      }
       const local = params.localPrefix[localIndex];
       const identity = local && readMirrorIdentity(local.message);
-      // Imports retain a bounded tail. Locate its recorded start, then verify every
-      // retained user in order; repeated text must never choose an earlier native turn.
+      // Imports retain a bounded tail. Locate its recorded start before checking
+      // content omitted from that mirror; repeated text cannot identify the boundary.
       const matchesIdentity =
         identity === `${turn.id}:${item.id}` || (!isSteer && identity === `${turn.id}:prompt`);
       if (!matchedPrefix && !matchesIdentity) {
         continue;
       }
+      // Display placeholders are not evidence of attachment identity.
+      const nativeText = textOnlyMessage(item.content);
+      if (nativeText === undefined) {
+        return failure(
+          "drift-mismatch",
+          "A message before the fork point contains images or attachments that cannot be verified across OpenClaw and Codex. Fork from a text-only span instead.",
+        );
+      }
+      const upstreamText = local && readUpstreamUserText(local.message);
+      // Harness evidence binds the complete submitted text, not the trimmed/truncated
+      // display projection that legacy imported mirrors retain.
+      const text = upstreamText ? nativeText : projectCodexUserItemText(item);
+      if (!text) {
+        continue;
+      }
       matchedPrefix = true;
-      const localText = localMessageText(
+      const localText = textOnlyMessage(
         local && "content" in local.message ? local.message.content : undefined,
       );
-      const upstreamText = local && readUpstreamUserText(local.message);
       // Harness prompts carry the sent text separately from the display text.
       // Its existing attestation must still bind both, or a local edit could pass drift checks.
       const upstreamPromptVerified =
@@ -116,14 +117,11 @@ function resolveCodexUpstreamForkBoundaryFromTurns(params: {
         (local?.message.role === "user" &&
           readCodexMirrorSourceFingerprint(local.message) ===
             fingerprintCodexMirrorSourceMessage(local.message));
-      const expectedText = upstreamText
-        ? projectCodexUserItemText({ content: [{ type: "text", text: upstreamText }] })
-        : localText;
       if (
         !matchesIdentity ||
         !upstreamPromptVerified ||
         localText === undefined ||
-        text !== expectedText
+        text !== (upstreamText ?? localText)
       ) {
         return failure(
           "drift-mismatch",
@@ -141,10 +139,7 @@ function resolveCodexUpstreamForkBoundaryFromTurns(params: {
         );
       }
       if (turn.status === "inProgress") {
-        return failure(
-          "in-progress-turn",
-          "This Codex turn is still in progress. Wait for it to finish, then try forking again.",
-        );
+        return failure("in-progress-turn", IN_PROGRESS_TURN_MESSAGE);
       }
       // beforeTurnId at the first turn yields a valid empty-history fork upstream
       // (codex-rs thread_fork_inner has no minimum-turn guard), matching the empty
@@ -154,15 +149,7 @@ function resolveCodexUpstreamForkBoundaryFromTurns(params: {
         ok: true,
         boundary: {
           beforeTurnId: turn.id,
-          targetTurnId: turn.id,
-          retainedMarker: retained
-            ? {
-                turnId: retained.id,
-                userMessageCount: retained.items.filter(
-                  (retainedItem) => retainedItem.type === "userMessage",
-                ).length,
-              }
-            : { turnId: null, userMessageCount: 0 },
+          lastRetainedTurnId: retained?.id ?? null,
         },
       };
     }
@@ -181,6 +168,8 @@ export async function listCodexUpstreamTurns(
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   for (;;) {
+    // Codex hydrates full turn items for both history modes; boundary validation
+    // needs their recorded message identities, not the native storage layout.
     const page = await control.listTurnPage({
       threadId,
       limit: TURN_PAGE_LIMIT,
@@ -208,18 +197,10 @@ export async function resolveCodexUpstreamForkBoundary(params: {
   storePath: string;
   entryId: string;
   threadId: string;
+  canonicalThreadId?: string;
   control: CodexSessionCatalogControl;
 }): Promise<CodexUpstreamForkBoundaryResult> {
   try {
-    // Paginated-history threads reject itemsView "full" turn reads (thread/items/list
-    // is required); fork support for them is future work — fail closed with intent.
-    const thread = await params.control.readThread(params.threadId, false);
-    if (thread.historyMode === "paginated") {
-      return failure(
-        "upstream-unavailable",
-        "This Codex thread uses paginated history, which cannot be forked from OpenClaw yet.",
-      );
-    }
     const entries = await readVisibleSessionTranscriptMessageEntries({
       agentId: params.agentId,
       sessionId: params.sessionId,
@@ -234,17 +215,82 @@ export async function resolveCodexUpstreamForkBoundary(params: {
         "The local message could not be mapped to the Codex thread. Refresh the session and try again.",
       );
     }
-    const localPrefix = visibleUserEntries.slice(0, targetIndex + 1);
-    const turns = await listCodexUpstreamTurns(params.control, params.threadId);
+    const target = visibleUserEntries[targetIndex]!;
+    const isOriginal = (entry: SessionTranscriptMessageEntry) => {
+      const identity = readMirrorIdentity(entry.message);
+      return Boolean(
+        identity &&
+        "idempotencyKey" in entry.message &&
+        entry.message.idempotencyKey ===
+          `codex-app-server:${params.threadId}:history:${identity}` &&
+        readCodexMirrorSourceFingerprint(entry.message),
+      );
+    };
+    // Root S may no longer exist. Only original imported targets depend on S;
+    // retained ancestor turn identities are verified against current canonical C.
+    const canonical = Boolean(params.canonicalThreadId && !isOriginal(target));
+    const threadId = canonical ? params.canonicalThreadId! : params.threadId;
+    const thread = await params.control.readThread(threadId, false);
+    if (thread.id !== threadId) {
+      return failure(
+        "upstream-unavailable",
+        "This Codex thread is unavailable or its identity changed.",
+      );
+    }
+    assertCodexThreadAcceptsDirectInput(thread);
+    if (thread.status?.type === "active") {
+      return failure(
+        "in-progress-turn",
+        "This Codex thread is active. Wait for it to finish before forking.",
+      );
+    }
+    const localPrefix = visibleUserEntries.slice(0, targetIndex + 1).filter((entry) => {
+      if (!canonical) {
+        return true;
+      }
+      if (isOriginal(entry)) {
+        return false;
+      }
+      const meta = "__openclaw" in entry.message ? entry.message["__openclaw"] : undefined;
+      const blocked = isRecord(meta) ? meta.beforeAgentRunBlocked : undefined;
+      return !(
+        entry !== target &&
+        isRecord(blocked) &&
+        typeof blocked.blockedBy === "string" &&
+        typeof blocked.blockedAt === "number"
+      );
+    });
+    const turns = await listCodexUpstreamTurns(params.control, threadId);
     const resolved = resolveCodexUpstreamForkBoundaryFromTurns({
       turns,
       localPrefix,
     });
-    const target = localPrefix.at(-1)?.message;
+    const selected = canonical ? entries.slice(0, entries.indexOf(target) + 1) : [];
+    const displayPrefix = selected.slice(0, -1);
+    if (
+      canonical &&
+      (displayPrefix.length > 200 || Buffer.byteLength(JSON.stringify(displayPrefix)) > 512 * 1024)
+    ) {
+      return failure(
+        "upstream-unavailable",
+        "The local display prefix exceeds the safe fork-copy limit. Use native Codex to fork this conversation.",
+      );
+    }
     return resolved.ok
       ? {
           ...resolved,
-          editorText: localMessageText(target && "content" in target ? target.content : undefined),
+          editorText: textOnlyMessage(
+            "content" in target.message ? target.message.content : undefined,
+          ),
+          ...(canonical
+            ? {
+                canonical: {
+                  thread,
+                  turns,
+                  prefix: displayPrefix,
+                },
+              }
+            : {}),
         }
       : resolved;
   } catch {
@@ -253,24 +299,4 @@ export async function resolveCodexUpstreamForkBoundary(params: {
       "The Codex thread could not be read. Check that Codex is available, then try again.",
     );
   }
-}
-
-export function precheckCodexUpstreamForkBoundary(params: {
-  boundary: CodexUpstreamForkBoundary;
-  turns: readonly CodexTurn[];
-}): CodexUpstreamForkBoundaryResult {
-  const target = params.turns.find((turn) => turn.id === params.boundary.targetTurnId);
-  if (!target) {
-    return failure(
-      "upstream-unavailable",
-      "The Codex thread changed before it could be forked. Refresh the session and try again.",
-    );
-  }
-  if (target.status === "inProgress") {
-    return failure(
-      "in-progress-turn",
-      "This Codex turn is still in progress. Wait for it to finish, then try forking again.",
-    );
-  }
-  return { ok: true, boundary: params.boundary };
 }

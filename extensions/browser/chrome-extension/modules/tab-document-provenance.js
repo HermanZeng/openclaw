@@ -13,7 +13,7 @@ export function createTabDocumentProvenance({ access }) {
   function lifecycle(tabId) {
     let value = lifetimes.get(tabId);
     if (!value) {
-      value = { root: 0, attachment: 0 };
+      value = { root: 0, attachment: 0, rootUrl: undefined };
       lifetimes.set(tabId, value);
     }
     return value;
@@ -25,25 +25,13 @@ export function createTabDocumentProvenance({ access }) {
     document?.navigation.cancel();
   }
 
-  function commitTabDocument(tabId, url) {
-    const document = documents.get(tabId);
-    if (!document || url === "about:blank") {
-      return;
-    }
-    if (document.navigation.confirmed) {
-      documents.delete(tabId);
-    } else {
-      access.invalidateTab(tabId);
-    }
-  }
-
   function observeTab(tab) {
     const document = documents.get(tab?.id);
     if (!document) {
       return;
     }
-    if (tab.url && document.navigation.confirmed) {
-      commitTabDocument(tab.id, tab.url);
+    if (tab.url && tab.url !== "about:blank" && document.navigation.confirmed) {
+      documents.delete(tab.id);
     }
     if (
       !document.isCurrent() ||
@@ -130,6 +118,7 @@ export function createTabDocumentProvenance({ access }) {
     const frameUrl = root ? frameDocumentUrl(event.params.frame) : undefined;
     if (root) {
       lifecycle(event.tabId).root += 1;
+      lifecycle(event.tabId).rootUrl = frameUrl;
       access.recordRootCommit(event.tabId, frameUrl);
     }
     if (document) {
@@ -139,7 +128,7 @@ export function createTabDocumentProvenance({ access }) {
         event.params.frame.id === document.navigation.frameId &&
         frameUrl !== "about:blank"
       ) {
-        commitTabDocument(event.tabId, frameUrl);
+        documents.delete(event.tabId);
       } else {
         try {
           document.navigation.observe(event, send);
@@ -148,19 +137,34 @@ export function createTabDocumentProvenance({ access }) {
         }
         return;
       }
-    } else if (root) {
-      commitTabDocument(event.tabId, frameUrl);
     }
     send(event);
+  }
+
+  function resolveTabSnapshot(tabId, tab) {
+    const rootUrl = lifetimes.get(tabId)?.rootUrl;
+    // Chrome's tab metadata can lag the native root commit, including in fresh reads.
+    return tab?.id === tabId &&
+      tab.url === "about:blank" &&
+      typeof rootUrl === "string" &&
+      tab.pendingUrl === rootUrl
+      ? { ...tab, url: rootUrl }
+      : tab;
   }
 
   return {
     get: (tabId) => documents.get(tabId),
     rootRevision: (tabId) => lifecycle(tabId).root,
+    resolveTabSnapshot,
+    resolveTabUpdate: (tabId, tab, change) =>
+      change.status === "loading" && change.url === undefined
+        ? resolveTabSnapshot(tabId, tab)
+        : tab,
     observeTab,
     revokeDocument,
     retireAttachment: (tabId) => {
       lifecycle(tabId).attachment += 1;
+      lifecycle(tabId).rootUrl = undefined;
       if (documents.has(tabId)) {
         access.invalidateTab(tabId);
       }
@@ -228,18 +232,13 @@ function createDocumentNavigation({ frameId, isCurrent, revoke }) {
           fail();
           return;
         }
-        if (state.kind === "blank") {
-          if (state.loaderId !== frame.loaderId) {
-            fail();
-            return;
-          }
-        } else if (state.kind === "pending") {
+        if (state.kind === "pending") {
           if (state.commit && state.commit !== frame.loaderId) {
             fail();
             return;
           }
           state.commit = frame.loaderId;
-        } else if (state.kind === "responded" && state.loaderId !== frame.loaderId) {
+        } else if (state.loaderId !== frame.loaderId) {
           fail();
           return;
         }

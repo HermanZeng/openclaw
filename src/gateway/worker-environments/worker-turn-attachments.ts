@@ -1,14 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
+import { sanitizeUntrustedFileName } from "@openclaw/fs-safe/advanced";
 import { isPassThroughRemoteMediaSource } from "@openclaw/media-core/media-source-url";
 import { truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import type { SessionPlacementTurnParams } from "../../agents/session-placement-admission.js";
-import { sanitizeUntrustedFileName } from "../../infra/fs-safe-advanced.js";
 import { readPersistedMediaFacts } from "../../media/media-facts.js";
 import { resolveInboundMediaReference } from "../../media/media-reference.js";
 import { readMediaBuffer } from "../../media/store.js";
+import { NODE_WORKER_WORKSPACE_STDIN_MAX_BYTES } from "../../worker/node-workspace-protocol.js";
 import { resolveChatAttachmentMaxBytes } from "../chat-attachment-policy.js";
-import { MAX_PAYLOAD_BYTES } from "../server-constants.js";
+import { MAX_PAYLOAD_BYTES } from "../payload-limits.js";
 import type { WorkerWorkspaceTunnelHandle } from "./tunnel-contract.js";
 import {
   WORKER_ATTACHMENT_DIRECTORY_PATTERN,
@@ -16,8 +17,8 @@ import {
 } from "./workspace-path-exclusions.js";
 
 const MAX_TURN_ATTACHMENTS = 16;
-// Base64 expansion stays below the node workspace command's 128 KiB stdin cap.
-const ATTACHMENT_CHUNK_BYTES = 64 * 1024;
+// Fill the command's stdin budget without splitting a base64 quartet.
+const ATTACHMENT_CHUNK_BYTES = Math.floor(NODE_WORKER_WORKSPACE_STDIN_MAX_BYTES / 4) * 3;
 
 // Enter verified directories before mutation: process cwd pins the directory,
 // including when another process renames it. All following names are basenames.
@@ -89,11 +90,14 @@ export async function prepareWorkerTurnAttachments(params: {
   >;
   tunnel: Pick<WorkerWorkspaceTunnelHandle, "runWorkspaceCommand">;
   remoteWorkspaceDir: string;
+  // Placement ownership authorizes cleanup even after the run closes.
   assertCurrent: () => void;
+  assertRunCurrent?: () => void;
 }): Promise<string | undefined> {
   const { turn, tunnel, assertCurrent } = params;
   const check = () => {
     turn.abortSignal?.throwIfAborted();
+    params.assertRunCurrent?.();
     assertCurrent();
   };
   check();
@@ -104,14 +108,16 @@ export async function prepareWorkerTurnAttachments(params: {
   check();
   // The recorder retains originals for inline images and facts already staged
   // locally. Runtime media alone omits those images or points at a host copy.
-  const facts = (message ? readPersistedMediaFacts(message) : undefined) ?? turn.media ?? [];
+  const facts =
+    heldFacts ?? (message ? readPersistedMediaFacts(message) : undefined) ?? turn.media ?? [];
   const files: Array<{ name: string; buffer: Buffer }> = [];
   const seen = new Set<string>();
   let remainingBytes = MAX_PAYLOAD_BYTES;
   const maxBytes = resolveChatAttachmentMaxBytes(turn.config ?? {});
   for (const fact of facts) {
+    const sources = [fact.url, fact.path];
     let reference: Awaited<ReturnType<typeof resolveInboundMediaReference>> = null;
-    for (const source of [fact.url, fact.path]) {
+    for (const source of sources) {
       if (!source) {
         continue;
       }
@@ -122,9 +128,7 @@ export async function prepareWorkerTurnAttachments(params: {
       }
     }
     if (!reference) {
-      if (
-        [fact.path, fact.url].some((source) => source && !isPassThroughRemoteMediaSource(source))
-      ) {
+      if (sources.some((source) => source && !isPassThroughRemoteMediaSource(source))) {
         throw new Error(
           "Cloud attachment original is unavailable in managed media storage; attach the file again and retry.",
         );
@@ -157,36 +161,57 @@ export async function prepareWorkerTurnAttachments(params: {
     return undefined;
   }
   const directory = `${WORKER_ATTACHMENT_DIRECTORY_PREFIX}${randomUUID()}`;
-  const deadline = Date.now() + turn.timeoutMs;
-  const execute = async (args: string[], input?: string, cleanup = false): Promise<string> => {
+  const deadline = performance.now() + turn.timeoutMs;
+  const execute = async (
+    operation: "init" | "write" | "cleanup",
+    args: string[] = [],
+    input?: string,
+  ): Promise<string> => {
+    const cleanup = operation === "cleanup";
     const assertDispatchCurrent = cleanup ? assertCurrent : check;
     assertDispatchCurrent();
-    const timeoutMs = cleanup ? 5_000 : Math.min(60_000, Math.max(1, deadline - Date.now()));
-    if (!cleanup && Date.now() >= deadline) {
+    const timeoutMs = cleanup
+      ? 5_000
+      : Math.min(60_000, Math.max(1, Math.floor(deadline - performance.now())));
+    if (!cleanup && performance.now() >= deadline) {
       throw new Error("Cloud attachment transfer timed out; retry this turn.");
     }
     const result = await tunnel.runWorkspaceCommand({
-      argv: ["node", "-e", STAGE_ATTACHMENT_SCRIPT, params.remoteWorkspaceDir, directory, ...args],
+      argv: [
+        "node",
+        "-e",
+        STAGE_ATTACHMENT_SCRIPT,
+        params.remoteWorkspaceDir,
+        directory,
+        operation,
+        ...args,
+      ],
       ...(input === undefined ? {} : { input }),
       transportRetry: "never",
       assertCurrent: assertDispatchCurrent,
       timeoutMs,
       ...(!cleanup && turn.abortSignal ? { signal: turn.abortSignal } : {}),
     });
-    assertDispatchCurrent();
+    // Retain the created directory identity before checking run revocation so
+    // the catch path can clean it using the still-current placement claim.
+    if (operation !== "init") {
+      assertDispatchCurrent();
+    }
     if (result.termination !== "exit" || result.code !== 0) {
       throw new Error(
         `Cloud attachment transfer failed: ${truncateUtf16Safe(result.stderr.trim() || "remote write failed", 512)}. Retry this turn.`,
       );
     }
-    return result.stdout.trim();
+    const identity = result.stdout.trim();
+    if (!cleanup && !/^\d+:\d+$/.test(identity)) {
+      const kind = operation === "init" ? "directory" : "file";
+      throw new Error(`Cloud attachment transfer returned an invalid ${kind} identity.`);
+    }
+    return identity;
   };
   let directoryIdentity: string | undefined;
   try {
-    directoryIdentity = await execute(["init"]);
-    if (!/^\d+:\d+$/.test(directoryIdentity)) {
-      throw new Error("Cloud attachment transfer returned an invalid directory identity.");
-    }
+    directoryIdentity = await execute("init");
     for (const file of files) {
       const hash = createHash("sha256").update(file.buffer).digest("hex");
       let fileIdentity = "new";
@@ -196,8 +221,8 @@ export async function prepareWorkerTurnAttachments(params: {
         offset += ATTACHMENT_CHUNK_BYTES
       ) {
         fileIdentity = await execute(
+          "write",
           [
-            "write",
             directoryIdentity,
             file.name,
             String(offset),
@@ -207,14 +232,11 @@ export async function prepareWorkerTurnAttachments(params: {
           ],
           file.buffer.subarray(offset, offset + ATTACHMENT_CHUNK_BYTES).toString("base64"),
         );
-        if (!/^\d+:\d+$/.test(fileIdentity)) {
-          throw new Error("Cloud attachment transfer returned an invalid file identity.");
-        }
       }
     }
   } catch (error) {
     if (directoryIdentity) {
-      await execute(["cleanup", directoryIdentity], undefined, true).catch(() => undefined);
+      await execute("cleanup", [directoryIdentity]).catch(() => undefined);
     }
     throw error;
   }

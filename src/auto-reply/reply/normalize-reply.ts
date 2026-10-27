@@ -1,4 +1,3 @@
-// Normalizes raw agent output into sendable reply text and metadata.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { sanitizeUserFacingText } from "../../agents/embedded-agent-helpers/sanitize-user-facing-text.js";
 import { renderUserFacingText } from "../../agents/embedded-agent-helpers/user-facing-text.js";
@@ -7,20 +6,15 @@ import { stripHeartbeatToken } from "../heartbeat.js";
 import {
   copyReplyPayloadMetadata,
   getReplyPayloadMetadata,
+  hasReplyPayloadSpeechContent,
   setReplyPayloadMetadata,
 } from "../reply-payload.js";
-import {
-  HEARTBEAT_TOKEN,
-  isInternalFormattingArtifact,
-  isSilentReplyPayloadText,
-  isSilentReplyText,
-  SILENT_REPLY_TOKEN,
-  startsWithSilentToken,
-  stripLeadingSilentToken,
-  stripSilentToken,
-} from "../tokens.js";
+import { HEARTBEAT_TOKEN, isInternalFormattingArtifact } from "../tokens.js";
 import type { ReplyPayload } from "../types.js";
-import type { NormalizeReplySkipReason } from "./normalize-reply-skip-reason.js";
+import type {
+  NormalizeReplyOutcome as PayloadNormalizationOutcome,
+  NormalizeReplySkipReason,
+} from "./normalize-reply-skip-reason.js";
 import {
   resolveResponsePrefixTemplate,
   type ResponsePrefixContext,
@@ -28,9 +22,7 @@ import {
 
 export type { NormalizeReplySkipReason } from "./normalize-reply-skip-reason.js";
 
-export type NormalizeReplyOutcome<T = ReplyPayload> =
-  | { kind: "deliver"; payload: T }
-  | { kind: "suppress"; reason: NormalizeReplySkipReason };
+export type NormalizeReplyOutcome<T = ReplyPayload> = PayloadNormalizationOutcome<T>;
 
 const channelReplyTransformOwners = new WeakMap<
   (payload: ReplyPayload) => ReplyPayload | null,
@@ -56,7 +48,6 @@ type NormalizeReplyOptions = {
   /** Context for template variable interpolation in responsePrefix */
   responsePrefixContext?: ResponsePrefixContext;
   onHeartbeatStrip?: () => void;
-  silentToken?: string;
   transformReplyPayload?: (payload: ReplyPayload) => ReplyPayload | null;
   conversationContext?: string;
   onSkip?: (reason: NormalizeReplySkipReason) => void;
@@ -72,42 +63,22 @@ export function normalizeReplyPayloadOutcome(
   };
   const applyChannelTransforms = opts.applyChannelTransforms ?? true;
   const hasContent = (text: string | undefined) =>
-    hasReplyPayloadContent(
-      {
-        ...payload,
-        text,
-      },
-      {
-        trimText: true,
-      },
-    );
+    hasReplyPayloadContent({
+      ...payload,
+      text,
+    });
   const trimmed = normalizeOptionalString(payload.text) ?? "";
-  if (!hasContent(trimmed)) {
+  const hasSpeechContent = hasReplyPayloadSpeechContent(payload);
+  if (!hasContent(trimmed) && !hasSpeechContent) {
     return suppress("empty");
   }
 
-  const silentToken = opts.silentToken ?? SILENT_REPLY_TOKEN;
-  let text = payload.text ?? undefined;
-  if (text && isSilentReplyPayloadText(text, silentToken)) {
-    if (!hasContent("")) {
+  let text = payload.text;
+  if (getReplyPayloadMetadata(payload)?.silentReply === true) {
+    if (!hasContent("") && !hasSpeechContent) {
       return suppress("silent");
     }
     text = "";
-  }
-  // Strip NO_REPLY from mixed-content messages (e.g. "😄 NO_REPLY") so the
-  // token never leaks to end users.  If stripping leaves nothing, treat it as
-  // silent just like the exact-match path above.  (#30916, #30955)
-  if (text && !isSilentReplyText(text, silentToken)) {
-    const hasLeadingSilentToken = startsWithSilentToken(text, silentToken);
-    if (hasLeadingSilentToken) {
-      text = stripLeadingSilentToken(text, silentToken);
-    }
-    if (hasLeadingSilentToken || text.toLowerCase().includes(silentToken.toLowerCase())) {
-      text = stripSilentToken(text, silentToken);
-      if (!hasContent(text)) {
-        return suppress("silent");
-      }
-    }
   }
   if (text && !trimmed) {
     // Keep empty text when media exists so media-only replies still send.
@@ -137,7 +108,7 @@ export function normalizeReplyPayloadOutcome(
         })
       : sanitizeUserFacingText(text, { conversationContext: opts.conversationContext });
   }
-  if (!hasContent(text)) {
+  if (!hasContent(text) && !hasSpeechContent) {
     return suppress("empty");
   }
 
@@ -161,7 +132,6 @@ export function normalizeReplyPayloadOutcome(
     text = enrichedPayload.text;
   }
 
-  // Resolve template variables in responsePrefix if context is provided
   const effectivePrefix = opts.responsePrefixContext
     ? resolveResponsePrefixTemplate(opts.responsePrefix, opts.responsePrefixContext)
     : opts.responsePrefix;
@@ -172,7 +142,9 @@ export function normalizeReplyPayloadOutcome(
     text.trim() !== HEARTBEAT_TOKEN &&
     !text.startsWith(effectivePrefix)
   ) {
-    text = `${effectivePrefix} ${text}`;
+    const prefix = `${effectivePrefix} `;
+    text = `${prefix}${text}`;
+    setReplyPayloadMetadata(enrichedPayload, { responsePrefix: prefix });
   }
 
   enrichedPayload = copyReplyPayloadMetadata(enrichedPayload, { ...enrichedPayload, text });

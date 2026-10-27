@@ -1,10 +1,21 @@
+import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
+import { appendCurrentInboundContext } from "../../agents/embedded-agent-runner/run/runtime-context-prompt.js";
+import type { CurrentInboundPromptContext } from "../../agents/internal-runtime-context.js";
+import { normalizeChatType } from "../../channels/chat-type.js";
 import { isAgentEventLifecycleGenerationCurrent } from "../../infra/agent-events.js";
-import { resolveFollowupReplyDeliveryTargetKey } from "./queue/delivery-target.js";
+import { channelRouteDedupeKey } from "../../plugin-sdk/channel-route.js";
+import type {
+  ReplyOperation,
+  SessionControllerInput,
+  SessionControllerMailbox,
+} from "../../sessions/session-controller.contracts.js";
+import { isSessionControllerSourceQueued } from "../../sessions/session-controller.mailbox-source.js";
+import { getSessionControllerEntryForOperation } from "../../sessions/session-controller.state.js";
+import { resolveFollowupReplyAnchor } from "./queue/delivery-context.js";
 import type { FollowupRun } from "./queue/types.js";
-import type { ReplyOperation } from "./reply-run-registry.js";
 
 /** Immutable process-local fact minted by the owner that completed a source reply. */
-export type ReplyCompletionHandoff = Readonly<{
+type ReplyCompletionHandoff = Readonly<{
   kind: "completed_source_reply";
   ownerKey: string;
   ownerSessionId: string;
@@ -12,31 +23,38 @@ export type ReplyCompletionHandoff = Readonly<{
   deliveryTargetKey: string;
 }>;
 
-type ReplyCompletionQueueClaim = {
+type OperationCompletion =
+  | { kind: "recorded"; handoff: ReplyCompletionHandoff }
+  | { kind: "published" };
+
+type QueuedPredecessor = {
   handoff: ReplyCompletionHandoff;
+  recipients: WeakSet<SessionControllerInput>;
 };
 
-type ReplyCompletionQueueOwner = object & {
-  abortController?: AbortController;
-};
+const completionsByOperation = new WeakMap<ReplyOperation, OperationCompletion>();
+const predecessorsByMailbox = new WeakMap<SessionControllerMailbox, QueuedPredecessor>();
 
-const completionHandoffsByOperation = new WeakMap<ReplyOperation, ReplyCompletionHandoff>();
-const claimedCompletionUpdatesByOperation = new WeakSet<ReplyOperation>();
-const completionClaimsByQueueOwner = new WeakMap<object, ReplyCompletionQueueClaim>();
-const queuedCompletionClaim = Symbol("openclaw.queuedReplyCompletionClaim");
-
-type QueuedCompletionCarrier = FollowupRun & {
-  [queuedCompletionClaim]?: {
-    claim: ReplyCompletionQueueClaim;
-    owner: ReplyCompletionQueueOwner;
-  };
-};
-
-function clearReplyCompletionQueueClaim(owner: ReplyCompletionQueueOwner): void {
-  completionClaimsByQueueOwner.delete(owner);
+/** Fields that can change where or how a queued reply is delivered. */
+function resolveFollowupReplyDeliveryTargetKey(run: FollowupRun): string {
+  return JSON.stringify([
+    channelRouteDedupeKey({
+      channel: run.originatingChannel ?? run.run.messageProvider,
+      to: run.originatingTo,
+      accountId: run.originatingAccountId ?? run.run.agentAccountId,
+      threadId: run.originatingThreadId,
+    }),
+    normalizeOptionalString(run.originatingChatId) ?? "",
+    resolveFollowupReplyAnchor(run) ?? "",
+    run.originatingReplyToMode ?? "",
+    normalizeChatType(run.originatingChatType ?? run.run.chatType) ?? "",
+  ]);
 }
 
-/** Records the completed delivery before execution can return to owner cleanup. */
+const COMPLETED_SOURCE_REPLY_HANDOFF_DIRECTIVE =
+  "The immediately preceding turn already delivered its final user-visible reply via the `message` tool. Do not replay it merely to finish that preceding turn. Treat the current queued content as a fresh request, answer it normally, and send a new reply whenever it warrants one—including when it explicitly asks to repeat or discuss the prior reply.";
+
+/** Records settled delivery evidence, not transcript guesses or planned sends. */
 export function recordReplyOperationCompletedSourceReply(
   operation: ReplyOperation,
   source: FollowupRun,
@@ -49,42 +67,34 @@ export function recordReplyOperationCompletedSourceReply(
   ) {
     return;
   }
-  completionHandoffsByOperation.set(
-    operation,
-    Object.freeze({
+  completionsByOperation.set(operation, {
+    kind: "recorded",
+    handoff: Object.freeze({
       kind: "completed_source_reply",
       ownerKey: operation.key,
       ownerSessionId: operation.sessionId,
       ownerLifecycleGeneration: lifecycleGeneration,
       deliveryTargetKey: resolveFollowupReplyDeliveryTargetKey(source),
     }),
-  );
+  });
 }
 
-type ReplyCompletionHandoffTake =
-  | { kind: "claimed"; handoff?: ReplyCompletionHandoff }
-  | { kind: "ignored" };
-
-/**
- * Claims the exact operation's one queue-owner update after clear.
- * Duplicate callbacks are no-ops; the canonical no-delivery callback still
- * returns `claimed` so it can explicitly clear any predecessor state.
- */
-export function takeReplyOperationCompletionHandoff(params: {
+/** Claims one operation's update; duplicate clear callbacks cannot erase its successor. */
+function takeReplyOperationCompletionHandoff(params: {
   operation: ReplyOperation;
   queueKey: string;
   admissionSessionId: string;
-}): ReplyCompletionHandoffTake {
-  const handoff = completionHandoffsByOperation.get(params.operation);
+}): { kind: "claimed"; handoff?: ReplyCompletionHandoff } | { kind: "ignored" } {
+  const completion = completionsByOperation.get(params.operation);
   if (
-    claimedCompletionUpdatesByOperation.has(params.operation) ||
+    completion?.kind === "published" ||
     params.operation.key !== params.queueKey ||
     params.operation.sessionId !== params.admissionSessionId
   ) {
     return { kind: "ignored" };
   }
-  claimedCompletionUpdatesByOperation.add(params.operation);
-  completionHandoffsByOperation.delete(params.operation);
+  completionsByOperation.set(params.operation, { kind: "published" });
+  const handoff = completion?.handoff;
   if (
     params.operation.result?.kind !== "completed" ||
     !handoff ||
@@ -97,79 +107,70 @@ export function takeReplyOperationCompletionHandoff(params: {
   return { kind: "claimed", handoff };
 }
 
-/** Replaces the queue owner's predecessor fact, including replacement by no delivery. */
-export function replaceReplyCompletionQueuePredecessor(
-  owner: ReplyCompletionQueueOwner,
-  handoff: ReplyCompletionHandoff | undefined,
-): void {
-  clearReplyCompletionQueueClaim(owner);
-  if (handoff) {
-    completionClaimsByQueueOwner.set(owner, { handoff });
-  }
-}
-
-/**
- * Binds the queue owner's predecessor fact to the exact selected candidate.
- * A deferred candidate retains this claim; mismatches discard it without changing the run.
- */
-export function bindReplyCompletionHandoffToQueuedRun(params: {
-  owner: ReplyCompletionQueueOwner;
+/** Publish only an adopted source's predecessor update to its exact physical mailbox. */
+export function publishReplyOperationCompletionHandoff(params: {
+  operation: ReplyOperation;
+  source: FollowupRun;
   queueKey: string;
-  queued: FollowupRun;
+  admissionSessionId: string;
 }): void {
-  const claim = completionClaimsByQueueOwner.get(params.owner);
-  if (!claim) {
+  const input = params.source.controllerInput;
+  const custody = params.source.controllerClaim?.custody ?? input?.custody;
+  // Source custody is not inferred from terminal disposition: preparation can
+  // finish as consumed without ever adopting input or executing its request.
+  if (!input || !custody?.adopted) {
     return;
   }
-  if (params.owner.abortController?.signal.aborted) {
-    clearReplyCompletionQueueClaim(params.owner);
+  const mailbox = getSessionControllerEntryForOperation(params.operation).mailbox;
+  if (!mailbox || input.mailbox !== mailbox) {
     return;
   }
-  // Dropped/aborted queue entries never become a successor. Preserve the fact
-  // for the first non-aborted item that actually reaches reply admission.
-  if (params.queued.abortSignal?.aborted || params.queued.queueAbortSignal?.aborted) {
+  const completion = takeReplyOperationCompletionHandoff(params);
+  if (completion.kind === "ignored") {
     return;
   }
-  const handoff = claim.handoff;
-  const eligible =
-    isAgentEventLifecycleGenerationCurrent(handoff.ownerLifecycleGeneration) &&
-    params.queueKey === handoff.ownerKey &&
-    params.queued.run.sessionKey === handoff.ownerKey &&
-    (params.queued.admissionSessionId ?? params.queued.run.sessionId) === handoff.ownerSessionId &&
-    params.queued.currentInboundEventKind !== "room_event" &&
-    handoff.deliveryTargetKey === resolveFollowupReplyDeliveryTargetKey(params.queued);
-  if (!eligible) {
-    clearReplyCompletionQueueClaim(params.owner);
+  predecessorsByMailbox.delete(mailbox);
+  if (!completion.handoff || mailbox.abortController.signal.aborted) {
     return;
   }
-  Object.defineProperty(params.queued, queuedCompletionClaim, {
-    configurable: true,
-    value: { claim, owner: params.owner },
-  });
+  // An empty mailbox can survive for redelivery dedupe. Capture existing input
+  // identities so an ordinary later turn cannot inherit this queued-only fact.
+  const recipients = mailbox.entries.filter(
+    (candidate) =>
+      isSessionControllerSourceQueued(candidate) &&
+      !candidate.abortSignal.aborted &&
+      !candidate.retirementRequested,
+  );
+  if (recipients.length > 0) {
+    predecessorsByMailbox.set(mailbox, {
+      handoff: completion.handoff,
+      recipients: new WeakSet(recipients),
+    });
+  }
 }
 
-/** Consumes the candidate-bound fact only after its ReplyOperation admission succeeds. */
+/** Consume after actual source adoption, never during retryable preparation. */
 export function consumeQueuedReplyCompletionHandoff(
   queued: FollowupRun,
   operation: ReplyOperation,
 ): ReplyCompletionHandoff | undefined {
-  // SAFETY: the optional symbol is written only by bindReplyCompletionHandoffToQueuedRun.
-  const carrier = queued as QueuedCompletionCarrier;
-  const binding = carrier[queuedCompletionClaim];
-  if (!binding) {
+  const claim = queued.controllerClaim ?? queued.controllerInput?.claim;
+  const custody = queued.controllerClaim?.custody ?? queued.controllerInput?.custody;
+  if (!claim || claim.operation !== operation || !custody?.adopted || operation.result) {
     return undefined;
   }
-  delete carrier[queuedCompletionClaim];
-  if (completionClaimsByQueueOwner.get(binding.owner) !== binding.claim) {
+  const mailbox = getSessionControllerEntryForOperation(operation).mailbox;
+  if (!mailbox || claim.mailbox !== mailbox) {
     return undefined;
   }
-  if (binding.owner.abortController?.signal.aborted) {
-    clearReplyCompletionQueueClaim(binding.owner);
+  const predecessor = predecessorsByMailbox.get(mailbox);
+  if (!predecessor) {
     return undefined;
   }
-  clearReplyCompletionQueueClaim(binding.owner);
-  const handoff = binding.claim.handoff;
-  return !operation.result &&
+  predecessorsByMailbox.delete(mailbox);
+  const handoff = predecessor.handoff;
+  return !mailbox.abortController.signal.aborted &&
+    claim.inputs.some((input) => predecessor.recipients.has(input)) &&
     operation.key === handoff.ownerKey &&
     operation.sessionId === handoff.ownerSessionId &&
     operation.lifecycleGeneration === handoff.ownerLifecycleGeneration &&
@@ -180,4 +181,13 @@ export function consumeQueuedReplyCompletionHandoff(
     handoff.deliveryTargetKey === resolveFollowupReplyDeliveryTargetKey(queued)
     ? handoff
     : undefined;
+}
+
+/** Runtime fragments preserve prompt layout and never change user-authored transcript bytes. */
+export function appendCompletedSourceReplyHandoffDirective(
+  context: CurrentInboundPromptContext | undefined,
+): CurrentInboundPromptContext {
+  return appendCurrentInboundContext(context, [
+    { kind: "runtime-instruction", text: COMPLETED_SOURCE_REPLY_HANDOFF_DIRECTIVE },
+  ]);
 }

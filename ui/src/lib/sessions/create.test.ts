@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { requestSessionCreate, resolveSessionCreateParams } from "./create.ts";
+import { requestSessionCreate } from "./create.ts";
+import { resolveSessionCreateParams } from "./session-create-params.ts";
 
 describe("resolveSessionCreateParams", () => {
   it("marks a Control UI child as parallel to its selected parent", () => {
@@ -29,7 +30,7 @@ describe("requestSessionCreate", () => {
     ).resolves.toEqual({
       key: "agent:main:dashboard:new",
       entry: { thinkingLevel: "xhigh", updatedAt: 10 },
-      initialRun: { status: "started", runId: "initial-send-id", messageSeq: 7 },
+      initialRun: { status: "started", runId: "initial-send-id" },
     });
   });
 

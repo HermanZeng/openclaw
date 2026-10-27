@@ -1,4 +1,3 @@
-/** Applies runtime mode/config controls to live ACP backend sessions. */
 import type {
   AcpRuntime,
   AcpRuntimeCapabilities,
@@ -14,8 +13,9 @@ import {
   withAcpRuntimeErrorBoundary,
 } from "../runtime/errors.js";
 import type { CachedRuntimeState } from "./manager.runtime-handle-cache.js";
+import { isAcpOwnerRepairRequired } from "./manager.runtime-owner.js";
 import type { AcpSessionRuntimeOptions, SessionAcpMeta } from "./manager.types.js";
-import { createUnsupportedControlError } from "./manager.utils.js";
+import { assertCurrentAcpActor, createUnsupportedControlError } from "./manager.utils.js";
 import {
   buildRuntimeConfigOptionPairs,
   buildRuntimeControlSignature,
@@ -112,7 +112,6 @@ function isRejectedThinkingConfigOption(key: string, error: unknown): boolean {
   );
 }
 
-/** Resolves backend-advertised controls plus locally inferred runtime control support. */
 export async function resolveManagerRuntimeCapabilities(params: {
   runtime: AcpRuntime;
   handle: AcpRuntimeHandle;
@@ -151,7 +150,10 @@ export async function resolveManagerRuntimeCapabilities(params: {
       for (const key of extractRuntimeStatusConfigOptionKeys(status)) {
         normalizedKeys.add(key);
       }
-    } catch {
+    } catch (error) {
+      if (isAcpOwnerRepairRequired(error)) {
+        throw error;
+      }
       // Status-derived option keys are an optional refinement. Keep the
       // capability result usable for runtimes that expose controls but cannot
       // answer status before a turn.
@@ -170,8 +172,12 @@ export async function applyManagerRuntimeControls(params: {
   handle: AcpRuntimeHandle;
   meta: SessionAcpMeta;
   getCachedRuntimeState: (sessionKey: string) => CachedRuntimeState | null;
+  isCurrentActor?: () => boolean;
   onOptionsChanged: (options: AcpSessionRuntimeOptions) => Promise<void>;
+  onModelApplied?: (model: string | undefined) => void;
 }): Promise<void> {
+  const isCurrentActor = params.isCurrentActor ?? (() => true);
+  assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
   let options = resolveRuntimeOptionsFromMeta(params.meta);
   const signature = buildRuntimeControlSignature(options);
   const cached = params.getCachedRuntimeState(params.sessionKey);
@@ -186,7 +192,7 @@ export async function applyManagerRuntimeControls(params: {
     includeStatusConfigOptionKeys: needsConfigOptionKeys,
   });
   const backend = params.handle.backend || params.meta.backend;
-  const runtimeMode = normalizeText(options.runtimeMode);
+  const runtimeMode = options.runtimeMode;
   const configOptions = buildRuntimeConfigOptionPairs(options, capabilities.configOptionKeys);
   const thinkingConfigKey = options.thinking
     ? resolveRuntimeConfigOptionKey("thinking", capabilities.configOptionKeys)
@@ -199,8 +205,9 @@ export async function applyManagerRuntimeControls(params: {
 
   await withAcpRuntimeErrorBoundary({
     run: async () => {
+      assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
       if (runtimeMode) {
-        if (!capabilities.controls.includes("session/set_mode") || !params.runtime.setMode) {
+        if (!params.runtime.setMode) {
           throw createUnsupportedControlError({
             backend,
             control: "session/set_mode",
@@ -213,16 +220,14 @@ export async function applyManagerRuntimeControls(params: {
       }
 
       if (configOptions.length > 0) {
-        if (
-          !capabilities.controls.includes("session/set_config_option") ||
-          !params.runtime.setConfigOption
-        ) {
+        if (!params.runtime.setConfigOption) {
           throw createUnsupportedControlError({
             backend,
             control: "session/set_config_option",
           });
         }
         for (const [key, requestedValue] of configOptions) {
+          assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
           // Model changes can clamp or remove unsupported thinking before its turn in the replay.
           const value = key === thinkingConfigKey ? options.thinking : requestedValue;
           if (value === undefined) {
@@ -243,6 +248,17 @@ export async function applyManagerRuntimeControls(params: {
               key,
               value,
             });
+            assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
+            if (key === resolveRuntimeConfigOptionKey("model", capabilities.configOptionKeys)) {
+              const applied = result?.configOptions.find((option) => option.id === key);
+              params.onModelApplied?.(
+                result
+                  ? typeof applied?.currentValue === "string"
+                    ? applied.currentValue
+                    : undefined
+                  : value,
+              );
+            }
             const accepted = reconcileAcceptedRuntimeOptions(
               options,
               result,
@@ -251,9 +267,11 @@ export async function applyManagerRuntimeControls(params: {
             if (!runtimeOptionsEqual(options, accepted)) {
               // Persist each accepted change even if a later control fails.
               await params.onOptionsChanged(accepted);
+              assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
               options = accepted;
             }
           } catch (error) {
+            assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
             if (
               isUnsupportedOptionalTimeoutConfigRejection(key, error) ||
               isRejectedThinkingConfigOption(key, error)
@@ -269,6 +287,7 @@ export async function applyManagerRuntimeControls(params: {
     fallbackMessage: "Could not apply ACP runtime options before turn execution.",
   });
 
+  assertCurrentAcpActor(isCurrentActor(), params.sessionKey);
   if (cached) {
     cached.appliedControlSignature = buildRuntimeControlSignature(options);
   }

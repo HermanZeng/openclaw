@@ -5,6 +5,7 @@ import { basename, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BaseSequencer, type TestSpecification } from "vitest/node";
 import { readUiE2eFileTimings } from "../../scripts/lib/ci-test-timings.mts";
+import { selectWeightedShard } from "./vitest.weighted-sharding.ts";
 
 // Cold-start fallback when committed measurements are missing. Refresh
 // config/ci-test-timings.json with `pnpm ci:timings:refit`, not these literals.
@@ -64,7 +65,6 @@ const UI_E2E_FILE_SECONDS_HINTS = new Map<string, number>([
   ["device-token-reconnect.e2e.test.ts", 12],
   ["github-link-hovercard.e2e.test.ts", 11],
   ["initial-connect-splash.e2e.test.ts", 16],
-  ["lobster-pet-dismiss-menu-overflow.e2e.test.ts", 12],
   ["locale-offline-retry.e2e.test.ts", 13],
   ["mobile-pairing.e2e.test.ts", 12],
   ["model-providers.e2e.test.ts", 13],
@@ -106,11 +106,14 @@ const UI_E2E_FILE_SECONDS_HINTS = new Map<string, number>([
 // tests included -- keep rebalancing automatically off their source size.
 const UI_E2E_FALLBACK_SECONDS_PER_KB = 0.38;
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-
-type ShardBucket = {
-  seconds: number;
-  files: TestSpecification[];
-};
+// These source fixtures borrow one invocation's compiled subprocess generation.
+// New borrowers may add preparation elsewhere until this measured group is refreshed.
+const UI_E2E_SHARED_WORKER_FILES = new Set([
+  "ui/src/e2e/model-providers-profile-outcomes.e2e.test.ts",
+  "ui/src/e2e/post-deploy-session-entry.e2e.test.ts",
+  "ui/src/e2e/question-guest.e2e.test.ts",
+  "ui/src/e2e/screen-requester-routing.e2e.test.ts",
+]);
 
 function estimateFileSeconds(moduleId: string): number {
   const { fileSeconds, perFileOverheadSeconds } = readUiE2eFileTimings();
@@ -123,30 +126,50 @@ function estimateFileSeconds(moduleId: string): number {
 }
 
 export class UiE2eSequencer extends BaseSequencer {
+  override async sort(files: TestSpecification[]): Promise<TestSpecification[]> {
+    // eslint-disable-next-line unicorn/no-array-sort -- BaseSequencer.sort is Vitest's ordering API.
+    const ordered = await super.sort(files);
+    const parallel = ordered.filter((file) => file.project.config.sequence.groupOrder === 0);
+    if (parallel.some((file) => this.ctx.cache.getTestSpecificationResult(file))) {
+      // Keep native failed-first and observed-duration ordering on warm reruns.
+      return ordered;
+    }
+    const seconds = new Map(parallel.map((file) => [file, estimateFileSeconds(file.moduleId)]));
+    return ordered.toSorted((left, right) => {
+      const groupOrder =
+        left.project.config.sequence.groupOrder - right.project.config.sequence.groupOrder;
+      if (groupOrder || left.project.config.sequence.groupOrder !== 0) {
+        return groupOrder;
+      }
+      // Bundled and private fixtures share this worker pool; do not queue builds last.
+      return (
+        seconds.get(right)! - seconds.get(left)! ||
+        left.moduleId.localeCompare(right.moduleId) ||
+        left.project.name.localeCompare(right.project.name)
+      );
+    });
+  }
+
   override async shard(files: TestSpecification[]): Promise<TestSpecification[]> {
     // Vitest invokes shard() only when config.shard is present.
-    const { count, index } = this.ctx.config.shard!;
-    const buckets: ShardBucket[] = Array.from({ length: count }, () => ({
-      seconds: 0,
-      files: [],
-    }));
-    // Membership comes only from Vitest discovery. Stale timing keys can
-    // change balance but must never add, omit, or duplicate a test file.
-    const weightedFiles = files
-      .map((file) => ({ seconds: estimateFileSeconds(file.moduleId), file }))
-      .sort(
-        (left, right) =>
-          right.seconds - left.seconds || left.file.moduleId.localeCompare(right.file.moduleId),
-      );
-
-    for (const weightedFile of weightedFiles) {
-      const bucket = buckets.reduce((lightest, candidate) =>
-        candidate.seconds < lightest.seconds ? candidate : lightest,
-      );
-      bucket.seconds += weightedFile.seconds;
-      bucket.files.push(weightedFile.file);
-    }
-
-    return buckets[index - 1]!.files;
+    return selectWeightedShard(
+      files,
+      this.ctx.config.shard!,
+      (file) => estimateFileSeconds(file.moduleId) / effectiveProjectWorkers(file),
+      (file) =>
+        UI_E2E_SHARED_WORKER_FILES.has(relative(repoRoot, file.moduleId).replaceAll("\\", "/"))
+          ? "compiled-workers"
+          : undefined,
+    );
   }
+}
+
+function effectiveProjectWorkers(file: TestSpecification): number {
+  // Mirror Vitest's project-first, root-second worker resolution. The UI config
+  // pins both sources, so an implicit host-sized fallback would hide drift.
+  const workers = file.project.config.maxWorkers ?? file.project.vitest.config.maxWorkers;
+  if (typeof workers !== "number" || !Number.isInteger(workers) || workers < 1) {
+    throw new Error(`Control UI E2E project ${file.project.name} needs an explicit worker count`);
+  }
+  return workers;
 }
