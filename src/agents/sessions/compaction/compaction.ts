@@ -1,5 +1,5 @@
 /** Preserves the session SDK's throwing summary API over agent-core results. */
-import type { Model } from "../../../llm/types.js";
+import type { Model, ModelRequestHeaders } from "../../../llm/types.js";
 import { projectRecordedModelPrompt } from "../../../sessions/user-turn-transcript.message.js";
 import {
   generateSummary as generateSummaryCore,
@@ -23,7 +23,7 @@ export async function generateSummary(
   model: Model,
   reserveTokens: number,
   apiKey: string | undefined,
-  headers?: Record<string, string>,
+  headers?: ModelRequestHeaders,
   signal?: AbortSignal,
   customInstructions?: string,
   previousSummary?: string,

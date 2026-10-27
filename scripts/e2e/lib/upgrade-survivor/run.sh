@@ -38,6 +38,7 @@ LIVE_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 LIVE_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 resolve_upgrade_survivor_paths
 mkdir -p "$ARTIFACT_ROOT"
+export OPENCLAW_UPGRADE_SURVIVOR_ARCHIVE_PROOF_ROOT="$ARTIFACT_ROOT/session-archives"
 LIVE_MODELS_JSON="$ARTIFACT_ROOT/live-models.json"
 node scripts/e2e/lib/upgrade-survivor/live-models.mjs init "$LIVE_MODELS_JSON"
 export GATEWAY_AUTH_TOKEN_REF="upgrade-survivor-token"
@@ -1137,8 +1138,22 @@ assert.equal(result.status, "skipped", "second update was not a clean no-op");
 assert.equal(result.reason, "already-current", "second update was not already current");
 // The isolated state directory records a service refusal without running the suggested command.
 assert(Array.isArray(result.steps), "second update did not report its steps");
+// Already-current updates still retire verified recovery artifacts, never packages.
+const cleanups = result.steps.filter((step) => step.name === "recovery-artifact-cleanup");
+assert(cleanups.length <= 1, "second update repeated recovery cleanup");
+for (const { durationMs, diagnostics, ...step } of cleanups) {
+  assert(Number.isFinite(durationMs) && durationMs >= 0, "invalid recovery cleanup duration");
+  assert.deepEqual(step, {
+    name: "recovery-artifact-cleanup", command: "openclaw update cleanup", cwd: "", exitCode: 0,
+  }, "second update recovery cleanup did not finish cleanly");
+  assert(Array.isArray(diagnostics) && diagnostics.length === 1 &&
+    typeof diagnostics[0] === "string" &&
+    /^Recovery cleanup removed \d+ files \(\d+ logical bytes\); protected recovery artifacts were retained\.$/.test(diagnostics[0]),
+    "second update omitted its verified recovery cleanup outcome");
+}
 // Advisory guidance is product prose that releases reword; require one, not its text.
-const steps = result.steps.map(({ advisory, ...step }) => advisory ? {
+const steps = result.steps.filter((step) => step.name !== "recovery-artifact-cleanup")
+  .map(({ advisory, ...step }) => advisory ? {
   ...step,
   advisory: { kind: advisory.kind, explained: typeof advisory.message === "string" && advisory.message.trim() !== "" },
 } : step);
@@ -1593,6 +1608,9 @@ update_candidate() {
   local update_node_options="${NODE_OPTIONS:+$NODE_OPTIONS }--import=$PWD/scripts/e2e/lib/upgrade-survivor/diagnostics.mjs"
   if [ -n "${OPENCLAW_UPGRADE_SURVIVOR_NPM_REGISTRY:-}" ]; then
     update_node_options+=" --import=$PWD/scripts/e2e/lib/upgrade-survivor/plugin-registry-redirect.mjs"
+  fi
+  if [ "$SCENARIO" = "legacy-operator-state" ]; then
+    update_node_options+=" --import=$PWD/scripts/e2e/lib/upgrade-survivor/session-archive-proof.mjs"
   fi
   if [ "$SCENARIO" = "custom-plugin-siblings" ]; then
     update_node_options+=" --import=$ARTIFACT_ROOT/sibling-refusal-preload.mjs"
@@ -2399,6 +2417,29 @@ phase validate-worker-cell validate_worker_cell
 phase reset-run-state reset_run_state
 phase install-baseline install_baseline
 phase initialize-state initialize_state
+if [ "$SCENARIO" = "session-share" ]; then
+  require_isolated_manual_baseline openclaw@2026.10.7
+  phase configure-sharing-baseline node scripts/e2e/lib/upgrade-survivor/session-share.mjs configure "$(package_root)"
+  phase prepare-sharing-baseline run_doctor
+  phase start-sharing-baseline start_gateway
+  phase seed-sharing-baseline node scripts/e2e/lib/upgrade-survivor/session-share.mjs seed "$(package_root)"
+  phase stop-sharing-baseline stop_gateway
+  phase resolve-sharing-candidate resolve_candidate_version
+  phase sharing-candidate-package node scripts/e2e/lib/upgrade-survivor/worker-cell-package.mjs candidate "$(package_root)" "$CANDIDATE_SPEC"
+  phase update-sharing-candidate update_candidate
+  if [ "$update_outcome" != "success" ] || [ "$update_repair_required" != "0" ]; then
+    echo "Session sharing upgrade requires successful native migration without manual repair." >&2
+    exit 1
+  fi
+  phase sharing-installed-package node scripts/e2e/lib/upgrade-survivor/worker-cell-package.mjs installed "$(package_root)" "$CANDIDATE_SPEC"
+  # Read the updater's result before Gateway startup or a standalone Doctor can repair it.
+  phase inspect-sharing-first-hop node scripts/e2e/lib/upgrade-survivor/session-share.mjs inspect "$(package_root)"
+  phase start-sharing-candidate start_gateway
+  phase assert-sharing-candidate node scripts/e2e/lib/upgrade-survivor/session-share.mjs candidate "$(package_root)"
+  run_completed="1"
+  echo "Session sharing survivor passed: native update preserved published group-only settings, session identities, transcripts, and paired-node selection."
+  exit 0
+fi
 if [ "$SCENARIO" = "package-publication-recovery" ] || [ "$SCENARIO" = "package-verification-recovery" ] || [ "$SCENARIO" = "package-stranded-first-hop" ]; then
   source scripts/e2e/lib/upgrade-survivor/package-activation-recovery.sh
   run_package_activation_recovery_survivor
@@ -2782,7 +2823,13 @@ if [ "$SCENARIO" = "legacy-operator-state" ]; then
   phase seed-legacy-pending-delivery node scripts/e2e/lib/upgrade-survivor/assertions.mjs \
     seed-legacy-operator-pending-delivery
 fi
+if [ "$SCENARIO" = "legacy-operator-state" ]; then
+  phase seed-legacy-doctor-repairs node scripts/e2e/lib/upgrade-survivor/legacy-operator-doctor-repairs.mjs seed
+fi
 phase update-candidate update_candidate_for_install_mode
+if [ "$SCENARIO" = "legacy-operator-state" ]; then
+  phase assert-legacy-doctor-repairs node scripts/e2e/lib/upgrade-survivor/legacy-operator-doctor-repairs.mjs assert
+fi
 if [ "$SCENARIO" = "legacy-operator-state" ]; then
   phase assert-legacy-pending-delivery node scripts/e2e/lib/upgrade-survivor/assertions.mjs \
     assert-legacy-operator-pending-delivery "$UPDATE_JSON" "$UPDATE_ERR"

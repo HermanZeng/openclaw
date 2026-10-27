@@ -12,8 +12,11 @@ import { runWithSqliteCleanup } from "./sqlite-lifecycle-errors.js";
 import { observeSqliteNativeClose } from "./sqlite-native-observer.js";
 import { runSqliteReadOnlyWorkerSync } from "./sqlite-readonly-worker.js";
 import { truncateSqliteWal } from "./sqlite-wal-checkpoint.js";
+import { readMatchingUpdateDatabaseGeneration } from "./update-database-generations.js";
 
 export type UpdateDoctorMigrationCapture = {
+  /** Captured SQLite sources admitted by this Doctor session. */
+  openedSqlitePaths?: Set<string>;
   expected(pathname: string): string | null | undefined;
   assertCurrent(): void;
   accept(pathname: string, before: string | null, after: string | null): void;
@@ -196,6 +199,7 @@ export function runUpdateSqliteMigration<T>(
   }
   const { capture } = context;
   const expected = capture.expected(pathname);
+  const opened = capture.openedSqlitePaths?.has(pathname);
   if (typeof expected !== "string" && !(expected === null && options?.created)) {
     return operation();
   }
@@ -231,10 +235,22 @@ export function runUpdateSqliteMigration<T>(
             throw new Error("Created SQLite migration family is no longer empty.");
           }
         }
-        const before = expected === null ? null : readSqliteGeneration(pathname);
+        // Before native exclusion, a cold read-only open may add an empty WAL
+        // index to the captured family. Exclusive handles keep the isolated read:
+        // closing a raw source descriptor here would release their process locks.
+        const before =
+          expected === null
+            ? null
+            : opened || mode === "exclusive"
+              ? readSqliteGeneration(pathname)
+              : readMatchingUpdateDatabaseGeneration(pathname, expected);
         assertCurrent();
+        if (before === undefined || (!opened && mode === "exclusive" && before !== expected)) {
+          throw new Error(`SQLite migration source changed after update capture: ${pathname}`);
+        }
+        capture.openedSqlitePaths?.add(pathname);
         if (before !== expected) {
-          throw new Error("SQLite migration source changed after update capture.");
+          capture.accept(pathname, expected, before);
         }
         if (mode !== "exclusive") {
           // Start WAL in normal mode: a cold exclusive WAL cannot later return
@@ -264,7 +280,9 @@ export function runUpdateSqliteMigration<T>(
           return result;
         });
       } catch (error) {
-        capture.refuse("SQLite migration publication could not be verified.");
+        capture.refuse(
+          `SQLite migration publication could not be verified: ${formatErrorMessage(error)}`,
+        );
         throw error;
       }
     },
@@ -295,6 +313,7 @@ export function beginUpdateSqliteCompanion(db: DatabaseSync, pathname: string, c
     capture.refuse("Migration companion changed after update capture.");
     throw new Error("Database migration companion no longer matches its capture.");
   }
+  capture.openedSqlitePaths?.add(pathname);
   return {
     complete() {
       assertCurrent();
