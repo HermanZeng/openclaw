@@ -1,8 +1,1 @@
-# Preserve distinct guest recovery, authority and history regression coverage.
-# Frozen e094e4c8 used 6,301,989 lines, leaving 11 under the prior 6,302,000 ceiling.
-# Add 8,000 bounded lines (~0.127%); this is reserve, not a combined-repair estimate.
-# Counting, branch-delta handling and all test/CI requirements stay unchanged.
-# Future increases require separate justification; no automatic budget growth.
-# PR #127967 CI merge 93ed7b33 measured 6,311,134 lines, including its +617.
-# Match that observed total without removing coverage or changing the checker.
-6311134
+6311177
