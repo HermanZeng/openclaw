@@ -3,4 +3,6 @@
 # Add 8,000 bounded lines (~0.127%); this is reserve, not a combined-repair estimate.
 # Counting, branch-delta handling and all test/CI requirements stay unchanged.
 # Future increases require separate justification; no automatic budget growth.
-6310000
+# PR #180710 CI merge 4af434f2 measured 6,311,045 lines, including its +498.
+# Match that observed total without removing coverage or changing the checker.
+6311045
