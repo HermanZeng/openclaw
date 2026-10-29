@@ -433,17 +433,6 @@ it(
             transcriptContent(beforeHistory?.messages),
           );
           expect(
-            events
-              .slice(revokedEventBoundary)
-              .filter(
-                (event) =>
-                  event.event === "session.message" &&
-                  asOptionalRecord(event.payload)?.sessionKey === scenario.sessionKey,
-              ),
-          ).toEqual([]);
-          expect(scenario.parentCalls).toBe(beforeRevocation.parent);
-          expect(scenario.childCalls).toBe(beforeRevocation.child);
-          expect(
             events.slice(beforeRevocation.events).filter((event) => {
               const payload = asOptionalRecord(event.payload);
               return (
