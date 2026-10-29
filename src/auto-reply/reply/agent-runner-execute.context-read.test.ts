@@ -29,15 +29,6 @@ vi.mock("./agent-runner-memory.js", () => ({
 }));
 // mock-isolation: No follow-up or outbound delivery is started by this admission fixture.
 vi.mock("./followup-runner.js", () => ({ createFollowupRunner: () => async () => {} }));
-// mock-isolation: This Goal-less prefix race uses an unregistered reply double; actual Goal/controller
-// composition is covered by goal-continuation.test.ts and chat-goal-created-yield.e2e.test.ts.
-vi.mock("./goal-continuation.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("./goal-continuation.js")>()),
-  createGoalContinuationReturn:
-    () =>
-    <T>(run: () => T) =>
-      run(),
-}));
 // mock-isolation: The test ends after the runtime-owned transcript and reply boundary.
 vi.mock("./agent-runner-result.js", () => ({ finalizeReplyAgentRun: async () => undefined }));
 // mock-isolation: Verify admission even when no plugin hook is registered.
