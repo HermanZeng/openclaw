@@ -2,6 +2,7 @@ import {
   closeOpenClawStateDatabaseForTest,
   createChannelIngressQueueForTests,
 } from "openclaw/plugin-sdk/channel-ingress-test-runtime";
+import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
 import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SignalSseEvent } from "./client-adapter.js";
@@ -52,6 +53,7 @@ const tempDirs = useAutoCleanupTempDirTracker((cleanup) =>
       }
     } finally {
       monitors.clear();
+      await closeOpenClawStateDatabaseAsync();
       closeOpenClawStateDatabaseForTest();
       cleanup();
       vi.restoreAllMocks();
