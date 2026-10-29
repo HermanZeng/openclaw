@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { asOptionalRecord } from "@openclaw/normalization-core/record-coerce";
-import { expect, it } from "vitest";
+import { expect, it, onTestFinished, vi } from "vitest";
 import { withinTest } from "../../test/helpers/promise.js";
 import { runQaGatewayFixture } from "../../test/helpers/qa-gateway-cleanup.js";
 import { subscribeSubagentRunChanges } from "../agents/subagents/registry/subagent-registry-publication.js";
 import { getSubagentRunByRunId } from "../agents/subagents/registry/subagent-registry.js";
+import * as queueLifecycle from "../auto-reply/reply/queue/lifecycle.js";
 import { loadSessionEntry } from "../config/sessions/session-accessor.js";
 import { waitForGatewayActiveWork } from "../infra/gateway-active-work.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -31,15 +32,29 @@ function records(value: unknown): Record<string, unknown>[] {
 
 // Real Gateway, tools and committed child return. Only provider decisions are scripted.
 it(
-  "continues a model-created Goal once after a delegated or ordinary final",
+  "delivers one Goal continuation after direct or queued creation and a delegated or ordinary final",
   {
     timeout: 120_000,
   },
   async ({ signal }) => {
-    const scenarios = [true, false].map((delegated) => {
+    const scenarios = [
+      { name: "delegated", delegated: true, queued: false },
+      { name: "direct", delegated: false, queued: false },
+      { name: "queued", delegated: true, queued: true },
+    ].map(({ name, delegated, queued }) => {
       const nonce = randomUUID();
       return {
+        name,
         delegated,
+        queued,
+        predecessorPrompt: `PREDECESSOR_${nonce}`,
+        predecessorCalls: 0,
+        predecessorStarted: createDeferredCore(),
+        releasePredecessor: createDeferredCore(),
+        enqueued: createDeferredCore(),
+        finalText: `GOAL_DONE_${nonce}`,
+        finalMessages: [] as unknown[],
+        finalReceived: createDeferredCore(),
         prompt: `GOAL_CREATE_${nonce}: Create the requested Goal, finish the first item, then continue the remaining item.`,
         childTask: `CHILD_ITEM_${nonce}: Return the first-item finding only.`,
         childResult: `CHILD_DONE_${nonce}`,
@@ -57,6 +72,21 @@ it(
     for (const scenario of scenarios) {
       void scenario.failed.promise.catch(() => {});
     }
+    // chat.send acknowledges durable admission before enqueue publication. Observe
+    // the real queue decision, without replacing it, before releasing its predecessor.
+    const enqueue = queueLifecycle.markFollowupRunEnqueued;
+    const observeQueue = vi
+      .spyOn(queueLifecycle, "markFollowupRunEnqueued")
+      .mockImplementation((run) => {
+        const enqueued = enqueue(run);
+        if (enqueued) {
+          scenarios
+            .find((scenario) => scenario.queued && run.prompt.includes(scenario.prompt))
+            ?.enqueued.resolve();
+        }
+        return enqueued;
+      });
+    onTestFinished(() => observeQueue.mockRestore());
     await withOpenClawTestState(
       {
         label: "goal-created-yield",
@@ -69,6 +99,20 @@ it(
       },
       async () => {
         const fixture = createChatFixture("goal-created-yield", {
+          onEvent: ({ event, payload: value }) => {
+            const payload = asOptionalRecord(value);
+            const scenario = scenarios.find((entry) => entry.sessionKey === payload?.sessionKey);
+            if (
+              event === "session.message" &&
+              scenario &&
+              records(payload?.message).some(
+                (part) => part.type === "text" && part.text === scenario.finalText,
+              )
+            ) {
+              scenario.finalMessages.push(payload?.message);
+              scenario.finalReceived.resolve();
+            }
+          },
           configure: (config) => ({
             ...config,
             agents: { ...config.agents, ownership: "explicit", entries: { main: {} } },
@@ -82,9 +126,21 @@ it(
             }
             const scenario =
               scenarios.find((candidate) => body.includes(candidate.prompt)) ??
-              scenarios.find((candidate) => body.includes(candidate.childTask));
+              scenarios.find((candidate) => body.includes(candidate.childTask)) ??
+              scenarios.find((candidate) => body.includes(candidate.predecessorPrompt));
             assert(scenario, "only fixture conversations may call this provider");
             try {
+              if (
+                scenario.queued &&
+                body.includes(scenario.predecessorPrompt) &&
+                !body.includes(scenario.prompt)
+              ) {
+                scenario.predecessorCalls++;
+                expect(scenario.predecessorCalls).toBe(1);
+                scenario.predecessorStarted.resolve();
+                await scenario.releasePredecessor.promise;
+                return "The predecessor is complete; no Goal was created.";
+              }
               if (!body.includes(scenario.prompt) && body.includes(scenario.childTask)) {
                 scenario.childCalls++;
                 expect(scenario.childCalls).toBe(1);
@@ -129,7 +185,7 @@ it(
                 writeToolCall(response, "update_goal", { status: "complete" });
               } else if (scenario.parentCalls === (scenario.delegated ? 6 : 4)) {
                 expect(toolOutput).toContainEqual(expect.objectContaining({ status: "updated" }));
-                return "Both synthetic items are complete.";
+                return scenario.finalText;
               } else {
                 throw new Error(`Unexpected Goal request ${scenario.parentCalls}`);
               }
@@ -148,9 +204,14 @@ it(
                 withinTest(Promise.race([promise, scenario.failed.promise]), signal);
               const created = await fixture.client.request<{ key: string }>("sessions.create", {
                 agentId: "main",
-                label: scenario.delegated ? "Delegated Goal" : "Direct Goal",
+                label: `Goal ${scenario.name}`,
               });
               scenario.sessionKey = created.key;
+              expect(
+                await fixture.client.request("sessions.messages.subscribe", {
+                  key: scenario.sessionKey,
+                }),
+              ).toMatchObject({ subscribed: true });
               const unsubscribe = subscribeSubagentRunChanges("persistence", () => {
                 const child = scenario.childRunId && getSubagentRunByRunId(scenario.childRunId);
                 if (!child) {
@@ -169,15 +230,42 @@ it(
                 }
               });
               try {
+                if (scenario.queued) {
+                  await fixture.client.request("chat.send", {
+                    sessionKey: scenario.sessionKey,
+                    message: scenario.predecessorPrompt,
+                    idempotencyKey: randomUUID(),
+                  });
+                  await wait(scenario.predecessorStarted.promise);
+                }
                 const accepted = await fixture.client.request<{ status: string; runId: string }>(
                   "chat.send",
                   {
                     sessionKey: scenario.sessionKey,
                     message: scenario.prompt,
+                    ...(scenario.queued ? { queueMode: "followup" } : {}),
                     idempotencyKey: randomUUID(),
                   },
                 );
                 expect(accepted.status).toBe("started");
+                if (scenario.queued) {
+                  await wait(scenario.enqueued.promise);
+                  // Observe the second user input queued behind the held predecessor,
+                  // before any Goal exists; the later automatic nudge is a distinct turn.
+                  expect(
+                    await fixture.client.request("chat.history", {
+                      sessionKey: scenario.sessionKey,
+                      inputRunIds: [accepted.runId],
+                    }),
+                  ).toMatchObject({
+                    inputReceipts: [{ runId: accepted.runId, state: "pending", queued: true }],
+                  });
+                  expect(
+                    loadSessionEntry({ agentId: "main", sessionKey: scenario.sessionKey })?.goal,
+                  ).toBeUndefined();
+                  expect(scenario.parentCalls).toBe(0);
+                  scenario.releasePredecessor.resolve();
+                }
                 if (scenario.delegated) {
                   await wait(
                     Promise.all([scenario.childStarted.promise, scenario.yielded.promise]),
@@ -205,8 +293,27 @@ it(
                 });
                 expect(scenario.parentCalls).toBe(scenario.delegated ? 6 : 4);
                 expect(scenario.childCalls).toBe(Number(scenario.delegated));
+                expect(scenario.predecessorCalls).toBe(Number(scenario.queued));
+                await wait(scenario.finalReceived.promise);
+                const finalMessage = expect.objectContaining({
+                  role: "assistant",
+                  content: [expect.objectContaining({ type: "text", text: scenario.finalText })],
+                });
+                expect(scenario.finalMessages).toEqual([finalMessage]);
+                const history = await fixture.client.request<{ messages: unknown[] }>(
+                  "chat.history",
+                  { sessionKey: scenario.sessionKey, limit: 100 },
+                );
+                expect(
+                  history.messages.filter((message) =>
+                    records(message).some(
+                      (part) => part.type === "text" && part.text === scenario.finalText,
+                    ),
+                  ),
+                ).toEqual([finalMessage]);
                 expect(fixture.errors).toEqual([]);
               } finally {
+                scenario.releasePredecessor.resolve();
                 scenario.releaseChild.resolve();
                 unsubscribe();
               }
@@ -214,6 +321,7 @@ it(
           },
           async () => {
             for (const scenario of scenarios) {
+              scenario.releasePredecessor.resolve();
               scenario.releaseChild.resolve();
             }
             await fixture.close();

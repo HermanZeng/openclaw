@@ -58,6 +58,30 @@ function spawnReceipt(value: unknown): { runId: string; childSessionKey: string 
     .find((receipt) => receipt !== undefined);
 }
 
+function assistantText(value: unknown): string | undefined {
+  const message = asOptionalRecord(value);
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) {
+    return undefined;
+  }
+  return message.content
+    .map((block) => {
+      const part = asOptionalRecord(block);
+      return part?.type === "text" && typeof part.text === "string" ? part.text : "";
+    })
+    .join("");
+}
+
+function transcriptContent(messages: unknown[] | undefined) {
+  return messages?.map((value) => {
+    const message = asOptionalRecord(value);
+    return {
+      id: asOptionalRecord(message?.["__openclaw"])?.id,
+      role: message?.role,
+      content: message?.content,
+    };
+  });
+}
+
 // Fixed provider decisions; real identified operators, tools, authority and persisted effects.
 it(
   "preserves restricted Goal returns and cancels revoked returns before further effects",
@@ -98,6 +122,8 @@ it(
         settlementEntered: createDeferredCore(),
         releaseSettlement: createDeferredCore(),
         providerCancelled: createDeferredCore(),
+        finalText: `GOAL_COMPLETE_${nonce}`,
+        finalReceived: createDeferredCore(),
       };
     });
     cleanup.defer(() => {
@@ -185,7 +211,7 @@ it(
           writeToolCall(response, "update_goal", { status: "complete" });
         } else if (scenario.parentCalls === 7) {
           expect(scenario.revoke).toBe(false);
-          reply("The synthetic Goal is complete.");
+          reply(scenario.finalText);
         } else {
           throw new Error("Unexpected Goal authority provider request");
         }
@@ -263,6 +289,9 @@ it(
       origin,
       tlsFingerprint: new X509Certificate(TEST_TLS_CERT_PEM).fingerprint256,
     };
+    const publicationText = `POST_REVOCATION_${randomUUID()}`;
+    const authorizedEvents: Array<{ event?: string; payload?: unknown }> = [];
+    const authorizedPublication = createDeferredCore();
     const gateway = await startGatewayWithClient({
       ...connection,
       cfg,
@@ -271,6 +300,16 @@ it(
       secure: true,
       scopes: ["operator.admin"],
       edgeAuthHeaders: headers("admin"),
+      onEvent: (event) => {
+        authorizedEvents.push(event);
+        const payload = asOptionalRecord(event.payload);
+        if (
+          event.event === "session.message" &&
+          assistantText(payload?.message) === publicationText
+        ) {
+          authorizedPublication.resolve();
+        }
+      },
     });
     cleanup.defer(async () => {
       await disconnectGatewayClient(gateway.client);
@@ -288,7 +327,17 @@ it(
         deviceIdentity: loadOrCreateDeviceIdentity({
           path: state.path(scenario.name, "client", "credentials.sqlite"),
         }),
-        onEvent: (event) => events.push(event),
+        onEvent: (event) => {
+          events.push(event);
+          const payload = asOptionalRecord(event.payload);
+          if (
+            event.event === "session.message" &&
+            payload?.sessionKey === scenario.sessionKey &&
+            assistantText(payload.message) === scenario.finalText
+          ) {
+            scenario.finalReceived.resolve();
+          }
+        },
       });
       cleanup.defer(() => disconnectGatewayClient(member));
       expect(await member.request("users.self", {})).toMatchObject({
@@ -299,6 +348,9 @@ it(
         label: `Goal ${scenario.name}`,
       });
       scenario.sessionKey = created.key;
+      expect(
+        await member.request("sessions.messages.subscribe", { key: scenario.sessionKey }),
+      ).toMatchObject({ subscribed: true });
       const unsubscribe = subscribeSubagentRunChanges("persistence", () => {
         const child = scenario.childRunId && getSubagentRunByRunId(scenario.childRunId);
         if (child && child.requesterSettleWake?.requesterYieldBatch && !child.requesterTurnRunId) {
@@ -320,8 +372,23 @@ it(
           child: scenario.childCalls,
           events: events.length,
         };
+        const beforeHistory = scenario.revoke
+          ? await admin.request<{ messages: unknown[] }>("chat.history", {
+              sessionKey: scenario.sessionKey,
+              limit: 100,
+            })
+          : undefined;
+        let revokedEventBoundary = events.length;
         if (scenario.revoke) {
+          expect(
+            events.some(
+              (event) =>
+                event.event === "session.message" &&
+                asOptionalRecord(event.payload)?.sessionKey === scenario.sessionKey,
+            ),
+          ).toBe(true);
           await admin.request("users.setRole", { profileId: scenario.profile.id, role: "revoked" });
+          revokedEventBoundary = events.length;
           // Observe the actual provider socket cancellation, not a fixture decision
           // to drop a response. The stale effect is released only after this fact.
           await wait(scenario.providerCancelled.promise);
@@ -341,7 +408,39 @@ it(
             ? { status: "active", continuationTurns: 0 }
             : { status: "complete", continuationTurns: 1 },
         );
+        if (!scenario.revoke) {
+          await wait(scenario.finalReceived.promise);
+        }
+        const history = await (scenario.revoke ? admin : member).request<{ messages: unknown[] }>(
+          "chat.history",
+          { sessionKey: scenario.sessionKey, limit: 100 },
+        );
+        const finals = events.filter(
+          (event) =>
+            event.event === "session.message" &&
+            asOptionalRecord(event.payload)?.sessionKey === scenario.sessionKey &&
+            assistantText(asOptionalRecord(event.payload)?.message) === scenario.finalText,
+        );
+        expect(finals).toHaveLength(scenario.revoke ? 0 : 1);
+        expect(
+          history.messages.filter((message) => assistantText(message) === scenario.finalText),
+        ).toHaveLength(scenario.revoke ? 0 : 1);
         if (scenario.revoke) {
+          // The administrator may still inspect the canonical history; only the
+          // revoked requester's publication stream is required to be silent.
+          // Role changes refresh projected avatar URLs, not durable message identity/content.
+          expect(transcriptContent(history.messages)).toEqual(
+            transcriptContent(beforeHistory?.messages),
+          );
+          expect(
+            events
+              .slice(revokedEventBoundary)
+              .filter(
+                (event) =>
+                  event.event === "session.message" &&
+                  asOptionalRecord(event.payload)?.sessionKey === scenario.sessionKey,
+              ),
+          ).toEqual([]);
           expect(scenario.parentCalls).toBe(beforeRevocation.parent);
           expect(scenario.childCalls).toBe(beforeRevocation.child);
           expect(
@@ -356,6 +455,50 @@ it(
               );
             }),
           ).toEqual([]);
+          // Role changes retire the old subscription; the client may reconnect read-only.
+          // Assert disclosure after a real publication, not transient transport state.
+          expect(
+            await admin.request("sessions.messages.subscribe", { key: scenario.sessionKey }),
+          ).toMatchObject({ subscribed: true });
+          expect(
+            await admin.request("chat.inject", {
+              sessionKey: scenario.sessionKey,
+              message: publicationText,
+            }),
+          ).toMatchObject({ ok: true });
+          await wait(authorizedPublication.promise);
+          const publicationDrained = await wait(waitForGatewayActiveWork(30_000));
+          expect(publicationDrained.drained).toBe(true);
+          const afterPublication = await admin.request<{ messages: unknown[] }>("chat.history", {
+            sessionKey: scenario.sessionKey,
+            limit: 100,
+          });
+          expect(
+            authorizedEvents.filter(
+              (event) =>
+                event.event === "session.message" &&
+                asOptionalRecord(event.payload)?.sessionKey === scenario.sessionKey &&
+                assistantText(asOptionalRecord(event.payload)?.message) === publicationText,
+            ),
+          ).toHaveLength(1);
+          expect(afterPublication.messages).toHaveLength(history.messages.length + 1);
+          expect(transcriptContent(afterPublication.messages.slice(0, -1))).toEqual(
+            transcriptContent(history.messages),
+          );
+          expect(assistantText(afterPublication.messages.at(-1))).toBe(publicationText);
+          expect(
+            events.slice(revokedEventBoundary).filter((event) => {
+              const payload = asOptionalRecord(event.payload);
+              return (
+                payload?.sessionKey === scenario.sessionKey &&
+                (event.event === "session.message" ||
+                  (event.event === "chat" &&
+                    (payload.message !== undefined || payload.deltaText !== undefined)))
+              );
+            }),
+          ).toEqual([]);
+          expect(scenario.parentCalls).toBe(beforeRevocation.parent);
+          expect(scenario.childCalls).toBe(beforeRevocation.child);
         } else {
           expect(scenario.parentCalls).toBe(7);
         }
