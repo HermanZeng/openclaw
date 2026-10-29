@@ -2,7 +2,7 @@
 // oxfmt-ignore
 import { useSubagentControlFixture } from "../../agents/subagents/registry/subagent-control.test-support.js";
 import path from "node:path";
-import { expect, it, onTestFinished, vi } from "vitest";
+import { expect, it, vi } from "vitest";
 import { SessionManager } from "../../agents/sessions/session-manager.js";
 import { subagentRuns } from "../../agents/subagents/registry/subagent-registry-memory.js";
 import * as persistence from "../../agents/subagents/registry/subagent-registry-persistence.js";
@@ -10,8 +10,6 @@ import { registerSubagentRun } from "../../agents/subagents/registry/subagent-re
 import { getRuntimeConfig } from "../../config/config.js";
 import { replaceSessionEntry } from "../../config/sessions/session-accessor.js";
 import type { InternalSessionEntry } from "../../config/sessions/types.js";
-import { createReplyOperation } from "../../sessions/session-controller.operation.js";
-import { captureSessionTarget } from "../../sessions/session-controller.target.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { getReplyPayloadMetadata } from "../reply-payload.js";
 import { executePreparedReplyAgentRun } from "./agent-runner-execute.js";
@@ -20,7 +18,8 @@ import {
   createMinimalRunAgentTurnParams,
   setupAgentRunnerExecutionTestState,
 } from "./agent-runner-execution.test-support.js";
-import { createReplyRestartRecoveryClaimController } from "./restart-recovery-claim.js";
+import { createReplyActorFixture } from "./reply-actor.test-support.js";
+import { createReplyInputAdmission } from "./reply-input-admission.js";
 import { createMockTypingController } from "./test-helpers.js";
 
 const fixture = useSubagentControlFixture();
@@ -39,19 +38,6 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
   const recorder = createUserTurnTranscriptRecorder({
     input: { text: "Continue the completed task", idempotencyKey: "reply-followup:user" },
     target: { ...target, sessionEntry: entry },
-  });
-  const admission = createReplyRestartRecoveryClaimController({
-    ...target,
-    acquireSessionActor: async () => undefined,
-    admissionRunId: "reply-followup",
-    lifecycleGeneration: undefined,
-    getEntry: () => entry,
-    getSessionId: () => target.sessionId,
-    setEntry: (next) => {
-      entry = next;
-    },
-    isRestartAbort: () => false,
-    resolveDeliveryContext: () => undefined,
   });
   await registerSubagentRun({
     runId: "completed-task",
@@ -101,24 +87,11 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
     }
     return mutate(ids, plan, options);
   });
-  // The execution owner opens Goal return custody even before a Goal is created.
-  // Keep that real controller boundary while isolating only the cohort replacement race.
-  const replyOperation = createReplyOperation({
-    sessionKey,
-    sessionId: target.sessionId,
-    agentId: target.agentId,
-    resetTriggered: false,
-    target: captureSessionTarget({
-      storeScope: target.storePath,
-      sessionKey,
-      agentId: target.agentId,
-      incarnation: target.sessionId,
-    }),
+  await using actor = createReplyActorFixture({
+    ...target,
+    getSessionId: () => target.sessionId,
   });
-  onTestFinished(async () => {
-    replyOperation.complete();
-    await replyOperation.ownerSettlement;
-  });
+  const { operation: replyOperation } = await actor.bind();
   const failMock = vi.spyOn(replyOperation, "fail");
   const followupRun = createFollowupRun({
     config: getRuntimeConfig(),
@@ -126,6 +99,16 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
     sessionId: target.sessionId,
   });
   followupRun.userTurnTranscriptRecorder = recorder;
+  const admission = createReplyInputAdmission({
+    followupRun,
+    replyOperation,
+    sessionKey,
+    storePath: target.storePath,
+    sourceTurnId: "reply-followup",
+    setEntry: (next) => {
+      entry = next;
+    },
+  });
   const result = await executePreparedReplyAgentRun({
     ...createMinimalRunAgentTurnParams({
       followupRun,
@@ -150,7 +133,6 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
     typing: createMockTypingController(),
     typingMode: "never",
     getActiveSessionEntry: () => entry,
-    isRestartRecoveryArmed: admission.isArmed,
     onCompactionNoticePayload: () => {},
     resolveVisibleReplyDelivery: async () => false,
     returnWithQueuedFollowupDrain: (value) => value,
@@ -176,7 +158,5 @@ it("settles a reply visibly when the reactivation cohort changes before replacem
   expect(state.runEmbeddedAgentMock).not.toHaveBeenCalled();
   expect(subagentRuns.has("reply-followup")).toBe(false);
   expect(subagentRuns.get("completed-task")?.execution.status).toBe("terminal");
-  replyOperation.complete();
-  await replyOperation.ownerSettlement;
   await fixture.settle();
 });
