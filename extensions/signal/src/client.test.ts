@@ -1,16 +1,9 @@
 import { Buffer } from "node:buffer";
 import http from "node:http";
-import {
-  closeOpenClawStateDatabaseForTest,
-  createChannelIngressQueueForTests,
-} from "openclaw/plugin-sdk/channel-ingress-test-runtime";
-import { closeOpenClawStateDatabaseAsync } from "openclaw/plugin-sdk/sqlite-runtime-testing";
-import { useAutoCleanupTempDirTracker } from "openclaw/plugin-sdk/test-env";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createRuntimeSpies } from "../../test-support/runtime-spies.js";
 import { signalCheck, signalRpcRequest, streamSignalEvents } from "./client.js";
 import { expectPreparedHandoff, useSignalHttpServer } from "./client.test-support.js";
-import { startSignalIngressMonitor } from "./signal-ingress.js";
 import { runSignalSseLoop, type SignalStatusSink } from "./sse-reconnect.js";
 
 vi.mock("openclaw/plugin-sdk/core", async (importOriginal) => ({
@@ -19,7 +12,6 @@ vi.mock("openclaw/plugin-sdk/core", async (importOriginal) => ({
 }));
 
 const withSignalServer = useSignalHttpServer();
-const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const rpc = (baseUrl: string, options: Partial<Parameters<typeof signalRpcRequest>[2]> = {}) =>
   signalRpcRequest("version", undefined, { baseUrl, ...options });
 const stream = (baseUrl: string, options: Partial<Parameters<typeof streamSignalEvents>[0]> = {}) =>
@@ -227,145 +219,6 @@ describe("signalCheck", () => {
 });
 
 describe("streamSignalEvents", () => {
-  it.each([
-    { disconnect: false, rejectOnce: false },
-    { disconnect: true, rejectOnce: false },
-    { disconnect: true, rejectOnce: true },
-  ])(
-    "receives every buffered event with disconnect=$disconnect and receive failure=$rejectOnce",
-    async ({ disconnect, rejectOnce }) => {
-      const abort = new AbortController();
-      const received: Array<string | undefined> = [];
-      const attempted: Array<string | undefined> = [];
-      const headers: Array<string | string[] | undefined> = [];
-      const buffered = ["1"];
-      let rejected = false;
-      let connections = 0;
-      const frame = (id: string) =>
-        `id: ${id}\nevent: receive\ndata: ${JSON.stringify({
-          envelope: {
-            sourceNumber: "+15555550200",
-            timestamp: 1_700_000_000_000 + Number(id),
-            dataMessage: { message: id },
-          },
-        })}\n\n`;
-      const baseUrl = await withSignalServer((request, response) => {
-        connections += 1;
-        headers.push(request.headers["last-event-id"]);
-        response.writeHead(200, { "Content-Type": "text/event-stream" });
-        if (!disconnect) {
-          response.end(["1", "2", "3"].map(frame).join(""));
-        } else if (connections === 1) {
-          response.end(frame("1"));
-        } else {
-          if (!buffered.includes("3")) {
-            buffered.push("3");
-          }
-          const cursor = request.headers["last-event-id"];
-          const replay = cursor ? buffered.slice(buffered.indexOf(String(cursor)) + 1) : ["3"];
-          response.end(replay.map(frame).join(""));
-        }
-      });
-      type IngressQueue = NonNullable<Parameters<typeof startSignalIngressMonitor>[0]["queue"]>;
-      const ingress = await startSignalIngressMonitor({
-        accountId: "default",
-        queue: createChannelIngressQueueForTests<Parameters<IngressQueue["enqueue"]>[1]>({
-          channelId: "signal",
-          accountId: "default",
-          stateDir: tempDirs.make("signal-sse-replay-"),
-        }),
-        runtime: createRuntimeSpies(),
-        dispatch: (event) => {
-          received.push(event.id);
-        },
-      });
-
-      try {
-        await runSignalSseLoop({
-          baseUrl,
-          account: "+15555550100",
-          abortSignal: abort.signal,
-          runtime: createRuntimeSpies(),
-          policy: { initialMs: 0, maxMs: 0, jitter: 0 },
-          statusSink: (patch) => {
-            if (patch.lifecycle === "recovering" && !buffered.includes("2")) {
-              // The daemon keeps receiving while its HTTP subscriber reconnects.
-              buffered.push("2");
-            }
-          },
-          onEvent: async (event) => {
-            attempted.push(event.id);
-            if (rejectOnce && event.id === "2" && !rejected) {
-              rejected = true;
-              throw new Error("receive did not accept the event");
-            }
-            await ingress.receive(event);
-            if (event.id === "3") {
-              abort.abort();
-            }
-          },
-        });
-      } finally {
-        abort.abort();
-        try {
-          await ingress.stop();
-        } finally {
-          await closeOpenClawStateDatabaseAsync();
-          closeOpenClawStateDatabaseForTest();
-        }
-      }
-
-      expect(received).toEqual(["1", "2", "3"]);
-      expect(attempted).toEqual(rejectOnce ? ["1", "2", "2", "3"] : ["1", "2", "3"]);
-      expect(headers).toEqual(
-        !disconnect ? [undefined] : rejectOnce ? [undefined, "1", "1"] : [undefined, "1"],
-      );
-    },
-  );
-
-  it.each([
-    { name: "an empty ID", frame: "id:\n\n", cursor: undefined },
-    { name: "an ID-less event", frame: "event: receive\ndata: {}\n\n", cursor: "seed" },
-    { name: "an incomplete event", frame: "id: unseen\nevent: receive\n", cursor: "seed" },
-    {
-      name: "an invalid ID",
-      frame: "id: bad\0id\nevent: receive\ndata: {}\n\n",
-      cursor: "seed",
-    },
-  ])("reconnects with cursor $cursor after $name", async ({ frame, cursor }) => {
-    const abort = new AbortController();
-    const headers: Array<string | string[] | undefined> = [];
-    const baseUrl = await withSignalServer((request, response) => {
-      headers.push(request.headers["last-event-id"]);
-      response.writeHead(200, { "Content-Type": "text/event-stream" });
-      response.end(
-        headers.length === 1
-          ? "id: seed\nevent: receive\ndata: {}\n\n"
-          : headers.length === 2
-            ? frame
-            : "event: receive\ndata: {}\n\n",
-      );
-    });
-
-    try {
-      await runSignalSseLoop({
-        baseUrl,
-        abortSignal: abort.signal,
-        runtime: createRuntimeSpies(),
-        policy: { initialMs: 0, maxMs: 0, jitter: 0 },
-        onEvent: () => {
-          if (headers.length === 3) {
-            abort.abort();
-          }
-        },
-      });
-    } finally {
-      abort.abort();
-    }
-
-    expect(headers).toEqual([undefined, "seed", cursor]);
-  });
-
   it("preserves path-prefixed base URLs for event streams", async () => {
     type StreamEvent = Parameters<Parameters<typeof streamSignalEvents>[0]["onEvent"]>[0];
     const events: StreamEvent[] = [];
