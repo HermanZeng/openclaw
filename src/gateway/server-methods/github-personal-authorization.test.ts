@@ -223,6 +223,7 @@ it("rejects invited publication metadata when sharing selects a replacement stor
   const release = vi.fn();
   mocks.prepareSharing.mockResolvedValue({
     storageTarget: replacement,
+    prepareRead: () => undefined,
     readCurrent: () => ({
       target: { ...replacement, storeKey: replacement.canonicalKey },
       membership: new Set(["profile-cache-test"]),
