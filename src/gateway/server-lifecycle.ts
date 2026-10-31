@@ -15,6 +15,7 @@ import {
   getGatewayContextLifetime,
   withPluginRuntimeRegistryScope,
 } from "../plugins/runtime/gateway-request-scope.js";
+import { beginGatewayShutdownCleanup } from "../process/gateway-work-admission.js";
 import { clearSecretsRuntimeSnapshotState } from "../secrets/runtime-state.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import { createDeferredCore } from "../shared/deferred.js";
@@ -38,7 +39,7 @@ import { createGatewayDiagnosticsConfigurator } from "./server-diagnostics.js";
 import { applyGatewayLaneConcurrency, resolveGatewayLaneConcurrency } from "./server-lanes.js";
 import { createGatewayServerLiveState } from "./server-live-state.js";
 import { createGatewayPluginRuntimeGeneration } from "./server-plugin-runtime-generation.js";
-import type { GatewayCloseOptions } from "./server-public.js";
+import type { GatewayCloseOptions, GatewayServerOptions } from "./server-public.js";
 import { GatewayRequestEntryLifetime } from "./server-request-entry.js";
 import type { prepareGatewayKernelState } from "./server-runtime-state-prepare.js";
 import { resolveGatewayShutdownNotice, runGatewayCloseSteps } from "./server-shutdown.js";
@@ -60,6 +61,7 @@ export async function prepareGatewayLifecycle(params: {
   log: GatewayLogger;
   logCron: GatewayLogger;
   shutdownRuntime: GatewayShutdownRuntime;
+  exitAfterStartupFailure?: GatewayServerOptions["exitAfterStartupFailure"];
 }) {
   const { runtime, port, log, logCron, shutdownRuntime } = params;
   const requestEntryLifetime = new GatewayRequestEntryLifetime();
@@ -396,14 +398,15 @@ export async function prepareGatewayLifecycle(params: {
       ?.modelAccountConnectService?.stop());
   // Connect, RPC, and maintenance refreshes share a Gateway owner, not a socket lifetime.
   const healthWork = new AsyncWorkScope();
+  let closeCleanupStarted = false;
   const markClosePreludeStarted = (options?: GatewayCloseOptions) => {
-    fenceSessionSuspensionWritesForGatewayShutdown();
-    if (lifecycle.closePreludeStarted) {
+    if (closeCleanupStarted) {
       return params.pluginMetadata.beginClose();
     }
+    closeCleanupStarted = true;
+    beginGatewayShutdownCleanup();
     const prelude = params.pluginMetadata.beginClose();
     const notice = resolveGatewayShutdownNotice(options);
-    lifecycle.closePreludeStarted = true;
     markGatewaySuspendExiting();
     authRateLimiter.dispose();
     browserAuthRateLimiter.dispose();
@@ -412,11 +415,7 @@ export async function prepareGatewayLifecycle(params: {
     talkClose.beginClose();
     void stopModelAccountsForClose();
     void closeAuthProfileUsage(params.sdkResourceHost);
-    runtime.scheduler.beginClose();
     void runtimeState.maintenance?.stopPeriodicTasks();
-    // Fence new entry now; the run-shutdown owner records recovery before
-    // canceling admitted work or withdrawing its runtime capabilities.
-    requestEntryLifetime.beginClose();
     void mentionInbox.dispose();
     healthWork.beginClose();
     broadcast("shutdown", notice);
@@ -430,7 +429,6 @@ export async function prepareGatewayLifecycle(params: {
     void runtimeState.controlUiSessionPullRequests?.stop();
     runtimeState.sessionViewerPresence?.stop();
     runtime.stopPresencePublications();
-    cronReconciliation.invalidate();
     return prelude;
   };
   let configReloaderStopPromise: Promise<void> | null = null;
@@ -520,10 +518,12 @@ export async function prepareGatewayLifecycle(params: {
   };
   const prepareClose = async (optsValue?: GatewayCloseOptions) => {
     exitAfterClose = optsValue?.exitAfterClose === true;
-    // Fence new work synchronously; snapshot and abort before joining cleanup owners.
-    const prelude = markClosePreludeStarted(optsValue);
-    // Observe cleanup failure while marker persistence owns the next await.
-    void Promise.resolve(prelude).catch(() => {});
+    // Fence admission now; database cleanup must wait for restart marker persistence.
+    fenceSessionSuspensionWritesForGatewayShutdown();
+    lifecycle.closePreludeStarted = true;
+    requestEntryLifetime.beginClose();
+    runtime.scheduler.beginClose();
+    cronReconciliation.invalidate();
     const preparation = await shutdownRuntime.prepareGatewayClose(
       {
         resolveGatewayContext: runtime.resolvePluginGatewayContext,
@@ -541,6 +541,8 @@ export async function prepareGatewayLifecycle(params: {
           });
         },
         terminateRunningSubagentsForShutdown: async () => {
+          // Persistence has settled or timed out; release marker retention before run claims.
+          void Promise.resolve(markClosePreludeStarted(optsValue)).catch(() => {});
           const { terminateLiveSubagentsForShutdown } =
             await import("../agents/subagents/registry/subagent-registry.js");
           await terminateLiveSubagentsForShutdown(runtime.resolvePluginGatewayContext);
@@ -555,7 +557,6 @@ export async function prepareGatewayLifecycle(params: {
       },
       optsValue,
     );
-    await prelude;
     await beginClosePrelude(optsValue);
     // Startup may still publish cleanup owners while received work settles.
     // Resolve their handles only when the caller reaches final teardown.
@@ -645,17 +646,22 @@ export async function prepareGatewayLifecycle(params: {
     sealAndJoinRegisteredSidecarStops,
   };
   let startupFailureClose: Promise<void> | undefined;
-  const closeOnStartupFailure = () =>
-    (startupFailureClose ??= closeStartupFailure().catch((error: unknown) => {
+  const closeOnStartupFailure = (startupError?: unknown) =>
+    (startupFailureClose ??= closeStartupFailure(startupError).catch((error: unknown) => {
       startupFailureClose = undefined;
       throw error;
     }));
-  const closeStartupFailure = async () => {
+  const closeStartupFailure = async (error: unknown) => {
+    const closeOptions = {
+      reason: "gateway startup failed",
+      exitAfterClose: params.exitAfterStartupFailure?.(error) === true,
+    };
     runtime.startupTrace.close();
     await runGatewayCloseSteps({
       owner: closeStepOwner,
+      exitAfterClose: closeOptions.exitAfterClose,
       // Prepare before the plan runs so earlier teardown steps see closed admission.
-      close: await prepareClose({ reason: "gateway startup failed" }),
+      close: await prepareClose(closeOptions),
       onError: (message) => log.error(message),
     });
   };
@@ -704,6 +710,7 @@ export async function prepareGatewayLifecycle(params: {
       const close = await params.sdkResourceHost.run(() => prepareClose(options));
       return () => params.sdkResourceHost.run(close);
     },
-    closeOnStartupFailure: () => params.sdkResourceHost.run(closeOnStartupFailure),
+    closeOnStartupFailure: (error?: unknown) =>
+      params.sdkResourceHost.run(() => closeOnStartupFailure(error)),
   };
 }

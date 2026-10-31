@@ -92,6 +92,10 @@ const catalog = {
         limitWeekly: "Weekly",
         limitDaily: "Daily",
         limitHours: "{hours}-hour",
+        compact: "Compact",
+        compacting: "Compacting",
+        compactDescription: "Replaces older context with a summary.",
+        compactAfterRun: "Available when the current run finishes.",
       },
       takePhoto: "Take photo",
       cameraAccessFailed: "Unable to access the camera.",
@@ -286,6 +290,7 @@ const catalog = {
       download: "Download",
       expand: "Open {filename} in the side panel",
       open: "Open",
+      chooseLinkedFile: "Browse Files to choose “{path}”. This attachment stays open.",
       previewUnavailable: "Preview unavailable",
       textPreviewUnavailable:
         "Could not preview this file. Text previews require UTF-8 files up to 256 KiB. Download it to read the full file.",

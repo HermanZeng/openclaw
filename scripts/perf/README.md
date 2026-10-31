@@ -1,5 +1,26 @@
 # Team-shaped synthetic state
 
+## Update state I/O
+
+`update-state-io-measure.ts` measures candidate inventory and snapshot creation,
+runtime retention, and the complete candidate Doctor command against synthetic
+shared and agent databases (about 2 GiB) and a 256 MiB runtime tree. It freezes
+the baseline snapshot owner while using unchanged dependencies from the current
+checkout, then interleaves baseline and candidate samples. Retention and Doctor
+are unchanged controls. Full output integrity and payload checks run outside
+the timed snapshot phase.
+
+```sh
+node --import ./scripts/tsx.mjs scripts/perf/update-state-io-measure.ts \
+  --baseline <base-commit> --samples 5
+```
+
+The script creates a realpath-resolved temporary root, isolates HOME and state,
+selects a free Gateway port, and removes its synthetic files afterward. Set
+`TMPDIR` to a trusted per-user temporary directory if the host's default has
+unsafe ancestors. Results include operation counts, medians, p95, spread, source
+identity, and host load. These phase timings do not measure total update downtime.
+
 ## Plugin policy reads
 
 `plugin-policy-read-measure.mjs` measures warm Codex config resolution and registered
@@ -5857,3 +5878,32 @@ to disappear (`PGCENSUS_EXPECT_COUNT_STATEMENTS=0` enforces this). Request windo
 and worker events use the same monotonic nanosecond clock, including submillisecond
 searches. Wall samples include instrumentation and incidental background work;
 this small workload does not establish latency or relevance at scale.
+
+## Backup archive verification
+
+`backup-verify-fixture.mjs` adds 5.5 GiB of deterministic SQLite payload and 768 MiB
+across 12,288 workspace files to a disposable installation with initialized
+`main`, `worker`, and `research` agents. Initialize a PostgreSQL Workboard store
+through its normal owner to cover mixed-engine archives. Never use a real state
+directory with this fixture writer.
+
+```sh
+node scripts/perf/backup-verify-fixture.mjs <synthetic-state> <synthetic-workspace>
+node --import ./scripts/tsx.mjs scripts/build-all.mts qaRuntime
+node scripts/perf/backup-verify-measure.mjs instrument dist
+BACKUP_MEASUREMENT=<absolute-results.jsonl> node --import ./scripts/perf/backup-verify-measure.mjs openclaw.mjs backup create --verify --output <archive> --json
+BACKUP_MEASUREMENT=<absolute-results.jsonl> node --import ./scripts/perf/backup-verify-measure.mjs openclaw.mjs backup verify <archive> --json
+```
+
+Instrument only disposable builds. Keep each source revision's runtime, use the
+same isolated state, and alternate baseline/candidate runs. The instrumentation
+wraps existing phase boundaries without replacing their implementations. Phase
+records are inclusive; subtract nested extraction records when reporting database
+verification separately. `archiveReadBytes` counts full compressed archive reads.
+
+On macOS, compile `backup-verify-rusage.c` with `clang` and set
+`BACKUP_MEASURE_RUSAGE` to that executable to include exited-child CPU and the
+CLI process's physical disk-read bytes. Those disk bytes exclude child processes
+and cached reads; they are distinct from logical archive bytes. Record host load,
+archive size, and complete CLI wall/CPU with `/usr/bin/time -l` as well. Keep
+compression-level experiments separate from the default-settings comparison.
